@@ -19,9 +19,12 @@ classifiers = [
     "Private :: Do Not Upload",
 ]
 
-# Runtime dependencies are intentionally minimal at Step 1.1; expanded in Step 1.2.
 dependencies = [
     "pydantic>=2.7,<3",
+    "anthropic>=0.39",
+    "langgraph>=1.0",
+    "httpx>=0.27",
+    "asyncpg>=0.29",
 ]
 
 [project.optional-dependencies]
