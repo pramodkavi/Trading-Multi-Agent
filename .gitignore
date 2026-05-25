@@ -1,0 +1,80 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+develop-eggs/
+downloads/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+MANIFEST
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.env
+.envrc
+
+# --- Testing & coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+.pyre/
+.pytype/
+
+# --- AWS CDK ---
+infrastructure/cdk.out/
+infrastructure/.cdk.staging/
+*.swp
+cdk.context.json
+
+# --- AWS / Cloud secrets ---
+*.pem
+.aws/
+
+# --- IDE / Editor ---
+.idea/
+.vscode/
+.claude/
+*.iml
+*.sublime-workspace
+*.sublime-project
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Local dev ---
+.localstack/
+docker-compose.override.yml
+
+# --- Notebooks (if any sneak in) ---
+.ipynb_checkpoints/
+
+# --- Project-specific ---
+*.local.yaml
+*.local.yml
