@@ -25,6 +25,7 @@ dependencies = [
     "langgraph>=1.0",
     "httpx>=0.27",
     "asyncpg>=0.29",
+    "ccxt>=4.4",
 ]
 
 [project.optional-dependencies]
@@ -81,11 +82,17 @@ no_implicit_reexport = true
 check_untyped_defs = true
 files = ["src", "tests"]
 
+[[tool.mypy.overrides]]
+module = ["ccxt", "ccxt.*"]
+ignore_missing_imports = true
+
 # --- pytest configuration ---
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Default run excludes integration tests; opt in with `pytest -m integration`.
+addopts = ["-m", "not integration"]
 markers = [
     "integration: integration tests that hit real external services (skipped in CI by default)",
 ]
