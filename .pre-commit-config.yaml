@@ -28,5 +28,6 @@ repos:
         additional_dependencies:
           - pydantic>=2.7
           - anthropic>=0.39
+          - langgraph>=1.0
         args: [--strict, --config-file=pyproject.toml]
         files: ^src/
