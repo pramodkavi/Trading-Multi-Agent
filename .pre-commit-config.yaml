@@ -27,5 +27,6 @@ repos:
       - id: mypy
         additional_dependencies:
           - pydantic>=2.7
+          - anthropic>=0.39
         args: [--strict, --config-file=pyproject.toml]
         files: ^src/
