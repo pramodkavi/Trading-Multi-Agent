@@ -26,6 +26,8 @@ dependencies = [
     "httpx>=0.27",
     "asyncpg>=0.29",
     "ccxt>=4.4",
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
 ]
 
 [project.optional-dependencies]
@@ -68,7 +70,7 @@ indent-style = "space"
 line-ending = "lf"
 
 [tool.ruff.lint.isort]
-known-first-party = ["src"]
+known-first-party = ["src", "scripts"]
 
 # --- mypy configuration ---
 [tool.mypy]

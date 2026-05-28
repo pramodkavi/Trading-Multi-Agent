@@ -1,0 +1,32 @@
+# Minimal local-dev compose for Slice 1 persistence tests.
+# Step 1.13 will expand this with the app container + LocalStack.
+#
+# Usage:
+#   docker compose up -d db          # start Postgres with pgvector
+#   docker compose down -v           # stop and wipe data
+#
+# Then:
+#   export DATABASE_URL="postgresql://signals:signals@localhost:5432/signals"
+#   python scripts/migrate.py
+#   pytest -m integration
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: signals-db
+    environment:
+      POSTGRES_USER: signals
+      POSTGRES_PASSWORD: signals
+      POSTGRES_DB: signals
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U signals -d signals"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db_data:
