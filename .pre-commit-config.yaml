@@ -27,6 +27,7 @@ repos:
       - id: mypy
         additional_dependencies:
           - pydantic>=2.7
+          - pydantic-settings>=2.4
           - anthropic>=0.39
           - langgraph>=1.0
           - psycopg[binary]>=3.2
