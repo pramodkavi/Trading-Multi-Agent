@@ -29,6 +29,7 @@ repos:
           - pydantic>=2.7
           - pydantic-settings>=2.4
           - anthropic>=0.39
+          - aiohttp>=3.10
           - langgraph>=1.0
           - psycopg[binary]>=3.2
           - asyncpg>=0.29

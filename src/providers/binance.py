@@ -24,6 +24,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+import aiohttp
 import ccxt
 import ccxt.async_support as ccxt_async
 
@@ -60,16 +61,39 @@ class BinanceProvider(DataProvider):
         Args:
             client: Optional pre-built ccxt async client. Tests inject a mock
                 here. Production code passes None to get a fresh Futures client.
+
+        Resolver note:
+            When we build the client ourselves, we attach an aiohttp session
+            that uses the portable ThreadedResolver instead of aiodns.
+            CCXT's default async resolver (aiodns / c-ares) fails to read the
+            system DNS configuration on some Windows machines, raising
+            "Could not contact DNS servers" even when the OS resolver works
+            fine. ThreadedResolver delegates to the standard getaddrinfo in a
+            thread pool -- negligible cost at our scan volume, and portable
+            across platforms. The session is only created when no client is
+            injected, so tests (which inject a mock) never touch the network.
         """
-        self._client: ccxt_async.binance = client or ccxt_async.binance(
-            {
-                "enableRateLimit": True,
-                "options": {"defaultType": "future"},
-            }
-        )
+        self._session: aiohttp.ClientSession | None = None
+        if client is not None:
+            self._client: ccxt_async.binance = client
+        else:
+            self._client = ccxt_async.binance(
+                {
+                    "enableRateLimit": True,
+                    "options": {"defaultType": "future"},
+                }
+            )
+            connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+            self._session = aiohttp.ClientSession(connector=connector)
+            self._client.session = self._session
 
     async def aclose(self) -> None:
+        # ccxt's close() shuts down the session it holds (ours, when we set
+        # it). The extra guarded close is belt-and-suspenders for the case
+        # where ccxt did not adopt our session.
         await self._client.close()
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
 
     async def fetch_market_snapshot(
         self, symbol: str, timeframes: list[Timeframe], *, limit: int = 200
