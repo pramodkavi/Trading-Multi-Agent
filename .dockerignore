@@ -1,0 +1,48 @@
+# Keep the build context small and the image clean. Anything not needed to
+# install the package or run a scan is excluded.
+
+# --- Secrets: NEVER copy into an image ---
+.env
+.env.*
+!.env.example
+
+# --- Local virtualenv / Python caches ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# --- VCS / IDE / OS ---
+.git/
+.gitignore
+.gitattributes
+.github/
+.idea/
+.vscode/
+.claude/
+.DS_Store
+Thumbs.db
+
+# --- Tests are not needed in the runtime image ---
+tests/
+
+# --- Infra / docs / local-only ---
+infrastructure/
+docs/
+.remember/
+docker-compose.yml
+docker-compose.override.yml
+Dockerfile
+.dockerignore
+.pre-commit-config.yaml
+
+# --- Misc ---
+*.log
+*.md
+!README.md

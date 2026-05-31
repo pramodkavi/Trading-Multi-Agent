@@ -45,6 +45,13 @@ dev = [
 where = ["."]
 include = ["src*"]
 
+# Ship non-Python data files that live inside the package. schema.sql is
+# loaded at runtime via importlib-relative path (SCHEMA_SQL_PATH); without
+# this it is omitted from `pip install .` and the installed package can't
+# find it (e.g. inside the Docker image).
+[tool.setuptools.package-data]
+"src.persistence" = ["*.sql"]
+
 # --- ruff configuration (Step 1.2 expands this) ---
 [tool.ruff]
 line-length = 100
