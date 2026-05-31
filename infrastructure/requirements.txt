@@ -1,0 +1,11 @@
+# CDK app dependencies (Step 1.14).
+#
+# Installed into the project .venv:
+#   .venv/Scripts/python -m pip install -r infrastructure/requirements.txt
+#
+# These are infra-only and intentionally separate from the application's
+# runtime dependencies in pyproject.toml.
+
+aws-cdk-lib>=2.150,<3
+constructs>=10.0,<11
+cdk-nag>=2.28

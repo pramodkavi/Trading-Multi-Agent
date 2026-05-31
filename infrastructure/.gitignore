@@ -1,0 +1,4 @@
+# CDK build artifacts (also covered by the repo-root .gitignore).
+cdk.out/
+.cdk.staging/
+cdk.context.json
