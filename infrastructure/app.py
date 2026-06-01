@@ -11,12 +11,6 @@ Environment:
     valid credentials these are unset and synthesis falls back to an
     environment-agnostic template (still valid; uses 2 dummy AZs).
 
-Context flags:
-    enable_interface_endpoints  (default false) -- turn on the ECR / Secrets
-        Manager / CloudWatch Logs interface VPC endpoints in NetworkStack.
-        They cost ~$7/mo per AZ each, so they are off by default:
-            cdk deploy -c enable_interface_endpoints=true
-
 Run from this directory (cdk.json sets `app = python app.py`):
     cdk synth
     cdk ls
@@ -42,24 +36,15 @@ env = cdk.Environment(
     region=os.environ.get("CDK_DEFAULT_REGION"),
 )
 
-# Context flag (string "true"/"false" or bool); default off for cost.
-_endpoints_ctx = app.node.try_get_context("enable_interface_endpoints")
-enable_interface_endpoints = str(_endpoints_ctx).lower() == "true"
-
-network = NetworkStack(
-    app,
-    "CryptoSignals-Network",
-    env=env,
-    enable_interface_endpoints=enable_interface_endpoints,
-)
+network = NetworkStack(app, "CryptoSignals-Network", env=env)
 DataStack(app, "CryptoSignals-Data", env=env)
 ComputeStack(app, "CryptoSignals-Compute", env=env)
 SchedulingStack(app, "CryptoSignals-Scheduling", env=env)
 MonitoringStack(app, "CryptoSignals-Monitoring", env=env)
 
-# Keep a reference so future stacks (DataStack in Step 1.16) can consume the
-# VPC + egress SG without re-importing them.
-_ = network.vpc
+# Keep a reference so DataStack (Step 1.16) can consume the VPC + DB security
+# group without re-importing them.
+_ = (network.vpc, network.db_security_group)
 
 # cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a
 # stack adds a resource, any insecure default is flagged immediately.

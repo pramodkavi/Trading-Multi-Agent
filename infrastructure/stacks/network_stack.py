@@ -1,35 +1,23 @@
-"""NetworkStack: VPC, subnets, security group, and VPC endpoints.
+"""NetworkStack: a minimal private VPC whose only job is to host Aurora.
 
-Topology (Step 1.15) -- NAT-free, cost-optimised for a signal-only egress
-workload (SPEC NFR-5.1 target < $100/mo):
+Serverless topology (revised Step 1.15 -- see SPEC §2.4):
 
     VPC (2 AZs, 10.20.0.0/16)
-      PUBLIC subnets            -> the Fargate scan task runs here with a
-                                   public IP (egress only; the task security
-                                   group denies all inbound). Outbound to the
-                                   non-AWS APIs it must reach -- Binance,
-                                   Anthropic, Telegram -- goes via the free
-                                   Internet Gateway. No NAT Gateway.
-      PRIVATE_ISOLATED subnets  -> RDS Postgres (Step 1.16). No route to the
-                                   internet, satisfying NFR-3.3 ("Postgres in a
-                                   private subnet with no public IP").
+      PRIVATE_ISOLATED subnets x2  -> Aurora Serverless v2 (Step 1.16). No
+                                      route to the internet, satisfying NFR-3.3
+                                      ("Aurora in isolated subnets, no public IP").
 
-Why no `PRIVATE_WITH_EGRESS` subnet: that tier requires a NAT Gateway route,
-and we deliberately run zero NAT Gateways (each is ~$32/mo + data for a
-workload that scans a few times a day). VPC *interface* endpoints cannot
-substitute for NAT here because the task's heaviest egress is to non-AWS
-hosts, which endpoints do not serve.
+There is deliberately **no public subnet, no Internet Gateway, no NAT, and no
+VPC endpoints**. The agent pipeline runs on Lambda *outside* this VPC and
+reaches the database over the IAM-authenticated RDS Data API (HTTPS) -- not a
+VPC connection -- so nothing here needs internet access. Aurora requires a DB
+subnet group spanning >= 2 AZs, which is the only reason a VPC exists at all.
 
-VPC endpoints:
-  - S3 gateway endpoint: always on. It is free and keeps ECR image-layer and
-    S3 blob traffic on the AWS backbone.
-  - ECR (api + dkr), Secrets Manager, CloudWatch Logs interface endpoints:
-    coded but OFF by default (`enable_interface_endpoints=False`). Each
-    interface endpoint bills ~$0.01/AZ/hr (~$7/mo per AZ), so four of them in
-    two AZs is ~$58/mo -- most of the budget, 24/7. With a public-subnet task
-    these calls already work for free over the IGW; the endpoints are a
-    keep-AWS-traffic-private upgrade to flip on later via context:
-        cdk deploy -c enable_interface_endpoints=true
+The DB security group is created here (the single place the network boundary
+lives) and exposed for DataStack to attach to the cluster. Its 5432-from-VPC
+ingress is forward-looking: in Slice 1 nothing inside the VPC connects to
+Aurora (the Data API is AWS-managed); the Slice 4 dashboard will run in-VPC
+with a persistent connection and use this rule.
 """
 
 from __future__ import annotations
@@ -44,26 +32,19 @@ from aws_cdk import (
 )
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_logs as logs
-from cdk_nag import NagSuppressions
 from constructs import Construct
 
 VPC_CIDR = "10.20.0.0/16"
+POSTGRES_PORT = 5432
 
 
 class NetworkStack(Stack):
-    """Networking foundation: VPC, subnets, egress-only SG, and endpoints."""
+    """Minimal private VPC + DB security group for Aurora."""
 
-    def __init__(
-        self,
-        scope: Construct,
-        construct_id: str,
-        *,
-        enable_interface_endpoints: bool = False,
-        **kwargs: Any,
-    ) -> None:
+    def __init__(self, scope: Construct, construct_id: str, **kwargs: Any) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # ---- VPC ---------------------------------------------------------
+        # ---- VPC: isolated subnets only, no internet path ----------------
         self.vpc = ec2.Vpc(
             self,
             "Vpc",
@@ -72,11 +53,6 @@ class NetworkStack(Stack):
             nat_gateways=0,
             restrict_default_security_group=True,
             subnet_configuration=[
-                ec2.SubnetConfiguration(
-                    name="public",
-                    subnet_type=ec2.SubnetType.PUBLIC,
-                    cidr_mask=24,
-                ),
                 ec2.SubnetConfiguration(
                     name="isolated",
                     subnet_type=ec2.SubnetType.PRIVATE_ISOLATED,
@@ -98,86 +74,38 @@ class NetworkStack(Stack):
             traffic_type=ec2.FlowLogTrafficType.ALL,
         )
 
-        # ---- Egress-only security group for the scan task ----------------
-        # No inbound rules; all outbound allowed so the task can reach
-        # Binance / Anthropic / Telegram and (over the IGW) AWS service APIs.
-        self.task_security_group = ec2.SecurityGroup(
+        # ---- DB security group -------------------------------------------
+        # Aurora attaches to this in DataStack (Step 1.16). Ingress is
+        # Postgres-only, from within the VPC -- for the Slice 4 dashboard,
+        # which is the one component that connects directly (the Data API
+        # path does not traverse the VPC).
+        self.db_security_group = ec2.SecurityGroup(
             self,
-            "ScanTaskSg",
+            "DbSg",
             vpc=self.vpc,
-            description="Egress-only SG for the Fargate scan task (no inbound).",
-            allow_all_outbound=True,
+            description="Aurora cluster SG: Postgres 5432 from within the VPC only.",
+            allow_all_outbound=False,
+        )
+        self.db_security_group.add_ingress_rule(
+            peer=ec2.Peer.ipv4(self.vpc.vpc_cidr_block),
+            connection=ec2.Port.tcp(POSTGRES_PORT),
+            description="Postgres from within the VPC (e.g. the Slice 4 dashboard).",
         )
 
-        # ---- S3 gateway endpoint (free) ----------------------------------
-        self.vpc.add_gateway_endpoint(
-            "S3Endpoint",
-            service=ec2.GatewayVpcEndpointAwsService.S3,
-        )
-
-        # ---- Interface endpoints (optional; cost-gated) ------------------
-        if enable_interface_endpoints:
-            self._add_interface_endpoints()
-
-        # ---- Outputs (handy for verification + later cross-stack wiring) -
+        # ---- Outputs -----------------------------------------------------
         CfnOutput(self, "VpcId", value=self.vpc.vpc_id, description="VPC id.")
-        CfnOutput(
-            self,
-            "PublicSubnetIds",
-            value=",".join(s.subnet_id for s in self.vpc.public_subnets),
-            description="Public subnet ids (Fargate scan task).",
-        )
         CfnOutput(
             self,
             "IsolatedSubnetIds",
             value=",".join(s.subnet_id for s in self.vpc.isolated_subnets),
-            description="Isolated subnet ids (RDS).",
+            description="Isolated subnet ids (Aurora DB subnet group).",
         )
         CfnOutput(
             self,
-            "TaskSecurityGroupId",
-            value=self.task_security_group.security_group_id,
-            description="Egress-only SG for the scan task.",
+            "DbSecurityGroupId",
+            value=self.db_security_group.security_group_id,
+            description="Security group for the Aurora cluster.",
         )
 
         Tags.of(self).add("project", "crypto-signals")
         Tags.of(self).add("layer", "network")
-
-        self._apply_nag_suppressions()
-
-    def _add_interface_endpoints(self) -> None:
-        """Add ECR / Secrets Manager / CloudWatch Logs interface endpoints.
-
-        Placed in the isolated subnets (the RDS tier) so AWS-service traffic
-        from anywhere in the VPC resolves to a private ENI. Off by default;
-        see the module docstring for the cost rationale.
-        """
-        targets: dict[str, ec2.InterfaceVpcEndpointAwsService] = {
-            "EcrApiEndpoint": ec2.InterfaceVpcEndpointAwsService.ECR,
-            "EcrDkrEndpoint": ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
-            "SecretsManagerEndpoint": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
-            "CloudWatchLogsEndpoint": ec2.InterfaceVpcEndpointAwsService.CLOUDWATCH_LOGS,
-        }
-        for construct_id, service in targets.items():
-            self.vpc.add_interface_endpoint(
-                construct_id,
-                service=service,
-                subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_ISOLATED),
-                private_dns_enabled=True,
-            )
-
-    def _apply_nag_suppressions(self) -> None:
-        """Justified cdk-nag suppressions for intentional Slice 1 choices."""
-        NagSuppressions.add_resource_suppressions(
-            self.task_security_group,
-            [
-                {
-                    "id": "AwsSolutions-EC23",
-                    "reason": (
-                        "Egress-only security group: it has no inbound rules. "
-                        "The all-outbound rule is required so the stateless scan "
-                        "task can reach Binance, Anthropic, and Telegram."
-                    ),
-                }
-            ],
-        )
