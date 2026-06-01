@@ -2,19 +2,30 @@
 """CDK application entry point for the crypto-signals system.
 
 Instantiates the five Slice 1 stacks and wires cdk-nag's AwsSolutionsChecks
-so security findings surface at synth time. The stacks are empty in Step 1.14;
-resources are added in Steps 1.15-1.18 (and 2.12 for monitoring).
+so security findings surface at synth time. NetworkStack is implemented in
+Step 1.15; the other four are filled in across Steps 1.16-1.18 (and 2.12).
+
+Environment:
+    Stacks are bound to the account/region the CDK CLI resolves from the
+    active AWS profile (CDK_DEFAULT_ACCOUNT / CDK_DEFAULT_REGION). With no
+    valid credentials these are unset and synthesis falls back to an
+    environment-agnostic template (still valid; uses 2 dummy AZs).
+
+Context flags:
+    enable_interface_endpoints  (default false) -- turn on the ECR / Secrets
+        Manager / CloudWatch Logs interface VPC endpoints in NetworkStack.
+        They cost ~$7/mo per AZ each, so they are off by default:
+            cdk deploy -c enable_interface_endpoints=true
 
 Run from this directory (cdk.json sets `app = python app.py`):
-    cdk synth          # write CloudFormation templates to cdk.out/
-    cdk ls             # list the stacks
-    cdk deploy <name>  # deploy (Step 1.15+; needs AWS creds + bootstrap)
-
-Stack naming: `CryptoSignals-<Layer>` so all stacks group together in the
-CloudFormation console and are easy to target individually.
+    cdk synth
+    cdk ls
+    cdk deploy CryptoSignals-Network   # Step 1.15+; needs creds + bootstrap
 """
 
 from __future__ import annotations
+
+import os
 
 import aws_cdk as cdk
 from cdk_nag import AwsSolutionsChecks
@@ -26,15 +37,32 @@ from stacks.scheduling_stack import SchedulingStack
 
 app = cdk.App()
 
-NetworkStack(app, "CryptoSignals-Network")
-DataStack(app, "CryptoSignals-Data")
-ComputeStack(app, "CryptoSignals-Compute")
-SchedulingStack(app, "CryptoSignals-Scheduling")
-MonitoringStack(app, "CryptoSignals-Monitoring")
+env = cdk.Environment(
+    account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
+    region=os.environ.get("CDK_DEFAULT_REGION"),
+)
 
-# cdk-nag: fail synth on AWS Solutions security-rule violations. Empty stacks
-# produce no findings today; the moment a stack adds a resource (Step 1.15+)
-# any insecure default is flagged immediately.
+# Context flag (string "true"/"false" or bool); default off for cost.
+_endpoints_ctx = app.node.try_get_context("enable_interface_endpoints")
+enable_interface_endpoints = str(_endpoints_ctx).lower() == "true"
+
+network = NetworkStack(
+    app,
+    "CryptoSignals-Network",
+    env=env,
+    enable_interface_endpoints=enable_interface_endpoints,
+)
+DataStack(app, "CryptoSignals-Data", env=env)
+ComputeStack(app, "CryptoSignals-Compute", env=env)
+SchedulingStack(app, "CryptoSignals-Scheduling", env=env)
+MonitoringStack(app, "CryptoSignals-Monitoring", env=env)
+
+# Keep a reference so future stacks (DataStack in Step 1.16) can consume the
+# VPC + egress SG without re-importing them.
+_ = network.vpc
+
+# cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a
+# stack adds a resource, any insecure default is flagged immediately.
 cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
 
 app.synth()
