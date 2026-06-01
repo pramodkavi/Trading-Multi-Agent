@@ -18,8 +18,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import scripts.run_scan as run_scan_module
 from scripts.run_scan import (
     MarketCommentary,
+    _alambda,
     compose_message,
     generate_commentary,
     run_one_symbol,
@@ -377,3 +379,117 @@ class TestRunOneSymbol:
         store.fail_scan.assert_awaited_once()
         error_message = store.fail_scan.await_args.kwargs["error_message"]
         assert "boom" in error_message
+
+
+# ---------------------------------------------------------------------------
+# lambda_handler — serverless entry point
+# ---------------------------------------------------------------------------
+
+
+class TestLambdaHandler:
+    """Exercises the async core (_alambda) under pytest's loop.
+
+    The thin sync lambda_handler wrapper is just ``asyncio.run(_alambda(...))``;
+    testing the core directly avoids spinning a fresh event loop per call, which
+    on Windows leaves an unclosed-loop ResourceWarning that filterwarnings=error
+    would fail on.
+    """
+
+    def _patch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        run: AsyncMock,
+    ) -> dict[str, MagicMock]:
+        """Patch every external dependency the handler reaches.
+
+        run_one_symbol itself is replaced (its own behaviour is covered by
+        TestRunOneSymbol); here we test event parsing, dependency lifecycle,
+        and result shaping in isolation.
+        """
+        store = MagicMock()
+        store.aclose = AsyncMock()
+        provider = MagicMock()
+        provider.aclose = AsyncMock()
+        notifier = MagicMock()
+        notifier.aclose = AsyncMock()
+        provider_factory = MagicMock(return_value=provider)
+        notifier_factory = MagicMock(return_value=notifier)
+
+        monkeypatch.setattr(run_scan_module, "create_store", AsyncMock(return_value=store))
+        monkeypatch.setattr(run_scan_module, "BinanceProvider", provider_factory)
+        monkeypatch.setattr(run_scan_module, "TelegramNotifier", notifier_factory)
+        monkeypatch.setattr(run_scan_module, "run_one_symbol", run)
+        return {
+            "store": store,
+            "provider": provider,
+            "notifier_factory": notifier_factory,
+        }
+
+    @staticmethod
+    def _ok_run() -> AsyncMock:
+        from uuid import uuid4
+
+        return AsyncMock(side_effect=lambda **kw: SimpleNamespace(scan_id=uuid4()))
+
+    async def test_event_symbols_list_runs_each(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = self._ok_run()
+        deps = self._patch(monkeypatch, run=run)
+
+        result = await _alambda({"symbols": ["BTCUSDT", "ETHUSDT"]}, _settings())
+
+        assert result["ok"] is True
+        assert [s["symbol"] for s in result["scans"]] == ["BTCUSDT", "ETHUSDT"]
+        assert all(s["status"] == "ok" for s in result["scans"])
+        assert run.await_count == 2
+        deps["store"].aclose.assert_awaited_once()
+
+    async def test_event_single_symbol(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = self._ok_run()
+        self._patch(monkeypatch, run=run)
+
+        result = await _alambda({"symbol": "SOLUSDT"}, _settings())
+
+        assert result["scans"][0]["symbol"] == "SOLUSDT"
+        assert run.await_count == 1
+
+    async def test_empty_event_falls_back_to_watchlist(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = self._ok_run()
+        self._patch(monkeypatch, run=run)
+
+        result = await _alambda(None, _settings())
+
+        # _settings() carries the default 4-symbol watchlist.
+        assert run.await_count == 4
+        assert result["ok"] is True
+
+    async def test_one_symbol_failure_marks_overall_not_ok(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from uuid import uuid4
+
+        def _side_effect(**kwargs: object) -> SimpleNamespace:
+            if kwargs["symbol"] == "ETHUSDT":
+                raise RuntimeError("boom")
+            return SimpleNamespace(scan_id=uuid4())
+
+        run = AsyncMock(side_effect=_side_effect)
+        self._patch(monkeypatch, run=run)
+
+        result = await _alambda({"symbols": ["BTCUSDT", "ETHUSDT"]}, _settings())
+
+        assert result["ok"] is False
+        statuses = {s["symbol"]: s["status"] for s in result["scans"]}
+        assert statuses == {"BTCUSDT": "ok", "ETHUSDT": "error"}
+        eth = next(s for s in result["scans"] if s["symbol"] == "ETHUSDT")
+        assert "boom" in eth["error"]
+
+    async def test_notify_false_skips_notifier(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        run = self._ok_run()
+        deps = self._patch(monkeypatch, run=run)
+
+        await _alambda({"symbol": "BTCUSDT", "notify": False}, _settings())
+
+        deps["notifier_factory"].assert_not_called()

@@ -6,16 +6,24 @@ script after a successful prior run is a no-op -- a property SPEC §5.2
 requires for persistence steps.
 
 Usage:
-    # Production / dev: pull connection from environment.
+    # Local dev (psycopg over a Postgres socket): pull connection from env.
     python -m scripts.migrate
 
     # Override URL explicitly (handy for one-off targets).
     python -m scripts.migrate --database-url "postgresql://user:pw@host/db"
 
+    # Serverless (Aurora RDS Data API; the VPC-less Lambda path).
+    python -m scripts.migrate --backend dataapi \
+        --cluster-arn arn:aws:rds:...:cluster:c \
+        --secret-arn  arn:aws:secretsmanager:...:secret:s
+
     # Just print the SQL that would be executed; no connection touched.
     python -m scripts.migrate --dry-run
 
-Connection URL precedence: --database-url flag > DATABASE_URL env var.
+Connection precedence:
+    psycopg  -- --database-url flag > DATABASE_URL env var.
+    dataapi  -- --cluster-arn/--secret-arn flags > DB_CLUSTER_ARN/DB_SECRET_ARN
+                env vars; --db-name > DB_NAME > 'signals'.
 
 Why psycopg (sync) here instead of asyncpg:
     Migrations are one-shot operations. Async buys us nothing on a single
@@ -37,7 +45,7 @@ from typing import TYPE_CHECKING
 
 import psycopg
 
-from src.persistence import SCHEMA_SQL_PATH
+from src.persistence import SCHEMA_SQL_PATH, run_data_api_migration
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Sequence
@@ -45,6 +53,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 DATABASE_URL_ENV: str = "DATABASE_URL"
+CLUSTER_ARN_ENV: str = "DB_CLUSTER_ARN"
+SECRET_ARN_ENV: str = "DB_SECRET_ARN"
+DB_NAME_ENV: str = "DB_NAME"
 
 
 def run_migration(
@@ -101,13 +112,43 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Apply the crypto-signals Postgres schema (idempotent).",
     )
     parser.add_argument(
+        "--backend",
+        choices=["psycopg", "dataapi"],
+        default="psycopg",
+        help=(
+            "How to reach the database: 'psycopg' (a Postgres socket, local "
+            "dev) or 'dataapi' (Aurora RDS Data API, serverless). Default psycopg."
+        ),
+    )
+    parser.add_argument(
         "--database-url",
         dest="database_url",
         default=None,
         help=(
             "Postgres connection URL "
             "(postgresql://user:pw@host:5432/db). "
-            f"Falls back to ${DATABASE_URL_ENV}."
+            f"Falls back to ${DATABASE_URL_ENV}. Used by --backend psycopg."
+        ),
+    )
+    parser.add_argument(
+        "--cluster-arn",
+        dest="cluster_arn",
+        default=None,
+        help=f"Aurora cluster ARN for --backend dataapi. Falls back to ${CLUSTER_ARN_ENV}.",
+    )
+    parser.add_argument(
+        "--secret-arn",
+        dest="secret_arn",
+        default=None,
+        help=f"Credentials secret ARN for --backend dataapi. Falls back to ${SECRET_ARN_ENV}.",
+    )
+    parser.add_argument(
+        "--db-name",
+        dest="db_name",
+        default=None,
+        help=(
+            "Database name for --backend dataapi (default 'signals'). "
+            f"Falls back to ${DB_NAME_ENV}."
         ),
     )
     parser.add_argument(
@@ -144,9 +185,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(sql)
         return 0
 
+    if args.backend == "dataapi":
+        cluster_arn, secret_arn, db_name = _resolve_data_api_config(args)
+        count = run_data_api_migration(
+            cluster_arn=cluster_arn,
+            secret_arn=secret_arn,
+            database=db_name,
+            schema_path=args.schema_file,
+        )
+        logger.info("Applied %d statements via the Data API", count)
+        return 0
+
     database_url = _resolve_database_url(args.database_url)
     run_migration(database_url=database_url, schema_path=args.schema_file)
     return 0
+
+
+def _resolve_data_api_config(args: argparse.Namespace) -> tuple[str, str, str]:
+    """Resolve cluster ARN / secret ARN / db name for the Data API backend.
+
+    Flag wins over env var. The two ARNs are required (no sensible default for
+    a destination that mutates schema); db name defaults to 'signals'.
+    """
+    cluster_arn = args.cluster_arn or os.getenv(CLUSTER_ARN_ENV)
+    secret_arn = args.secret_arn or os.getenv(SECRET_ARN_ENV)
+    db_name = args.db_name or os.getenv(DB_NAME_ENV) or "signals"
+    if not cluster_arn or not secret_arn:
+        raise SystemExit(
+            "--backend dataapi requires --cluster-arn/--secret-arn "
+            f"(or ${CLUSTER_ARN_ENV}/${SECRET_ARN_ENV})."
+        )
+    return cluster_arn, secret_arn, db_name
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entrypoint

@@ -39,7 +39,7 @@ import hashlib
 import logging
 import sys
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
@@ -338,6 +338,110 @@ async def run_one_symbol(
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+# ---------------------------------------------------------------------------
+# AWS Lambda entry point (serverless deploy, Step 1.17)
+# ---------------------------------------------------------------------------
+
+
+async def _run_symbols(
+    *,
+    settings: Settings,
+    symbols: list[str],
+    notify: bool,
+) -> list[dict[str, Any]]:
+    """Run a scan for each symbol, sharing one store / provider / notifier.
+
+    Each symbol is independent: a failure on one is captured in its result
+    entry and does not abort the others (``run_one_symbol`` has already flipped
+    that scan's row to FAILED before re-raising). The store backend is chosen
+    by ``settings.persistence_backend`` -- ``dataapi`` in the Lambda.
+    """
+    store = await create_store(settings)
+    results: list[dict[str, Any]] = []
+    try:
+        provider = BinanceProvider()
+        notifier: Notifier | None = (
+            TelegramNotifier(
+                token=settings.telegram_bot_token.get_secret_value(),
+                chat_id=settings.telegram_chat_id,
+            )
+            if notify
+            else None
+        )
+        try:
+            for symbol in symbols:
+                try:
+                    ctx = await run_one_symbol(
+                        settings=settings,
+                        symbol=symbol,
+                        provider=provider,
+                        store=store,
+                        notifier=notifier,
+                    )
+                    results.append({"symbol": symbol, "scan_id": str(ctx.scan_id), "status": "ok"})
+                except Exception as exc:
+                    # Report this symbol's failure and keep scanning the rest.
+                    logger.exception("lambda scan failed for %s", symbol)
+                    results.append(
+                        {
+                            "symbol": symbol,
+                            "status": "error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+        finally:
+            await provider.aclose()
+            if notifier is not None:
+                await notifier.aclose()
+    finally:
+        await store.aclose()
+    return results
+
+
+def _symbols_from_event(event: dict[str, Any], settings: Settings) -> list[str]:
+    """Resolve the symbols to scan: event override, else the watchlist.
+
+    Accepts ``{"symbols": [...]}`` or ``{"symbol": "BTCUSDT"}``; with neither
+    (the scheduled EventBridge invocation sends an empty payload) it falls back
+    to ``settings.scan_symbols``.
+    """
+    if event.get("symbols"):
+        return [str(s) for s in event["symbols"]]
+    if event.get("symbol"):
+        return [str(event["symbol"])]
+    return list(settings.scan_symbols)
+
+
+async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str, Any]:
+    """Async core of the Lambda handler (the awaitable part, sans event loop).
+
+    Kept separate from ``lambda_handler`` so tests can await it under pytest's
+    managed loop instead of spinning a fresh ``asyncio.run`` loop -- which on
+    Windows leaves an unclosed-loop ResourceWarning.
+    """
+    payload = event or {}
+    symbols = _symbols_from_event(payload, settings)
+    notify = bool(payload.get("notify", True))
+    logger.info("lambda scan starting for %s (notify=%s)", symbols, notify)
+
+    results = await _run_symbols(settings=settings, symbols=symbols, notify=notify)
+    ok = all(r["status"] == "ok" for r in results)
+    return {"ok": ok, "scans": results}
+
+
+def lambda_handler(event: dict[str, Any] | None, context: object) -> dict[str, Any]:
+    """AWS Lambda entry point: run the scan and return a structured result.
+
+    Triggered by EventBridge Scheduler (Step 1.19). Loads configuration from
+    the environment (Secrets Manager values are injected as env vars by the
+    LambdaStack, Step 1.18), runs the scan for the configured symbol(s), and
+    returns a JSON-serialisable summary. ``ok`` is False if any symbol errored,
+    so the invocation surfaces failures to CloudWatch without losing the
+    successful scans.
+    """
+    return asyncio.run(_alambda(event, get_settings()))
 
 
 # ---------------------------------------------------------------------------

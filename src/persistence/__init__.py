@@ -22,6 +22,11 @@ Public API:
 
 from pathlib import Path
 
+from src.persistence.dataapi_migrate import (
+    apply_schema_via_data_api,
+    run_data_api_migration,
+    split_sql_statements,
+)
 from src.persistence.factory import create_store
 from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
 from src.persistence.repositories import (
@@ -53,5 +58,8 @@ __all__ = [
     "StoredAgentRun",
     "StoredScanRun",
     "StoredSignal",
+    "apply_schema_via_data_api",
     "create_store",
+    "run_data_api_migration",
+    "split_sql_statements",
 ]
