@@ -14,15 +14,25 @@ Public API:
     SignalRepository    -- async CRUD over signals.
     AgentRunRepository  -- async writes for agent_runs.
     ScanRunRepository   -- async lifecycle ops for scan_runs.
+    SignalStore         -- backend-neutral persistence Protocol (Step 1.17).
+    AsyncpgSignalStore  -- SignalStore over a local asyncpg connection.
+    DataApiSignalStore  -- SignalStore over the Aurora RDS Data API (cloud).
+    create_store        -- factory selecting the backend from Settings.
 """
 
 from pathlib import Path
 
+from src.persistence.factory import create_store
 from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
 from src.persistence.repositories import (
     AgentRunRepository,
     ScanRunRepository,
     SignalRepository,
+)
+from src.persistence.store import (
+    AsyncpgSignalStore,
+    DataApiSignalStore,
+    SignalStore,
 )
 
 SCHEMA_SQL_PATH: Path = Path(__file__).parent / "schema.sql"
@@ -35,9 +45,13 @@ __all__ = [
     "EXPECTED_TABLES",
     "SCHEMA_SQL_PATH",
     "AgentRunRepository",
+    "AsyncpgSignalStore",
+    "DataApiSignalStore",
     "ScanRunRepository",
     "SignalRepository",
+    "SignalStore",
     "StoredAgentRun",
     "StoredScanRun",
     "StoredSignal",
+    "create_store",
 ]

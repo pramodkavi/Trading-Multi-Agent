@@ -25,7 +25,6 @@ from scripts.run_scan import (
     run_one_symbol,
 )
 from src.common.models import (
-    ScanStatus,
     SignalProposal,
     SkipDecision,
     SkipReason,
@@ -146,10 +145,16 @@ def _provider(snapshot: MarketSnapshot) -> MagicMock:
     return provider
 
 
-def _conn() -> MagicMock:
-    conn = MagicMock()
-    conn.execute = AsyncMock()
-    return conn
+def _store() -> MagicMock:
+    """A mock SignalStore: every write method is an AsyncMock."""
+    store = MagicMock()
+    store.start_scan = AsyncMock()
+    store.complete_scan = AsyncMock()
+    store.fail_scan = AsyncMock()
+    store.create_signal = AsyncMock()
+    store.log_agent_run = AsyncMock()
+    store.aclose = AsyncMock()
+    return store
 
 
 def _notifier() -> MagicMock:
@@ -269,7 +274,7 @@ class TestComposeMessage:
 class TestRunOneSymbol:
     async def test_bullish_publishes_persists_and_notifies(self) -> None:
         provider = _provider(_snapshot(_bullish_series()))
-        conn = _conn()
+        store = _store()
         notifier = _notifier()
         client = _anthropic_client()
 
@@ -277,7 +282,7 @@ class TestRunOneSymbol:
             settings=_settings(),
             symbol="BTCUSDT",
             provider=provider,
-            conn=conn,
+            store=store,
             notifier=notifier,
             anthropic_client=client,
         )
@@ -288,14 +293,17 @@ class TestRunOneSymbol:
         client.messages.create.assert_awaited_once()
         # Telegram sent.
         notifier.send.assert_awaited_once()
-        # DB writes happened: start_scan, create_signal, log_run, complete_scan
-        # all funnel through conn.execute.
-        assert conn.execute.await_count >= 4
+        # The full happy-path persistence sequence ran through the store.
+        store.start_scan.assert_awaited_once()
+        store.create_signal.assert_awaited_once()
+        store.log_agent_run.assert_awaited_once()
+        store.complete_scan.assert_awaited_once()
+        store.fail_scan.assert_not_awaited()
         assert ctx.strategy == "smc"
 
     async def test_ranging_skips_but_still_persists_and_notifies(self) -> None:
         provider = _provider(_snapshot(_ranging_series()))
-        conn = _conn()
+        store = _store()
         notifier = _notifier()
         client = _anthropic_client()
 
@@ -303,35 +311,37 @@ class TestRunOneSymbol:
             settings=_settings(),
             symbol="BTCUSDT",
             provider=provider,
-            conn=conn,
+            store=store,
             notifier=notifier,
             anthropic_client=client,
         )
-        # Even on a skip, the LLM is called and a message is sent.
+        # Even on a skip, the LLM is called, a row is written, and a message sent.
         client.messages.create.assert_awaited_once()
+        store.create_signal.assert_awaited_once()
         notifier.send.assert_awaited_once()
 
     async def test_no_notifier_skips_telegram(self) -> None:
         provider = _provider(_snapshot(_bullish_series()))
-        conn = _conn()
+        store = _store()
         client = _anthropic_client()
 
         await run_one_symbol(
             settings=_settings(),
             symbol="BTCUSDT",
             provider=provider,
-            conn=conn,
+            store=store,
             notifier=None,
             anthropic_client=client,
         )
         # No notifier -> no send, but DB + LLM still happen.
         client.messages.create.assert_awaited_once()
-        assert conn.execute.await_count >= 4
+        store.create_signal.assert_awaited_once()
+        store.complete_scan.assert_awaited_once()
 
     async def test_provider_failure_marks_scan_failed(self) -> None:
         provider = MagicMock()
         provider.fetch_market_snapshot = AsyncMock(side_effect=RuntimeError("binance down"))
-        conn = _conn()
+        store = _store()
         notifier = _notifier()
 
         with pytest.raises(RuntimeError, match="binance down"):
@@ -339,29 +349,31 @@ class TestRunOneSymbol:
                 settings=_settings(),
                 symbol="BTCUSDT",
                 provider=provider,
-                conn=conn,
+                store=store,
                 notifier=notifier,
                 anthropic_client=_anthropic_client(),
             )
-        # start_scan + fail_scan both executed; no notify on failure.
-        assert conn.execute.await_count >= 2
+        # start_scan + fail_scan both ran; success path and notify did not.
+        store.start_scan.assert_awaited_once()
+        store.fail_scan.assert_awaited_once()
+        store.complete_scan.assert_not_awaited()
         notifier.send.assert_not_awaited()
 
-    async def test_fail_scan_sql_uses_failed_status(self) -> None:
+    async def test_fail_scan_records_error_message(self) -> None:
         provider = MagicMock()
         provider.fetch_market_snapshot = AsyncMock(side_effect=RuntimeError("boom"))
-        conn = _conn()
+        store = _store()
 
         with pytest.raises(RuntimeError):
             await run_one_symbol(
                 settings=_settings(),
                 symbol="BTCUSDT",
                 provider=provider,
-                conn=conn,
+                store=store,
                 notifier=None,
                 anthropic_client=_anthropic_client(),
             )
-        # One of the execute calls must carry the FAILED status value.
-        all_args = [call.args for call in conn.execute.await_args_list]
-        flat = [a for args in all_args for a in args]
-        assert ScanStatus.FAILED.value in flat
+        # fail_scan carries the exception detail for the FAILED row.
+        store.fail_scan.assert_awaited_once()
+        error_message = store.fail_scan.await_args.kwargs["error_message"]
+        assert "boom" in error_message

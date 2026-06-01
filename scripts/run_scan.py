@@ -41,7 +41,6 @@ import sys
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-import asyncpg
 from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
 
@@ -61,11 +60,7 @@ from src.notifications import (
     format_new_signal,
     format_skip,
 )
-from src.persistence import (
-    AgentRunRepository,
-    ScanRunRepository,
-    SignalRepository,
-)
+from src.persistence import create_store
 from src.providers import BinanceProvider, Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -75,6 +70,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from src.common.llm import StructuredCompletionResult
     from src.config import Settings
     from src.notifications import Notifier
+    from src.persistence import SignalStore
     from src.providers import DataProvider
 
 logger = logging.getLogger(__name__)
@@ -196,7 +192,7 @@ def _input_hash(text: str) -> str:
 
 async def _persist(
     *,
-    conn: asyncpg.Connection[asyncpg.Record],
+    store: SignalStore,
     ctx: ScanContext,
     symbol: str,
     state: AgentState,
@@ -211,9 +207,9 @@ async def _persist(
     if proposal is None:
         raise RuntimeError("graph produced no proposal/skip; cannot persist")
 
-    await SignalRepository(conn).create_signal(proposal)
+    await store.create_signal(proposal)
 
-    await AgentRunRepository(conn).log_run(
+    await store.log_agent_run(
         scan_id=ctx.scan_id,
         agent_role=AgentRole.ANALYZER,
         strategy=ctx.strategy,
@@ -263,7 +259,7 @@ async def run_one_symbol(
     settings: Settings,
     symbol: str,
     provider: DataProvider,
-    conn: asyncpg.Connection[asyncpg.Record],
+    store: SignalStore,
     notifier: Notifier | None,
     anthropic_client: AsyncAnthropic | None = None,
 ) -> ScanContext:
@@ -272,6 +268,9 @@ async def run_one_symbol(
     Lifecycle: start_scan -> fetch -> graph -> live LLM -> persist -> notify
     -> complete_scan. Any exception flips the scan row to FAILED and re-raises
     so the caller surfaces a non-zero exit.
+
+    Persistence is reached through the backend-neutral ``SignalStore`` (Step
+    1.17): the same code path serves local asyncpg and the cloud Data API.
     """
     ctx = ScanContext(
         session=ScanSession.AD_HOC,
@@ -279,8 +278,7 @@ async def run_one_symbol(
         strategy="smc",
         triggered_by="manual",
     )
-    scan_repo = ScanRunRepository(conn)
-    await scan_repo.start_scan(
+    await store.start_scan(
         scan_id=ctx.scan_id,
         started_at=ctx.started_at,
         session=ctx.session.value,
@@ -312,7 +310,7 @@ async def run_one_symbol(
         )
 
         await _persist(
-            conn=conn,
+            store=store,
             ctx=ctx,
             symbol=symbol,
             state=state,
@@ -324,11 +322,11 @@ async def run_one_symbol(
             await notifier.send(compose_message(state, commentary_result.output))
             logger.info("telegram message sent")
 
-        await scan_repo.complete_scan(scan_id=ctx.scan_id, completed_at=_utcnow())
+        await store.complete_scan(scan_id=ctx.scan_id, completed_at=_utcnow())
         logger.info("scan %s completed", ctx.scan_id)
     except Exception as exc:
         logger.exception("scan %s failed", ctx.scan_id)
-        await scan_repo.fail_scan(
+        await store.fail_scan(
             scan_id=ctx.scan_id,
             completed_at=_utcnow(),
             error_message=f"{type(exc).__name__}: {exc}",
@@ -352,9 +350,7 @@ async def _amain(*, symbol: str | None, notify: bool) -> int:
     target_symbol = symbol or settings.scan_symbols[0]
     logger.info("running scan for %s (notify=%s)", target_symbol, notify)
 
-    conn: asyncpg.Connection[asyncpg.Record] = await asyncpg.connect(
-        settings.database_url.get_secret_value()
-    )
+    store = await create_store(settings)
     try:
         provider = BinanceProvider()
         notifier: Notifier | None = (
@@ -370,7 +366,7 @@ async def _amain(*, symbol: str | None, notify: bool) -> int:
                 settings=settings,
                 symbol=target_symbol,
                 provider=provider,
-                conn=conn,
+                store=store,
                 notifier=notifier,
             )
         finally:
@@ -378,7 +374,7 @@ async def _amain(*, symbol: str | None, notify: bool) -> int:
             if notifier is not None:
                 await notifier.aclose()
     finally:
-        await conn.close()
+        await store.aclose()
 
     return 0
 

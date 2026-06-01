@@ -195,6 +195,63 @@ class TestLogLevel:
 
 
 # ---------------------------------------------------------------------------
+# Persistence backend selection (Step 1.17)
+# ---------------------------------------------------------------------------
+
+
+class TestPersistenceBackend:
+    def test_defaults_to_asyncpg(self) -> None:
+        s = Settings(**_required_kwargs())
+        assert s.persistence_backend == "asyncpg"
+        assert s.db_name == "signals"
+        assert s.db_cluster_arn is None
+        assert s.db_secret_arn is None
+
+    def test_asyncpg_requires_database_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with pytest.raises(ValidationError, match="requires database_url"):
+            Settings(
+                anthropic_api_key="x",
+                telegram_bot_token="y",
+                telegram_chat_id="z",
+                persistence_backend="asyncpg",
+                _env_file=None,
+            )
+
+    def test_dataapi_backend_needs_no_database_url(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        s = Settings(
+            anthropic_api_key="x",
+            telegram_bot_token="y",
+            telegram_chat_id="z",
+            persistence_backend="dataapi",
+            db_cluster_arn="arn:aws:rds:...:cluster:c",
+            db_secret_arn="arn:aws:secretsmanager:...:secret:s",
+            _env_file=None,
+        )
+        assert s.database_url is None
+        assert s.persistence_backend == "dataapi"
+        assert s.db_cluster_arn == "arn:aws:rds:...:cluster:c"
+
+    def test_dataapi_requires_cluster_and_secret_arns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with pytest.raises(ValidationError, match="requires db_cluster_arn"):
+            Settings(
+                anthropic_api_key="x",
+                telegram_bot_token="y",
+                telegram_chat_id="z",
+                persistence_backend="dataapi",
+                _env_file=None,
+            )
+
+    def test_invalid_backend_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            Settings(**_required_kwargs(persistence_backend="redis"))
+
+
+# ---------------------------------------------------------------------------
 # Environment-variable loading & precedence
 # ---------------------------------------------------------------------------
 

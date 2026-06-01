@@ -38,6 +38,8 @@ import asyncio
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid4
 
+import asyncpg
+
 from src.common.models import (
     AgentRole,
     SignalDirection,
@@ -46,7 +48,13 @@ from src.common.models import (
     SkipDecision,
 )
 from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
-from src.persistence.repositories import _parse_jsonb_field, _to_jsonb
+from src.persistence.repositories import (
+    AgentRunRepository,
+    ScanRunRepository,
+    SignalRepository,
+    _parse_jsonb_field,
+    _to_jsonb,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping, Sequence
@@ -531,3 +539,117 @@ class DataApiSignalStore:
         ``async with``-style teardown regardless of backend.
         """
         return None
+
+
+# ---------------------------------------------------------------------------
+# AsyncpgSignalStore
+# ---------------------------------------------------------------------------
+
+
+class AsyncpgSignalStore:
+    """``SignalStore`` backed by a single asyncpg connection (local dev / tests).
+
+    Thin facade over the Step 1.9 repositories: it owns the connection's
+    lifetime (``aclose`` closes it) and forwards each call to the matching
+    repository method. The only adaptation is naming -- the repositories expose
+    ``get_by_id`` / ``list_recent`` / ``log_run``; the store renames them to the
+    backend-neutral ``get_scan_run`` / ``get_signal`` / ``list_recent_signals``
+    / ``log_agent_run`` so both backends present one identical surface.
+
+    Scope (Slice 1): one connection, no pool. The pool-aware variant arrives in
+    Slice 2 Step 2.13 with multi-symbol parallelism; the ``SignalStore``
+    interface stays the same, so callers are unaffected.
+    """
+
+    def __init__(self, conn: asyncpg.Connection[Any]) -> None:
+        self._conn = conn
+        self._scans = ScanRunRepository(conn)
+        self._signals = SignalRepository(conn)
+        self._agent_runs = AgentRunRepository(conn)
+
+    @classmethod
+    async def connect(cls, dsn: str) -> AsyncpgSignalStore:
+        """Open a connection to ``dsn`` and wrap it in a store."""
+        conn: asyncpg.Connection[Any] = await asyncpg.connect(dsn)
+        return cls(conn)
+
+    # ---- scan_runs --------------------------------------------------------
+
+    async def start_scan(
+        self,
+        *,
+        scan_id: UUID,
+        started_at: datetime,
+        session: str | None = None,
+        strategy: str | None = None,
+        symbols: list[str] | None = None,
+    ) -> None:
+        await self._scans.start_scan(
+            scan_id=scan_id,
+            started_at=started_at,
+            session=session,
+            strategy=strategy,
+            symbols=symbols,
+        )
+
+    async def complete_scan(self, *, scan_id: UUID, completed_at: datetime) -> None:
+        await self._scans.complete_scan(scan_id=scan_id, completed_at=completed_at)
+
+    async def fail_scan(self, *, scan_id: UUID, completed_at: datetime, error_message: str) -> None:
+        await self._scans.fail_scan(
+            scan_id=scan_id,
+            completed_at=completed_at,
+            error_message=error_message,
+        )
+
+    async def get_scan_run(self, scan_id: UUID) -> StoredScanRun | None:
+        return await self._scans.get_by_id(scan_id)
+
+    # ---- signals ----------------------------------------------------------
+
+    async def create_signal(self, payload: SignalProposal | SkipDecision) -> UUID:
+        return await self._signals.create_signal(payload)
+
+    async def get_signal(self, signal_id: UUID) -> StoredSignal | None:
+        return await self._signals.get_by_id(signal_id)
+
+    async def list_recent_signals(
+        self, *, limit: int = 50, symbol: str | None = None
+    ) -> list[StoredSignal]:
+        return await self._signals.list_recent(limit=limit, symbol=symbol)
+
+    # ---- agent_runs -------------------------------------------------------
+
+    async def log_agent_run(
+        self,
+        *,
+        scan_id: UUID,
+        agent_role: AgentRole,
+        strategy: str | None,
+        input_hash: str,
+        output: Mapping[str, Any],
+        latency_ms: int,
+        token_usage: Mapping[str, Any] | None = None,
+        cost_usd: float | None = None,
+        created_at: datetime | None = None,
+    ) -> UUID:
+        return await self._agent_runs.log_run(
+            scan_id=scan_id,
+            agent_role=agent_role,
+            strategy=strategy,
+            input_hash=input_hash,
+            output=output,
+            latency_ms=latency_ms,
+            token_usage=token_usage,
+            cost_usd=cost_usd,
+            created_at=created_at,
+        )
+
+    async def get_agent_run(self, run_id: UUID) -> StoredAgentRun | None:
+        return await self._agent_runs.get_by_id(run_id)
+
+    # ---- lifecycle --------------------------------------------------------
+
+    async def aclose(self) -> None:
+        """Close the underlying connection."""
+        await self._conn.close()

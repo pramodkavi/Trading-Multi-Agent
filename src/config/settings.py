@@ -24,9 +24,9 @@ Field policy (per the Step 1.11 design decision):
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # SPEC Appendix B / §11: default Slice 1-2 watchlist.
@@ -57,15 +57,40 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr = Field(
         description="Telegram bot token from @BotFather. Treated as a secret.",
     )
-    database_url: SecretStr = Field(
+    database_url: SecretStr | None = Field(
+        default=None,
         description="Postgres DSN, e.g. postgresql://user:pw@host:5432/db. "
-        "Secret because it embeds credentials.",
+        "Secret because it embeds credentials. Required only when "
+        "persistence_backend='asyncpg' (local dev); the cloud Lambda uses the "
+        "Data API and leaves this unset.",
     )
 
     # ---- Required non-secret ---------------------------------------------
     telegram_chat_id: str = Field(
         min_length=1,
         description="Target Telegram chat id (numeric) or '@channel' handle.",
+    )
+
+    # ---- Persistence backend selection (Step 1.17) -----------------------
+    persistence_backend: Literal["asyncpg", "dataapi"] = Field(
+        default="asyncpg",
+        description="Which SignalStore backend to build: 'asyncpg' (local "
+        "Postgres socket) or 'dataapi' (Aurora RDS Data API, cloud Lambda).",
+    )
+    db_cluster_arn: str | None = Field(
+        default=None,
+        description="Aurora cluster ARN for the Data API. Required when "
+        "persistence_backend='dataapi'.",
+    )
+    db_secret_arn: str | None = Field(
+        default=None,
+        description="Secrets Manager ARN of the Aurora credentials secret used "
+        "by the Data API. Required when persistence_backend='dataapi'.",
+    )
+    db_name: str = Field(
+        default="signals",
+        min_length=1,
+        description="Logical database name targeted by the Data API.",
     )
 
     # ---- Operational (defaulted) -----------------------------------------
@@ -117,6 +142,27 @@ class Settings(BaseSettings):
                 raise ValueError(f"log_level must be one of {sorted(_VALID_LOG_LEVELS)}, got {v!r}")
             return upper
         return v
+
+    @model_validator(mode="after")
+    def _backend_requirements(self) -> Settings:
+        """Enforce the fields the selected persistence backend depends on.
+
+        Done as a cross-field check (rather than making every field required)
+        because the two deployment targets need different things: the local
+        asyncpg path needs a DSN, while the cloud Data API path needs the
+        cluster + secret ARNs and never sees a DSN. Failing here -- at startup
+        -- beats a confusing connection error on the first scan.
+        """
+        if self.persistence_backend == "asyncpg":
+            if self.database_url is None:
+                raise ValueError("persistence_backend='asyncpg' requires database_url")
+        elif self.persistence_backend == "dataapi" and (
+            self.db_cluster_arn is None or self.db_secret_arn is None
+        ):
+            raise ValueError(
+                "persistence_backend='dataapi' requires db_cluster_arn and db_secret_arn"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)
