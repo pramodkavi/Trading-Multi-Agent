@@ -47,10 +47,10 @@ Risk gates live in `src/agents/orchestration/risk_gates.py` as pure functions in
 | Orchestration | LangGraph v1.0+, Postgres checkpointer |
 | Validation | Pydantic v2 at every agent boundary |
 | Observability | Langfuse (self-hosted) — every LLM/tool call traced from day one |
-| DB | RDS Serverless v2 PostgreSQL 16+ with pgvector |
+| DB | Aurora Serverless v2 PostgreSQL 16+ with pgvector (scale-to-zero). Cloud access via RDS Data API; local dev via asyncpg → Docker. Dual-backend repositories. |
 | Storage | S3 (versioning on, Glacier after 90 days) |
-| Compute | ECS Fargate (scheduled tasks + long-running dashboard service) |
-| Scheduling | EventBridge Scheduler |
+| Compute | **AWS Lambda** (container image, outside VPC) for the agent pipeline — revised from ECS Fargate, see SPEC §2.4. Dashboard (Slice 4) is a separate long-running Fargate/App Runner service. |
+| Scheduling | EventBridge Scheduler → Lambda |
 | Secrets | AWS Secrets Manager |
 | IaC | AWS CDK (Python) + cdk-nag + `aws-cdk@aws-skills` plugin |
 | Local dev | LocalStack + docker-compose |
@@ -95,7 +95,7 @@ Minutes are `:03` deliberately — avoids clock-jitter on `:00`.
 
 ## 7. Current Build Status
 
-- **Slice 1 (Weeks 1-3):** End-to-end substrate — one symbol, one strategy (SMC Analyzer only), Telegram delivery from Fargate.
+- **Slice 1 (Weeks 1-3):** End-to-end substrate — one symbol, one strategy (SMC Analyzer only), Telegram delivery from a scheduled **Lambda** (serverless; revised from Fargate — SPEC §2.4).
 - **Slice 2 (Weeks 4-7):** Full 4-agent pipeline + Forecaster + risk gates + multi-symbol watchlist.
 - **Slice 3 (Weeks 8-11):** Strategy registry + embeddings + Critic with PR opening.
 - **Slice 4 (Weeks 12-15):** FastAPI + React dashboard, Cognito auth, WebSocket real-time.
@@ -108,7 +108,7 @@ See SPEC.md §6.8. Do not build without explicit user request:
 - Order execution / broker integration (signal-only is permanent).
 - Mobile app, multi-tenancy, backtesting framework.
 - Custom LLM fine-tuning. Alternative LLM providers.
-- Microservices split (monolith Fargate is correct at this scale).
+- Microservices split / Step Functions fan-out (a single scan Lambda is correct at this scale).
 - Indicators like RSI/MACD/Bollinger/MAs.
 
 ## 9. When to Pause and Ask (SPEC.md §6.9)

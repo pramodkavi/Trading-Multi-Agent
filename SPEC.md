@@ -112,10 +112,12 @@ Minutes set to `:03` deliberately to avoid clock jitter on `:00` minutes.
 
 | Component | Technology | Rationale |
 |---|---|---|
-| Primary database | RDS Serverless v2 PostgreSQL 16+ | Single query language for everything; scales to zero when idle |
+| Primary database | Aurora Serverless v2 PostgreSQL 16+ (RDS) | Single query language for everything; **scale-to-zero** (auto-pause) keeps idle cost near storage-only for our bursty workload |
+| DB access (cloud) | RDS Data API (HTTPS, IAM-authenticated) | Lets the Lambda query the DB **without a VPC attachment** — the key enabler of a NAT-free serverless design |
+| DB access (local dev) | asyncpg → Docker Postgres + pgvector | Fast local iteration loop preserved; the persistence layer carries **dual backends** (asyncpg local / Data API cloud) behind one repository interface |
 | Vector extension | pgvector | Native vector similarity inside Postgres; no separate vector DB |
-| Blob storage | Amazon S3 (versioning enabled) | Audit retention, large reasoning logs, cold data |
-| Secrets | AWS Secrets Manager | Anthropic API key, Telegram bot token, FRED/Twelve Data keys |
+| Blob storage | Amazon S3 (versioning enabled) | Audit retention, large reasoning logs (>1MB), cold data |
+| Secrets | AWS Secrets Manager | Anthropic API key, Telegram bot token, FRED/Twelve Data keys, DB credentials |
 
 ### 2.3 Data Acquisition Layer
 
@@ -130,18 +132,23 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 ### 2.4 Compute Layer
 
+> **Architecture decision (revised 2026-06, supersedes the original ECS Fargate plan):** the agent pipeline runs on **AWS Lambda**, not ECS Fargate. For an event-driven job that runs a few times a day and finishes in seconds (far under Lambda's 15-minute limit), Lambda is cheaper and simpler. Crucially, the Lambda runs **outside any VPC**, so its egress to the non-AWS APIs it must call (Binance, Anthropic, Telegram) is free over the public internet — **no NAT Gateway, no VPC interface endpoints**. The database is reached over the **RDS Data API** (HTTPS), so the Lambda needs no VPC attachment. A minimal VPC exists only to host Aurora in isolated subnets.
+
 | Component | Technology | Rationale |
 |---|---|---|
-| Container compute | ECS Fargate | Same paradigm for scheduled tasks and long-running services; no Lambda 15-min cliff |
-| Scheduling | EventBridge Scheduler | Triggers Fargate scheduled tasks for cron scans |
-| Container registry | Amazon ECR | Standard AWS container store |
-| Service discovery | AWS Cloud Map | For internal service-to-service calls between dashboard backend and agents |
+| Agent compute | AWS Lambda (container image) | Event-driven, scale-to-zero, no cluster to manage; one scan finishes in seconds |
+| Packaging | Container image in Amazon ECR | Reuse the project Dockerfile (deps too large for a zip); Lambda pulls the image |
+| Scheduling | EventBridge Scheduler → Lambda | Cron rules invoke the scan Lambda directly |
+| DB connectivity | RDS Data API (boto3 `rds-data`) | Lambda queries Aurora over HTTPS — no VPC attachment, therefore no NAT |
+| Future fan-out | AWS Step Functions (deferred) | If a later slice needs per-symbol parallelism beyond one Lambda's budget; not needed at Slice 1-2 scale |
+
+**Why the change from Fargate:** the original plan used "private subnets + VPC endpoints to avoid NAT," but VPC endpoints only reach *AWS* services — the task's heaviest egress is to *non-AWS* hosts (Binance/Anthropic/Telegram), which still requires a NAT (~$32/mo) or a public IP. Lambda-outside-VPC removes that dilemma entirely while also dropping the ECS cluster, task definitions, and the need to keep compute attached to the VPC. **The one workload that is not Lambda-friendly is the Slice 4 dashboard** — a long-running WebSocket service using Postgres LISTEN/NOTIFY needs a persistent connection, so it runs as a small always-on service (Fargate service or App Runner), decided in Slice 4, independent of the agent pipeline.
 
 ### 2.5 Dashboard Layer (Built in Slice 4)
 
 | Component | Technology | Rationale |
 |---|---|---|
-| Backend API | FastAPI | Same Python stack as agents; runs in same Fargate cluster |
+| Backend API | FastAPI | Same Python stack as agents; runs as a small **long-running service** (Fargate service or App Runner) — NOT Lambda, because WebSocket + Postgres LISTEN/NOTIFY need a persistent connection |
 | Real-time delivery | WebSocket + Postgres LISTEN/NOTIFY | Push state changes to dashboard |
 | Frontend | React + TypeScript | Standard SPA stack |
 | Charts | TradingView Lightweight Charts | Industry standard for crypto; free; documented |
@@ -273,9 +280,9 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 **NFR-3.1** All secrets (Anthropic API key, Telegram bot token, FRED/Twelve Data keys, database credentials) shall live in AWS Secrets Manager. No secret shall be committed to the repository.
 
-**NFR-3.2** The IAM role for the Fargate task shall follow least-privilege: read-only access to Secrets Manager for required secrets only, read-write to specific S3 prefixes only, no broader AWS access.
+**NFR-3.2** The IAM execution role for the Lambda function shall follow least-privilege: `rds-data` (Data API) access to the one Aurora cluster only, read-only Secrets Manager access for the required secrets only, read-write to specific S3 prefixes only, and CloudWatch Logs write — no broader AWS access.
 
-**NFR-3.3** Postgres shall run in a private subnet with no public IP. Access only from within the VPC.
+**NFR-3.3** Aurora shall run in isolated (private) subnets with no public IP. It is reached only via the IAM-authenticated RDS Data API (HTTPS) or from within the VPC — never via a direct public database connection.
 
 **NFR-3.4** Dashboard authentication shall be implemented via AWS Cognito (single-user initially, extensible to multi-user later).
 
@@ -291,7 +298,7 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 #### 3.3.5 Cost
 
-**NFR-5.1** Target steady-state AWS infrastructure cost: < $100/month at 4 symbols, 4 scans/day. (RDS Serverless idle + Fargate task time + S3 + CloudFront + Secrets Manager + EventBridge.)
+**NFR-5.1** Target steady-state AWS infrastructure cost: < $100/month at 4 symbols, 4 scans/day, **dominated by the database**. The serverless design (Lambda + Aurora Serverless v2 with scale-to-zero + Data API; no NAT, no VPC interface endpoints) targets the low end: Lambda invocations ≈ $0 (free tier), Aurora ≈ $1–15/mo (storage + brief active ACUs while a scan runs), Secrets Manager ≈ $2/mo, S3 + EventBridge + Data API requests = pennies. **Aurora scale-to-zero (auto-pause) is the single biggest cost lever** for an idle-heavy workload and must be enabled.
 
 **NFR-5.2** Target LLM cost: tracked per agent per scan. Budget alarm at $200/month spending.
 
@@ -317,7 +324,7 @@ The build is organized into **four vertical slices**. Each slice goes through th
 
 ### Slice 1: End-to-End Substrate Validation (Weeks 1-3)
 
-**Slice goal:** Prove the production stack works end-to-end with one symbol, one strategy, one agent, manual triggering. Output a Telegram message from a Fargate-deployed container reading from a real Postgres database.
+**Slice goal:** Prove the production stack works end-to-end with one symbol, one strategy, one agent, manual triggering. Output a Telegram message from a deployed **Lambda** reading from Aurora (via the RDS Data API).
 
 #### Step 1.1: Repository scaffolding
 
@@ -456,58 +463,95 @@ The build is organized into **four vertical slices**. Each slice goes through th
 - Create empty stacks: `NetworkStack`, `DataStack`, `ComputeStack`, `SchedulingStack`, `MonitoringStack`
 - Verify `cdk synth` produces valid CloudFormation
 
-#### Step 1.15: NetworkStack implementation
+> **Serverless re-sequencing (2026-06):** Steps 1.15-1.22 were revised when the
+> deployment target moved from ECS Fargate to AWS Lambda + Aurora Data API (see
+> §2.4). The original Fargate-oriented NetworkStack (Step 1.15) was implemented
+> and committed first; the version below replaces it with the minimal VPC the
+> serverless design needs. A new Step 1.17 adds the Data API persistence backend
+> and the Lambda handler; the old ComputeStack/Scheduling steps become the
+> LambdaStack and a Lambda-target SchedulingStack.
 
-- Define VPC with public, private (egress), and isolated subnets across 2 AZs
-- Define VPC endpoints for: S3, ECR, Secrets Manager, CloudWatch Logs (avoid NAT Gateway costs)
-- Apply cdk-nag rules
-- Deploy to dev account
-- Verify VPC exists, subnets created, endpoints reachable
+#### Step 1.15: NetworkStack implementation (minimal VPC for Aurora)
+
+- Define a minimal VPC across 2 AZs with **isolated subnets only** (no public
+  subnets, no Internet Gateway, no NAT, no VPC endpoints) — its sole purpose is
+  to host the Aurora cluster privately (NFR-3.3)
+- A DB security group allowing Postgres (5432) only from within the VPC
+- VPC flow logs (short retention) to satisfy cdk-nag VPC7 cheaply
+- Apply cdk-nag rules (zero unsuppressed errors)
+- Deploy to dev account; verify the VPC + isolated subnets exist
 
 #### Step 1.16: DataStack implementation
 
-- Define RDS Serverless v2 PostgreSQL 16 cluster in isolated subnets
-- Define S3 bucket with versioning, lifecycle policy (Glacier after 90 days)
-- Define Secrets Manager entries (placeholder values; populate manually after deploy)
-- Output: DB connection details, S3 bucket name
+- Define **Aurora Serverless v2 PostgreSQL 16** cluster in the isolated subnets,
+  with **the RDS Data API enabled** and **scale-to-zero (auto-pause)** configured
+- Enable the `pgvector` extension (via the migration, run through the Data API)
+- Define S3 bucket with versioning + lifecycle policy (Glacier after 90 days)
+- Define Secrets Manager entries (the DB cluster's managed secret, plus
+  placeholders for Anthropic / Telegram / FRED / Twelve Data — populated after deploy)
+- Output: cluster ARN, Data API secret ARN, database name, S3 bucket name
 - Deploy and verify
 
-#### Step 1.17: ComputeStack implementation
+#### Step 1.17: Serverless persistence backend + Lambda handler
 
-- Define ECR repository
-- Define ECS Fargate cluster
-- Define Fargate task definition with: container image, IAM role with least-privilege, log group, secrets injected from Secrets Manager
-- Output: cluster name, task definition ARN
-- Deploy and verify
+- Introduce a repository **interface** (Protocol) over the existing methods, with
+  two backends behind one config switch:
+  - `AsyncpgRepository` — the current asyncpg implementation (local Docker dev)
+  - `DataApiRepository` — uses `boto3 rds-data` (`execute_statement`,
+    `BatchExecuteStatement`) against the Aurora cluster; cloud runtime
+- Add a Data-API variant of the migration runner (apply `schema.sql` via the
+  Data API)
+- Add `lambda_handler(event, context)` that loads config, runs the scan for the
+  configured symbol(s), and returns a structured result — reusing
+  `run_one_symbol` with the Data API backend selected
+- Config selects the backend (e.g. `PERSISTENCE_BACKEND=asyncpg|dataapi`)
+- Tests: unit-test `DataApiRepository` with a mocked `rds-data` client (parameter
+  mapping, result parsing); keep the asyncpg integration tests for local
 
-#### Step 1.18: SchedulingStack implementation
+#### Step 1.18: LambdaStack implementation
+
+- Build the scan **Lambda from a container image** (a Lambda-runtime Dockerfile
+  using the AWS base image / runtime interface client) pushed to **ECR**
+- Lambda runs **outside any VPC** (free internet egress to Binance/Anthropic/Telegram)
+- Least-privilege execution role (NFR-3.2): `rds-data` to the one cluster,
+  read-only Secrets Manager for the required secrets, read-write to the S3
+  prefix, CloudWatch Logs write
+- Inject config via environment (`PERSISTENCE_BACKEND=dataapi`, cluster ARN,
+  secret ARN, DB name, S3 bucket) — secret *values* are read from Secrets Manager
+  at runtime, not baked in
+- Output: Lambda function ARN
+- Deploy and verify the function exists
+
+#### Step 1.19: SchedulingStack implementation
 
 - Define EventBridge Scheduler with one rule for now: `3 8 * * *` UTC
-- Define Fargate task target with appropriate IAM permissions
-- Deploy and verify rule appears in EventBridge console
+- Target the scan **Lambda** (with the appropriate invoke permission)
+- Deploy and verify the rule appears in the EventBridge console
 
-#### Step 1.19: GitHub Actions CI
+#### Step 1.20: GitHub Actions CI
 
 - Create `.github/workflows/ci.yml`
 - On every push and PR: ruff check, mypy strict, pytest with coverage report
-- On every push to main: run full test suite, build Docker image, scan with Trivy
+- On every push to main: run full test suite, build the Lambda container image,
+  scan with Trivy
 - Verify CI passes
 
-#### Step 1.20: GitHub Actions CD
+#### Step 1.21: GitHub Actions CD
 
 - Create `.github/workflows/deploy-dev.yml` — triggered on push to `main` after CI passes
-  - Build Docker image
+  - Build the Lambda container image
   - Push to ECR (dev account)
-  - Run `cdk deploy` for dev stack
+  - Run `cdk deploy` for the dev stacks
 - Create `.github/workflows/deploy-prod.yml` — triggered on git tag push
-  - Same flow but to production account
-  - Add manual approval gate
-- Verify a push to main deploys to dev, and the deployed task runs successfully when manually triggered
+  - Same flow but to the production account
+  - Add a manual approval gate
+- Verify a push to main deploys to dev, and the deployed Lambda runs successfully when manually invoked
 
-#### Step 1.21: First production scan
+#### Step 1.22: First production scan
 
-- Manually trigger the deployed Fargate task in dev account
-- Verify: Postgres receives signal record, Telegram receives message, Langfuse trace is captured, CloudWatch logs are clean
+- Manually **invoke the deployed scan Lambda** in the dev account
+- Verify: Aurora receives the signal record (via Data API), Telegram receives the
+  message, CloudWatch logs are clean
 - This is the "Hello World" of the production stack — celebrate this milestone
 
 ---
@@ -600,8 +644,9 @@ The build is organized into **four vertical slices**. Each slice goes through th
 #### Step 2.10: Forecaster scheduling
 
 - Update `SchedulingStack` to add Forecaster invocations
-- The Forecaster runs after every scan (chained via Step Functions or as a separate scheduled task)
-- Decision: separate scheduled task to maintain clean separation
+- The Forecaster runs after every scan (a separate scheduled Lambda, or the same
+  Lambda invoked with a "forecaster" mode flag)
+- Decision: separate EventBridge rule → Lambda to maintain clean separation
 - Add cron `5 8,13,15,22 * * *` for Forecaster (2 minutes after each scan)
 - Deploy and verify
 
@@ -712,7 +757,10 @@ The build is organized into **four vertical slices**. Each slice goes through th
 - Create `src/dashboard/api/` directory
 - Initialize FastAPI app with health check endpoint
 - Add to existing Docker image with new entry point
-- Update CDK `ComputeStack`: add Fargate service definition (not scheduled task) for the dashboard
+- Add a new CDK `DashboardStack` with a **Fargate service** (long-running, not a
+  scheduled task) for the dashboard backend — it needs a persistent DB
+  connection for LISTEN/NOTIFY, so it runs in the VPC alongside Aurora (unlike
+  the serverless agent pipeline)
 - Add internal Application Load Balancer
 - Deploy and verify the health check responds
 
@@ -866,10 +914,10 @@ These are out of scope for the current build but should not require rework of Sl
 ### 5.3 Slice-Level Validation Checkpoints
 
 **End of Slice 1:**
-- A Fargate-deployed task runs to completion when manually triggered
-- Telegram message arrives in your phone
-- Signal record visible in Postgres
-- Langfuse trace shows the Analyzer call
+- The scan Lambda runs to completion when manually invoked
+- Telegram message arrives on your phone
+- Signal record visible in Aurora (queried via the Data API)
+- Langfuse trace shows the Analyzer call (once Langfuse is wired)
 - Cost of one scan documented (in dollars)
 
 **End of Slice 2:**
@@ -948,9 +996,9 @@ Langfuse must be running and capturing traces from the very first LLM call. Addi
 | Problem | Likely Cause | First Response |
 |---|---|---|
 | Agent returns malformed JSON | LLM hallucination | Pydantic validation retry should handle. If repeated, tighten prompt |
-| Fargate task fails with permission error | IAM role missing permission | Check CloudWatch logs, add specific permission, redeploy |
-| Postgres connection timeouts | Aurora Serverless v2 scaling delay | Acceptable; add connection retry with backoff |
-| Binance API geo-blocked | AWS egress IP in wrong region | Move VPC to eu-west-1 or ap-southeast-1 |
+| Lambda fails with AccessDenied | Execution role missing a permission | Check CloudWatch logs, add the specific rds-data / secretsmanager / s3 permission, redeploy |
+| Data API call times out / cold | Aurora scale-to-zero waking up | Acceptable; add retry with backoff; first call after idle is slow |
+| Binance API geo-blocked | Lambda's AWS egress IP in a blocked region | Deploy the Lambda in another region (eu-west-1 or ap-southeast-1) |
 | LangGraph state corruption | Schema migration issue | Use checkpointer's ability to inspect state; manually fix in Postgres |
 | Telegram messages not arriving | Bot token revoked or chat ID wrong | Verify with `getUpdates` endpoint; rotate token if needed |
 | Critic PR not opening | GitHub token expired | Rotate token in Secrets Manager |
@@ -965,7 +1013,7 @@ To avoid scope creep, Claude Code should explicitly NOT build these unless asked
 - Backtesting framework (deserves its own design discussion)
 - Custom LLM fine-tuning (use base Claude models)
 - Alternative LLM providers (Anthropic-only)
-- Microservices split (monolith Fargate task is correct for this scale)
+- Microservices split / Step Functions fan-out (a single scan Lambda is correct at this scale)
 
 ### 6.9 When to Pause and Reconsult
 
