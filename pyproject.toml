@@ -25,6 +25,7 @@ dependencies = [
     "langgraph>=1.0",
     "httpx>=0.27",
     "asyncpg>=0.29",
+    "boto3>=1.35",
     "ccxt>=4.4",
     "aiohttp>=3.10",
     "psycopg[binary]>=3.2",
@@ -99,6 +100,15 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["asyncpg"]
+ignore_missing_imports = true
+
+# boto3 / botocore ship no type information that satisfies --strict. The
+# rds-data client is wrapped behind the DataApiSignalStore (its surface is a
+# single execute_statement call), so we treat the client as Any there rather
+# than pulling in the heavy boto3-stubs (which are themselves strict and would
+# add more friction than they remove at this scale).
+[[tool.mypy.overrides]]
+module = ["boto3"]
 ignore_missing_imports = true
 
 # --- pytest configuration ---
