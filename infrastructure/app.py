@@ -37,14 +37,16 @@ env = cdk.Environment(
 )
 
 network = NetworkStack(app, "CryptoSignals-Network", env=env)
-DataStack(app, "CryptoSignals-Data", env=env)
+DataStack(
+    app,
+    "CryptoSignals-Data",
+    env=env,
+    vpc=network.vpc,
+    db_security_group=network.db_security_group,
+)
 ComputeStack(app, "CryptoSignals-Compute", env=env)
 SchedulingStack(app, "CryptoSignals-Scheduling", env=env)
 MonitoringStack(app, "CryptoSignals-Monitoring", env=env)
-
-# Keep a reference so DataStack (Step 1.16) can consume the VPC + DB security
-# group without re-importing them.
-_ = (network.vpc, network.db_security_group)
 
 # cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a
 # stack adds a resource, any insecure default is flagged immediately.
