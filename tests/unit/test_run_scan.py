@@ -22,6 +22,7 @@ import scripts.run_scan as run_scan_module
 from scripts.run_scan import (
     MarketCommentary,
     _alambda,
+    _load_settings,
     compose_message,
     generate_commentary,
     run_one_symbol,
@@ -493,3 +494,32 @@ class TestLambdaHandler:
         await _alambda({"symbol": "BTCUSDT", "notify": False}, _settings())
 
         deps["notifier_factory"].assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _load_settings — secret hydration ordering
+# ---------------------------------------------------------------------------
+
+
+class TestLoadSettings:
+    def test_hydrates_secrets_before_building_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        order: list[str] = []
+        settings = _settings()
+
+        def _hydrate() -> None:
+            order.append("hydrate")
+
+        def _get() -> object:
+            order.append("get_settings")
+            return settings
+
+        monkeypatch.setattr(run_scan_module, "hydrate_secrets_env", _hydrate)
+        monkeypatch.setattr(run_scan_module, "get_settings", _get)
+
+        result = _load_settings()
+
+        assert result is settings
+        # Secrets must land in the env before the cached get_settings() runs.
+        assert order == ["hydrate", "get_settings"]

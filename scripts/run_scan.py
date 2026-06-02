@@ -53,7 +53,7 @@ from src.common.models import (
     SignalProposal,
     SkipDecision,
 )
-from src.config import get_settings
+from src.config import get_settings, hydrate_secrets_env
 from src.notifications import (
     TelegramNotifier,
     escape_markdown_v2,
@@ -431,17 +431,29 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
     return {"ok": ok, "scans": results}
 
 
+def _load_settings() -> Settings:
+    """Hydrate secrets from Secrets Manager, then build the cached Settings.
+
+    Order matters: ``get_settings`` is ``lru_cache``d, so the secret values must
+    be in the environment before its first call -- otherwise the cache locks in
+    a Settings validated against a half-empty environment. Locally this is a
+    no-op (no secret ARNs set) and Settings reads straight from ``.env``.
+    """
+    hydrate_secrets_env()
+    return get_settings()
+
+
 def lambda_handler(event: dict[str, Any] | None, context: object) -> dict[str, Any]:
     """AWS Lambda entry point: run the scan and return a structured result.
 
-    Triggered by EventBridge Scheduler (Step 1.19). Loads configuration from
-    the environment (Secrets Manager values are injected as env vars by the
-    LambdaStack, Step 1.18), runs the scan for the configured symbol(s), and
-    returns a JSON-serialisable summary. ``ok`` is False if any symbol errored,
-    so the invocation surfaces failures to CloudWatch without losing the
-    successful scans.
+    Triggered by EventBridge Scheduler (Step 1.19). Resolves secret values from
+    Secrets Manager (the LambdaStack injects only the secret ARNs, never the
+    values), loads configuration, runs the scan for the configured symbol(s),
+    and returns a JSON-serialisable summary. ``ok`` is False if any symbol
+    errored, so the invocation surfaces failures to CloudWatch without losing
+    the successful scans.
     """
-    return asyncio.run(_alambda(event, get_settings()))
+    return asyncio.run(_alambda(event, _load_settings()))
 
 
 # ---------------------------------------------------------------------------

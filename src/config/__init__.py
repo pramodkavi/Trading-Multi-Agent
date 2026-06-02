@@ -6,6 +6,13 @@ Public API:
     DEFAULT_WATCHLIST -- SPEC default scan symbols.
 """
 
+from src.config.secrets import hydrate_secrets_env, resolve_secrets
 from src.config.settings import DEFAULT_WATCHLIST, Settings, get_settings
 
-__all__ = ["DEFAULT_WATCHLIST", "Settings", "get_settings"]
+__all__ = [
+    "DEFAULT_WATCHLIST",
+    "Settings",
+    "get_settings",
+    "hydrate_secrets_env",
+    "resolve_secrets",
+]
