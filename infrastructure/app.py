@@ -44,7 +44,7 @@ data = DataStack(
     vpc=network.vpc,
     db_security_group=network.db_security_group,
 )
-ComputeStack(
+compute = ComputeStack(
     app,
     "CryptoSignals-Compute",
     env=env,
@@ -52,7 +52,12 @@ ComputeStack(
     bucket=data.bucket,
     api_secrets=data.api_secrets,
 )
-SchedulingStack(app, "CryptoSignals-Scheduling", env=env)
+SchedulingStack(
+    app,
+    "CryptoSignals-Scheduling",
+    env=env,
+    scan_function=compute.function,
+)
 MonitoringStack(app, "CryptoSignals-Monitoring", env=env)
 
 # cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a
