@@ -1,0 +1,71 @@
+# Continuous deployment to the dev account (Slice 1 Step 1.21).
+#
+# Triggered when the CI workflow completes successfully on main (workflow_run is
+# the faithful "after CI passes" trigger). Deploys all stacks to the dev account.
+#
+# Why no separate docker-build / ECR-push step: ComputeStack uses
+# DockerImageCode.from_image_asset, so `cdk deploy` builds the Lambda image and
+# pushes it to the CDK-managed ECR asset repo itself (ubuntu-latest has Docker).
+#
+# Auth is keyless via GitHub OIDC -> an AWS IAM role (no long-lived keys).
+#
+# One-time prerequisites (configured outside this repo):
+#   - `cdk bootstrap` the dev environment, trusting the deploy role.
+#   - GitHub repo secret  AWS_DEPLOY_ROLE_ARN  = the dev OIDC deploy role ARN.
+#   - GitHub repo variable AWS_REGION          = e.g. us-east-1.
+#   - GitHub Environment "dev".
+
+name: Deploy (dev)
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+# Never run two dev deploys at once; let an in-flight deploy finish.
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: cdk deploy (dev)
+    # Only deploy if the CI run actually succeeded.
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Deploy exactly the commit CI validated, not the branch tip.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CDK app dependencies
+        run: pip install -r infrastructure/requirements.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install the CDK CLI
+        run: npm install -g aws-cdk@2.1125.0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Deploy all stacks
+        working-directory: infrastructure
+        run: cdk deploy --all --require-approval never

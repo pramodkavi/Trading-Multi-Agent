@@ -1,0 +1,64 @@
+# Continuous deployment to the production account (Slice 1 Step 1.21).
+#
+# Triggered on a version tag push (v*.*.*), per CLAUDE.md §10. Same flow as the
+# dev deploy, with a MANUAL APPROVAL GATE: the job targets the "production"
+# GitHub Environment, whose protection rule (required reviewers) blocks the run
+# until a human approves. The approval is configured in repo settings, not here.
+#
+# As with dev, `cdk deploy` builds and pushes the Lambda image asset itself.
+#
+# One-time prerequisites (configured outside this repo):
+#   - `cdk bootstrap` the prod environment, trusting the prod deploy role.
+#   - GitHub repo secret  AWS_PROD_DEPLOY_ROLE_ARN = the prod OIDC deploy role ARN.
+#   - GitHub repo variable AWS_PROD_REGION         = e.g. us-east-1.
+#   - GitHub Environment "production" with required reviewers (the approval gate).
+
+name: Deploy (prod)
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+# Never run two prod deploys at once.
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # required for OIDC
+  contents: read
+
+jobs:
+  deploy:
+    name: cdk deploy (prod)
+    runs-on: ubuntu-latest
+    # The "production" environment's required-reviewers rule is the manual
+    # approval gate; the job pauses here until a reviewer approves.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CDK app dependencies
+        run: pip install -r infrastructure/requirements.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install the CDK CLI
+        run: npm install -g aws-cdk@2.1125.0
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_PROD_REGION }}
+
+      - name: Deploy all stacks
+        working-directory: infrastructure
+        run: cdk deploy --all --require-approval never
