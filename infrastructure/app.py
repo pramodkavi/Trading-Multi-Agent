@@ -37,14 +37,21 @@ env = cdk.Environment(
 )
 
 network = NetworkStack(app, "CryptoSignals-Network", env=env)
-DataStack(
+data = DataStack(
     app,
     "CryptoSignals-Data",
     env=env,
     vpc=network.vpc,
     db_security_group=network.db_security_group,
 )
-ComputeStack(app, "CryptoSignals-Compute", env=env)
+ComputeStack(
+    app,
+    "CryptoSignals-Compute",
+    env=env,
+    cluster=data.cluster,
+    bucket=data.bucket,
+    api_secrets=data.api_secrets,
+)
 SchedulingStack(app, "CryptoSignals-Scheduling", env=env)
 MonitoringStack(app, "CryptoSignals-Monitoring", env=env)
 

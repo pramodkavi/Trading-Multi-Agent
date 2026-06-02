@@ -1,0 +1,30 @@
+# Lambda container image for the scan function (Slice 1 Step 1.18).
+#
+# Separate from the root `Dockerfile` (which docker-compose uses for the local
+# one-shot Fargate-style run): this image targets AWS Lambda. The AWS base image
+# bundles the Runtime Interface Client, so the CMD is a `module.function` handler
+# reference the RIC imports and invokes -- no entrypoint script, no web server.
+#
+# The Lambda runs OUTSIDE any VPC (SPEC §2.4): its egress to Binance/Anthropic/
+# Telegram is free over the public internet, and Aurora is reached over the RDS
+# Data API (HTTPS), so no VPC attachment / NAT is needed.
+
+FROM public.ecr.aws/lambda/python:3.11
+
+# ${LAMBDA_TASK_ROOT} is /var/task and is the WORKDIR. Copy the install inputs
+# first so the dependency layer caches across code-only changes.
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+
+# Install the `src` package + runtime deps into the image's site-packages.
+# All heavy deps (pydantic-core, asyncpg, aiohttp, boto3) ship manylinux wheels
+# for this Amazon Linux x86_64 base, so no compiler is required.
+RUN pip install --no-cache-dir .
+
+# The handler lives in scripts/run_scan.py (operational scripts, not part of the
+# installed package). Copy it under the task root so `scripts.run_scan` imports;
+# scripts/ has an __init__.py, and run_scan imports the installed `src` package.
+COPY scripts/ ${LAMBDA_TASK_ROOT}/scripts/
+
+# Handler: <module path>.<function>. EventBridge Scheduler (Step 1.19) invokes it.
+CMD ["scripts.run_scan.lambda_handler"]
