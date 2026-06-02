@@ -1,0 +1,84 @@
+# Continuous integration (Slice 1 Step 1.20).
+#
+# Two jobs:
+#   quality - lint, format, type-check, and test. Runs on every push and PR.
+#   image   - build the Lambda container image and scan it with Trivy. Runs only
+#             on a push to main (after quality passes), per SPEC §1.20 / §2.6.
+#
+# Lint/format run through pre-commit so CI uses the EXACT pinned tool versions
+# from .pre-commit-config.yaml -- no drift between "passes locally" and "passes
+# in CI". mypy is skipped in that step and run once explicitly (covering
+# src/ + scripts/) so it isn't executed twice with two mypy versions.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# One in-flight run per ref; new pushes cancel superseded runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Lint, type-check, test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install project + dev tools
+        run: pip install -e ".[dev]"
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Lint & format (pinned via pre-commit)
+        run: SKIP=mypy pre-commit run --all-files --show-diff-on-failure
+
+      - name: Type-check (mypy --strict)
+        run: mypy --strict src/ scripts/
+
+      - name: Tests + coverage
+        run: pytest --cov=src --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  image:
+    name: Build Lambda image + Trivy scan
+    needs: quality
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Lambda container image
+        run: docker build -f Dockerfile.lambda -t crypto-signals-lambda:${{ github.sha }} .
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: crypto-signals-lambda:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
