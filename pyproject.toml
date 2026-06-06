@@ -29,11 +29,14 @@ dependencies = [
     "ccxt>=4.4",
     "aiohttp>=3.10",
     "psycopg[binary]>=3.2",
-    "pgvector>=0.3",
     "pydantic-settings>=2.4",
 ]
 
 [project.optional-dependencies]
+slice3-embeddings = [
+    "pgvector>=0.3",  # Slice 3 Step 3.4: narrative embeddings in signals
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
