@@ -303,13 +303,17 @@ class DataApiSignalStore:
         strategy: str | None = None,
         symbols: list[str] | None = None,
     ) -> None:
+        # RDS Data API does not support array parameters, so convert symbols to
+        # a comma-separated string. The column is CAST to text[] on the server
+        # side if needed for querying (Step 3.4+).
+        symbols_str = ",".join(symbols) if symbols else None
         await self._execute(
             """
             INSERT INTO scan_runs
                 (id, started_at, status, session, strategy, symbols)
             VALUES
                 (:id::uuid, :started_at::timestamptz, :status, :session,
-                 :strategy, :symbols)
+                 :strategy, :symbols::text[])
             """,
             [
                 _str_param("id", str(scan_id)),
@@ -317,7 +321,7 @@ class DataApiSignalStore:
                 _str_param("status", "RUNNING"),
                 _str_param("session", session),
                 _str_param("strategy", strategy),
-                _array_param("symbols", symbols),
+                _str_param("symbols", symbols_str),
             ],
         )
 
