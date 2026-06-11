@@ -2,6 +2,12 @@
 
 > **Authority:** `SPEC.md` is the authoritative specification. This file is a quick-reference index. **Always re-read the relevant section of SPEC.md before designing or implementing anything.** When this file and SPEC.md disagree, SPEC.md wins — update this file to match.
 
+> **🆕 New machine / resuming work? START with [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md).**
+> It is the portable session handoff: current status, the LIVE AWS deployment (region/IDs),
+> environment setup, gotchas, open action items, and the Slice 2 plan. Then read the prior
+> assistant memory in [`docs/memory-snapshot/`](docs/memory-snapshot/) and re-seed your own
+> memory from it.
+
 ---
 
 ## 1. What This Project Is
@@ -95,12 +101,12 @@ Minutes are `:03` deliberately — avoids clock-jitter on `:00`.
 
 ## 7. Current Build Status
 
-- **Slice 1 (Weeks 1-3):** End-to-end substrate — one symbol, one strategy (SMC Analyzer only), Telegram delivery from a scheduled **Lambda** (serverless; revised from Fargate — SPEC §2.4).
-- **Slice 2 (Weeks 4-7):** Full 4-agent pipeline + Forecaster + risk gates + multi-symbol watchlist.
+- **Slice 1 (Weeks 1-3): ✅ COMPLETE & DEPLOYED LIVE** (Steps 1.1–1.22). End-to-end substrate — multi-symbol watchlist, SMC-stub Analyzer, Telegram delivery from a scheduled **Lambda** (container image, **ap-south-1**) + Aurora Serverless v2 via the RDS Data API. Verified end-to-end (Telegram confirmed 2026-06-12). **See [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md) for live resource IDs, gotchas, and open items.**
+- **Slice 2 (Weeks 4-7): ⬅️ NEXT.** Full 4-agent pipeline + Forecaster + risk gates + multi-symbol + **real** SMC Analyzer (replaces the Slice-1 stub at Step 2.1).
 - **Slice 3 (Weeks 8-11):** Strategy registry + embeddings + Critic with PR opening.
 - **Slice 4 (Weeks 12-15):** FastAPI + React dashboard, Cognito auth, WebSocket real-time.
 
-**Repository state at time of this CLAUDE.md:** Only `SPEC.md` exists. Slice 1 Step 1.1 (repository scaffolding) has not started. Begin there.
+**Open action items** (detail in `docs/PROJECT_STATE.md §7`): rotate the Anthropic + Telegram credentials (exposed in chat); set the git remote + configure CD secrets/vars/environments (region = ap-south-1); add an Aurora-resume retry in `DataApiSignalStore._execute`.
 
 ## 8. Things NOT to Build (Hard Scope Boundaries)
 
