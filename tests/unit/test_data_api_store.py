@@ -149,12 +149,15 @@ async def test_start_scan_builds_typed_parameters() -> None:
 
     call = client.calls[0]
     assert "INSERT INTO scan_runs" in call["sql"]
+    # RDS Data API rejects array parameters, so symbols go in as a comma-joined
+    # string and string_to_array() reconstructs the text[] server-side.
+    assert "string_to_array" in call["sql"]
     params = params_by_name(call)
     assert params["id"] == {"stringValue": str(scan_id)}
     assert params["started_at"] == {"stringValue": started.isoformat()}
     assert params["status"] == {"stringValue": "RUNNING"}
     assert params["session"] == {"stringValue": "LONDON"}
-    assert params["symbols"] == {"arrayValue": {"stringValues": ["BTCUSDT", "ETHUSDT"]}}
+    assert params["symbols"] == {"stringValue": "BTCUSDT,ETHUSDT"}
 
 
 async def test_start_scan_nulls_optional_fields() -> None:
