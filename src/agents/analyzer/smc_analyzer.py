@@ -283,12 +283,18 @@ def _build_stub_proposal(
     snapshot: MarketSnapshot,
     scan_id: UUID,
     strategy: str,
-) -> SignalProposal:
+) -> SignalProposal | SkipDecision:
     """Build a minimal Slice-1 SignalProposal from a confirmed bias.
 
     LONG geometry: SL = latest swing low * (1 - buffer); entry = latest close;
                    TP1 = entry + 3 * (entry - SL).
     SHORT geometry: mirrored — SL = latest swing high * (1 + buffer).
+
+    When price has extended past the structural stop anchor (e.g. a downtrend
+    retracement where the latest close sits above the latest swing high), the
+    stub cannot form a valid setup — the stop would land on the wrong side of
+    entry. That is a SKIP, not an invalid proposal; full retracement handling
+    arrives with the SMC analyzer in Slice 2.
     """
     latest_close = candles[-1].close
 
@@ -318,6 +324,23 @@ def _build_stub_proposal(
             f"{candles[swing_lows[-2]].low:.2f}. "
             f"Slice 1 stub proposal: SL anchored to latest swing high with "
             f"{STUB_SL_BUFFER * 100:.1f}% buffer, TP1 at 1:{STUB_RR_RATIO:.0f} R:R."
+        )
+
+    # Geometry guard: `risk` is (entry - SL) for longs and (SL - entry) for
+    # shorts, so risk <= 0 means the stop is on the wrong side of entry (price
+    # has extended past the structural anchor). No valid setup -> skip.
+    if risk <= 0:
+        return _skip(
+            scan_id=scan_id,
+            strategy=strategy,
+            symbol=snapshot.symbol,
+            reason=SkipReason.OTHER,
+            details=(
+                f"Price extended past the structural stop anchor for a "
+                f"{direction.value} setup (entry={latest_close:.4f}, "
+                f"SL={stop_loss:.4f}); no valid Slice-1 stub geometry. "
+                f"Awaiting SMC retracement handling (Slice 2)."
+            ),
         )
 
     return SignalProposal(
