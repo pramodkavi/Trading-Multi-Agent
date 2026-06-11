@@ -31,9 +31,16 @@ from stacks.scheduling_stack import SchedulingStack
 
 app = cdk.App()
 
+# Region is PINNED to Mumbai (ap-south-1). The scan Lambda calls the Binance
+# REST API, which geofences North-American/EU AWS regions with HTTP 451
+# ("restricted location"). ap-south-1 is reachable (verified) and is the
+# lowest-latency Binance-serving region for the operator (Sri Lanka). The
+# account still comes from the ambient CDK env. See Step 1.22 deploy notes.
+AWS_REGION = "ap-south-1"
+
 env = cdk.Environment(
     account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
-    region=os.environ.get("CDK_DEFAULT_REGION"),
+    region=AWS_REGION,
 )
 
 network = NetworkStack(app, "CryptoSignals-Network", env=env)
