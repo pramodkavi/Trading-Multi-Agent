@@ -10,6 +10,7 @@ from src.providers.base import (
     Kline,
     MacroContext,
     MarketSnapshot,
+    NoMacroData,
     ProviderError,
     ProviderInvalidResponseError,
     ProviderRateLimitError,
@@ -18,14 +19,18 @@ from src.providers.base import (
     Timeframe,
 )
 from src.providers.binance import BinanceProvider
+from src.providers.macro import FREDProvider, MacroProvider, TwelveDataProvider
 from src.providers.rate_limit import TokenBucket
 
 __all__ = [
     "BinanceProvider",
     "DataProvider",
+    "FREDProvider",
     "Kline",
     "MacroContext",
+    "MacroProvider",
     "MarketSnapshot",
+    "NoMacroData",
     "ProviderError",
     "ProviderInvalidResponseError",
     "ProviderRateLimitError",
@@ -33,4 +38,5 @@ __all__ = [
     "ProviderUnavailableError",
     "Timeframe",
     "TokenBucket",
+    "TwelveDataProvider",
 ]

@@ -223,8 +223,17 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > integration test (real multi-TF + derivatives). NOTE: `run_scan` still requests only H4 — wiring
 > it to request the SMC timeframes + derivatives is a small follow-up (do it when the analyzer's
 > multi-TF top-down logic lands; the analyzer already falls back gracefully today).
-> Next: **Step 2.3 (macro providers — FRED for DXY/yields/Fed funds, Twelve Data for SPX/VIX, behind
-> the `DataProvider` interface with graceful degradation)** for the Skeptic agent.
+> **Step 2.3 shipped:** `src/providers/macro.py` — `FREDProvider` (DXY proxy DTWEXBGS / US 10Y DGS10 /
+> Fed Funds DFF) and `TwelveDataProvider` (SPX, VIX), both behind a shared `MacroProvider(DataProvider)`
+> base (httpx, not ccxt). Each returns a normalized `MacroContext` (extended with a `fed_funds` field)
+> populated with only the fields it owns, or a `NoMacroData` sentinel when it can serve none (graceful
+> degradation per FR-4.3; per-field best-effort otherwise). Market-snapshot is unsupported on macro
+> providers (raises). Unit tests via `httpx.MockTransport`; opt-in integration tests skip without keys.
+> NOTE: providers take `api_key` directly; wiring them to Settings/Secrets (FRED_API_KEY,
+> TWELVE_DATA_API_KEY) happens with the Skeptic (Step 2.5) / Step 2.12 ops.
+> Next: **Step 2.4 (Historian — schema extensions: signals.tags/features/outcome/outcome_metadata;
+> `HistorianRepository` 3-stage retrieval [SQL hard filters → tag-overlap → L2 distance]; `historian_node`
+> + `HistorianReport`; synthetic-journal seed fixture).**
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
