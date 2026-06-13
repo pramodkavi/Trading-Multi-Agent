@@ -30,6 +30,8 @@ from src.agents.analyzer.smc.models import (
     FVGType,
     LegDirection,
     MarketPhase,
+    OrderBlock,
+    OrderBlockDirection,
     StructureAnalysis,
     StructureEvent,
     StructureEventType,
@@ -38,6 +40,7 @@ from src.agents.analyzer.smc.models import (
     SwingType,
     Zone,
 )
+from src.agents.analyzer.smc.order_block import detect_order_blocks
 from src.agents.analyzer.smc.structure import analyze_structure
 from src.agents.analyzer.smc.swings import detect_swings
 from src.agents.analyzer.smc.volatility import atr_series, average_true_range
@@ -48,6 +51,8 @@ __all__ = [
     "FairValueGap",
     "LegDirection",
     "MarketPhase",
+    "OrderBlock",
+    "OrderBlockDirection",
     "StructureAnalysis",
     "StructureEvent",
     "StructureEventType",
@@ -59,5 +64,6 @@ __all__ = [
     "atr_series",
     "average_true_range",
     "detect_fvgs",
+    "detect_order_blocks",
     "detect_swings",
 ]

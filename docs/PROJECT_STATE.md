@@ -202,10 +202,12 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > ATR normalization) with a no-look-ahead invariant test.
 > **Step 2.1b shipped:** `fvg.py` — Fair Value Gap detector (3-candle imbalance, ATR-normalized
 > size + displacement, as-of mitigation/fill status) with a no-look-ahead invariant test.
+> **Step 2.1c shipped:** `order_block.py` — Order Block detector anchored to confirmed BOS/CHoCH
+> events (2.1a) with FVG confluence (2.1b), displacement, and as-of mitigation status; raw
+> `confluence_count` (NOT a calibrated probability) + no-look-ahead invariant test.
 > The Slice-1 stub (`smc_analyzer.py`) is untouched; it gets rewired only at the assembly step.
-> Sub-steps renumbered for focus: **next = 2.1c (Order Block, anchored to confirmed BOS + FVG
-> confluence), then 2.1d (liquidity: BSL/SSL pools + sweeps), then 2.1e (5-gate assembly +
-> scoring → SignalProposal).**
+> Sub-steps (renumbered for focus): **next = 2.1d (liquidity: BSL/SSL pools + equal highs/lows +
+> sweeps), then 2.1e (5-gate assembly + scoring → SignalProposal).**
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
