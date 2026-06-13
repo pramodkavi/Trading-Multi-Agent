@@ -191,6 +191,22 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 
 ## 8. What's next — Slice 2 (Weeks 4–7), per `SPEC.md §4`
 
+> **Progress (2026-06-13):** CD pipeline is fully working (push to `main` → auto-deploy dev via
+> OIDC). The user supplied their reference SMC scripts (`requested_scripts/`); we ran an
+> evidence review (`docs/research/smc-evidence-review.md`) and agreed an **evidence-weighted +
+> calibrated** Analyzer philosophy (premium/discount + liquidity at obvious levels = high
+> trust; derivatives = regime/risk filter not direction; OTE/PO3 = low-weight context;
+> **as-of correctness mandatory**; forward-test, not backtest, is the real validation).
+> **Step 2.1a shipped:** `src/agents/analyzer/smc/` — typed, look-ahead-free structure layer
+> (swings, BOS/CHoCH state machine, market phase, directional Premium/Discount + OTE,
+> ATR normalization) with a no-look-ahead invariant test.
+> **Step 2.1b shipped:** `fvg.py` — Fair Value Gap detector (3-candle imbalance, ATR-normalized
+> size + displacement, as-of mitigation/fill status) with a no-look-ahead invariant test.
+> The Slice-1 stub (`smc_analyzer.py`) is untouched; it gets rewired only at the assembly step.
+> Sub-steps renumbered for focus: **next = 2.1c (Order Block, anchored to confirmed BOS + FVG
+> confluence), then 2.1d (liquidity: BSL/SSL pools + sweeps), then 2.1e (5-gate assembly +
+> scoring → SignalProposal).**
+
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
 1. **Step 2.1 — Real SMC Analyzer.** Replace the Slice-1 stub (`src/agents/analyzer/
