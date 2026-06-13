@@ -21,14 +21,15 @@ COPY src/ ./src/
 # for this Amazon Linux x86_64 base, so no compiler is required.
 RUN pip install --no-cache-dir .
 
-# Patch build/packaging tooling the base image ships with known-fixed HIGH CVEs
-# (enforced by the Trivy gate in CI). Neither package is used at Lambda runtime;
-# upgrading to the patched releases is cleaner than suppressing the findings, and
-# safer than removing the tooling (which risks breaking deps that still import
-# pkg_resources). Revisit if Trivy later flags pip/setuptools too.
-#   wheel          0.45.1 -> >=0.46.2  (CVE-2026-24049)
-#   jaraco.context  5.3.0 -> >=6.1.0   (CVE-2026-23949)
-RUN pip install --no-cache-dir --upgrade 'wheel>=0.46.2' 'jaraco.context>=6.1.0'
+# Patch build/packaging tooling for the Trivy gate in CI. The flagged HIGH CVEs
+# live in packages that setuptools VENDORS under setuptools/_vendor/ -- so
+# upgrading the top-level packages does NOT help; setuptools itself must be
+# upgraded. Current setuptools drops the vulnerable vendored jaraco.context
+# (CVE-2026-23949) and vendors wheel >=0.46.2 (CVE-2026-24049); the top-level
+# wheel upgrade covers the base image's own copy. None of this tooling is used
+# at Lambda runtime -- upgrading is cleaner than suppressing the findings and
+# safer than removing setuptools (which risks breaking pkg_resources imports).
+RUN pip install --no-cache-dir --upgrade setuptools wheel
 
 # The handler lives in scripts/run_scan.py (operational scripts, not part of the
 # installed package). Copy it under the task root so `scripts.run_scan` imports;
