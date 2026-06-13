@@ -20,6 +20,7 @@ MANIFEST
 
 # --- Virtual environments ---
 .venv/
+.venv-cdk/
 venv/
 env/
 ENV/
