@@ -58,7 +58,7 @@ jobs:
           node-version: "20"
 
       - name: Install the CDK CLI
-        run: npm install -g aws-cdk@2.1125.0
+        run: npm install -g aws-cdk@2.1126.0
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4

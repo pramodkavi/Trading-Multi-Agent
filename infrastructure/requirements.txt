@@ -6,8 +6,13 @@
 # These are infra-only and intentionally separate from the application's
 # runtime dependencies in pyproject.toml.
 
-aws-cdk-lib>=2.150,<3
-constructs>=10.0,<11
-# Ceiling required: cdk-nag 3.x removed `NagSuppressions` from the top-level
-# namespace (breaking). All stacks here use the cdk-nag 2.x API, so pin <3.
-cdk-nag>=2.28,<3
+# PINNED EXACTLY for reproducible CD. The deploy runner does a clean
+# `pip install`, so floating versions drift and break: cdk-nag 3.0 removed
+# `NagSuppressions`, and a floating aws-cdk-lib emitted cloud-assembly schema
+# 54.0.0 which outran the CDK CLI pinned in .github/workflows/deploy-*.yml.
+# aws-cdk-lib's schema MUST be readable by that CLI -- bump these and the CLI
+# together, then re-validate with `python app.py` in .venv-cdk.
+#   aws-cdk-lib 2.259.0 -> assembly schema 54.0.0 -> needs CDK CLI >= 2.1126.0
+aws-cdk-lib==2.259.0
+constructs==10.6.0
+cdk-nag==2.38.2

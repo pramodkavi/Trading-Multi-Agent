@@ -110,7 +110,7 @@ aws sts get-caller-identity      # confirm account 097853039368
 aws configure set region ap-south-1
 
 # 5. CDK CLI (only if you will deploy)
-npm install -g aws-cdk@2.1125.0
+npm install -g aws-cdk@2.1126.0   # must match aws-cdk-lib's assembly schema (see infrastructure/requirements.txt)
 ```
 
 `.env` is **gitignored** and will NOT clone. Recreate it for local dev (see `.env.example`
