@@ -386,17 +386,32 @@ class DataApiSignalStore:
         if isinstance(payload, SignalProposal):
             status = SignalStatus.PUBLISHED
             direction: SignalDirection | None = payload.direction
+            tags = list(payload.tags)
+            features: dict[str, Any] = dict(payload.features)
         else:
             status = SignalStatus.SKIPPED
             direction = None
+            tags = []
+            features = {}
+
+        # The Data API rejects array parameters, so tags (text[]) goes as a
+        # comma-joined string and is rebuilt server-side with string_to_array --
+        # the same workaround scan_runs.symbols uses. Tags are kebab-case and
+        # never contain commas, so the join is unambiguous. None -> empty array.
+        tags_str = ",".join(tags) if tags else None
 
         await self._execute(
             """
             INSERT INTO signals
-                (id, scan_id, symbol, strategy, direction, status, payload)
+                (id, scan_id, symbol, strategy, direction, status, payload, tags, features)
             VALUES
                 (:id::uuid, :scan_id::uuid, :symbol, :strategy, :direction,
-                 :status, :payload::jsonb)
+                 :status, :payload::jsonb,
+                 CASE WHEN :tags IS NOT NULL
+                      THEN string_to_array(:tags, ',')
+                      ELSE '{}'::text[]
+                 END,
+                 :features::jsonb)
             """,
             [
                 _str_param("id", str(signal_id)),
@@ -406,6 +421,8 @@ class DataApiSignalStore:
                 _str_param("direction", direction.value if direction is not None else None),
                 _str_param("status", status.value),
                 _str_param("payload", _to_jsonb(payload.model_dump(mode="json"))),
+                _str_param("tags", tags_str),
+                _str_param("features", _to_jsonb(features)),
             ],
         )
         return signal_id
@@ -416,7 +433,9 @@ class DataApiSignalStore:
             SELECT id::text AS id, scan_id::text AS scan_id, symbol, strategy,
                    direction, status,
                    {_utc_iso("created_at", alias="created_at")},
-                   payload::text AS payload
+                   payload::text AS payload,
+                   tags, features::text AS features, outcome,
+                   outcome_metadata::text AS outcome_metadata
             FROM signals
             WHERE id = :id::uuid
             """,
@@ -438,7 +457,9 @@ class DataApiSignalStore:
                 SELECT id::text AS id, scan_id::text AS scan_id, symbol, strategy,
                        direction, status,
                        {_utc_iso("created_at", alias="created_at")},
-                       payload::text AS payload
+                       payload::text AS payload,
+                       tags, features::text AS features, outcome,
+                       outcome_metadata::text AS outcome_metadata
                 FROM signals
                 ORDER BY created_at DESC
                 LIMIT :limit
@@ -452,7 +473,9 @@ class DataApiSignalStore:
                 SELECT id::text AS id, scan_id::text AS scan_id, symbol, strategy,
                        direction, status,
                        {_utc_iso("created_at", alias="created_at")},
-                       payload::text AS payload
+                       payload::text AS payload,
+                       tags, features::text AS features, outcome,
+                       outcome_metadata::text AS outcome_metadata
                 FROM signals
                 WHERE symbol = :symbol
                 ORDER BY created_at DESC
@@ -465,7 +488,12 @@ class DataApiSignalStore:
 
     @staticmethod
     def _row_to_signal(row: dict[str, Any]) -> StoredSignal:
+        # tags (text[]) already parsed to list[str] by _parse_field; features and
+        # outcome_metadata come back as ::text JSONB strings.
         row["payload"] = _parse_jsonb_field(row["payload"])
+        row["features"] = _parse_jsonb_field(row["features"])
+        if row.get("outcome_metadata") is not None:
+            row["outcome_metadata"] = _parse_jsonb_field(row["outcome_metadata"])
         return StoredSignal.model_validate(row)
 
     # ---- agent_runs -------------------------------------------------------

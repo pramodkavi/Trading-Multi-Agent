@@ -23,6 +23,7 @@ from src.common.models.enums import (
     ScanSession,
     ScanStatus,
     SignalDirection,
+    SignalOutcome,
     SignalStatus,
 )
 from src.common.models.scan_context import ScanContext
@@ -36,6 +37,7 @@ __all__ = [
     "ScanSession",
     "ScanStatus",
     "SignalDirection",
+    "SignalOutcome",
     "SignalProposal",
     "SignalStatus",
     "SkipDecision",

@@ -254,6 +254,19 @@ class TestSignalRepositoryCreate:
         assert payload_json["direction"] == "LONG"
         assert payload_json["scan_id"] == str(proposal.scan_id)
 
+    async def test_create_binds_tags_and_features(self) -> None:
+        conn = _make_conn_mock()
+        repo = SignalRepository(conn)
+        proposal = _make_long_proposal(
+            tags=["bullish-ob", "liquidity-sweep"],
+            features={"confluence_score": 3, "atr": 12.5},
+        )
+        await repo.create_signal(proposal)
+        _sql, *args = conn.execute.await_args.args
+        # tags goes as a native list (asyncpg binds text[]); features as JSONB string.
+        assert args[7] == ["bullish-ob", "liquidity-sweep"]
+        assert json.loads(args[8]) == {"confluence_score": 3, "atr": 12.5}
+
     async def test_create_skipped_for_skip_decision(self) -> None:
         conn = _make_conn_mock()
         repo = SignalRepository(conn)
@@ -286,6 +299,11 @@ class TestSignalRepositoryRead:
             "status": SignalStatus.PUBLISHED.value,
             "created_at": datetime(2026, 5, 28, 12, 0, 0, tzinfo=UTC),
             "payload": json.dumps(proposal.model_dump(mode="json"), default=str),
+            # asyncpg returns text[] as a native list and JSONB as a str (no codec).
+            "tags": list(proposal.tags),
+            "features": json.dumps(dict(proposal.features), default=str),
+            "outcome": None,
+            "outcome_metadata": None,
         }
 
     async def test_get_by_id_present(self) -> None:
@@ -305,6 +323,19 @@ class TestSignalRepositoryRead:
         round_tripped = result.as_proposal()
         assert round_tripped.symbol == proposal.symbol
         assert round_tripped.entry_price == proposal.entry_price
+
+    async def test_read_maps_tags_features_outcome(self) -> None:
+        conn = _make_conn_mock()
+        repo = SignalRepository(conn)
+        proposal = _make_long_proposal(tags=["bullish-ob"], features={"confluence_score": 3})
+        signal_id = uuid4()
+        conn.fetchrow.return_value = self._stored_row(signal_id=signal_id, proposal=proposal)
+        result = await repo.get_by_id(signal_id)
+        assert isinstance(result, StoredSignal)
+        assert result.tags == ["bullish-ob"]
+        assert result.features == {"confluence_score": 3}
+        assert result.outcome is None  # not set until the Forecaster closes the setup
+        assert result.outcome_metadata is None
 
     async def test_get_by_id_absent(self) -> None:
         conn = _make_conn_mock()

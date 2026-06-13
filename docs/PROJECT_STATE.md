@@ -231,9 +231,17 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > providers (raises). Unit tests via `httpx.MockTransport`; opt-in integration tests skip without keys.
 > NOTE: providers take `api_key` directly; wiring them to Settings/Secrets (FRED_API_KEY,
 > TWELVE_DATA_API_KEY) happens with the Skeptic (Step 2.5) / Step 2.12 ops.
-> Next: **Step 2.4 (Historian — schema extensions: signals.tags/features/outcome/outcome_metadata;
-> `HistorianRepository` 3-stage retrieval [SQL hard filters → tag-overlap → L2 distance]; `historian_node`
-> + `HistorianReport`; synthetic-journal seed fixture).**
+> **Step 2.4a shipped (schema + persistence foundation):** `signals` gained first-class
+> `tags TEXT[]` / `features JSONB` / `outcome` (enum-checked) / `outcome_metadata JSONB` columns
+> (idempotent `ALTER ... ADD COLUMN IF NOT EXISTS` + GIN index on tags). `SignalOutcome` enum added.
+> Both store backends write tags/features at `create_signal` (Data API uses the `string_to_array`
+> comma-string workaround; asyncpg binds the list natively) and read all four back into an extended
+> `StoredSignal`. Data-API migration statement count 12→18. **⚠️ MIGRATION ORDERING: apply the schema
+> (migrate.py) to the live DB BEFORE deploying this code — `create_signal` now INSERTs the new
+> columns, which must exist.** outcome/outcome_metadata stay NULL at creation (set by the Forecaster,
+> Step 2.9). Next: **Step 2.4b (the Historian itself — `HistorianRepository` 3-stage retrieval
+> [SQL hard filters → tag-overlap via PG array ops → numeric L2 distance], `historian_node` +
+> `HistorianReport`, ~50-signal synthetic seed fixture).**
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

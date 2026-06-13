@@ -74,6 +74,29 @@ CREATE INDEX IF NOT EXISTS idx_signals_status
 
 
 -- ---------------------------------------------------------------------------
+-- Slice 2 Step 2.4 (Historian): promote retrieval columns to first class.
+-- Done as ALTER ... ADD COLUMN IF NOT EXISTS (not edits to the base signals
+-- definition above) so the migration is idempotent on the ALREADY-DEPLOYED
+-- signals table as well as on a fresh install -- the idempotent table create
+-- above is a no-op once the table exists, so new columns must be added here.
+--   tags             -> Historian stage-2 tag-overlap retrieval (GIN index).
+--   features         -> Historian stage-3 numeric L2-distance retrieval.
+--   outcome          -> set by the Forecaster (Step 2.9) when a setup closes.
+--   outcome_metadata -> free-form details about the outcome (exit price, R, etc.).
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS tags TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS features JSONB NOT NULL DEFAULT '{}'::JSONB;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome TEXT
+    CHECK (outcome IS NULL OR outcome IN ('WIN', 'LOSS', 'BREAKEVEN', 'INVALIDATED', 'EXPIRED'));
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome_metadata JSONB;
+
+CREATE INDEX IF NOT EXISTS idx_signals_tags
+    ON signals USING GIN (tags);
+
+CREATE INDEX IF NOT EXISTS idx_signals_outcome
+    ON signals (outcome);
+
+
+-- ---------------------------------------------------------------------------
 -- agent_runs: per-agent execution log per FR-6.2.
 -- Carries the observability + cost data StructuredCompletionResult emits.
 -- token_usage is JSONB to accommodate evolving fields (input/output/cache
