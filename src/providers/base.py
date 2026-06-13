@@ -296,7 +296,12 @@ class DataProvider(ABC):
 
     @abstractmethod
     async def fetch_market_snapshot(
-        self, symbol: str, timeframes: list[Timeframe], *, limit: int = 200
+        self,
+        symbol: str,
+        timeframes: list[Timeframe],
+        *,
+        limit: int = 200,
+        include_derivatives: bool = False,
     ) -> MarketSnapshot:
         """Fetch a normalized snapshot for one symbol across one or more timeframes.
 
@@ -304,6 +309,11 @@ class DataProvider(ABC):
             symbol: market symbol in venue-native format (e.g., 'BTCUSDT').
             timeframes: which timeframes to include in the snapshot.
             limit: max number of candles per timeframe (most-recent N).
+            include_derivatives: when True and the venue supports it, also populate
+                `funding_rate` and `open_interest` on the snapshot (Step 2.2). On a
+                venue without derivatives data these stay None. Derivative fetches
+                degrade gracefully — a failure leaves the field None rather than
+                failing the whole snapshot.
 
         Raises:
             ProviderUnavailableError: venue unreachable or returned 5xx.

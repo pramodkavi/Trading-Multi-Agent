@@ -18,6 +18,7 @@ from src.providers.base import (
     Timeframe,
 )
 from src.providers.binance import BinanceProvider
+from src.providers.rate_limit import TokenBucket
 
 __all__ = [
     "BinanceProvider",
@@ -31,4 +32,5 @@ __all__ = [
     "ProviderTimeoutError",
     "ProviderUnavailableError",
     "Timeframe",
+    "TokenBucket",
 ]

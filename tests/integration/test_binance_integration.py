@@ -34,3 +34,23 @@ async def test_real_binance_4h_btcusdt() -> None:
     assert latest.close > 1000.0
     assert latest.high >= latest.close
     assert latest.low <= latest.close
+
+
+async def test_real_binance_multi_timeframe_and_derivatives() -> None:
+    """Step 2.2: fetch all SMC timeframes concurrently plus funding/OI in one call."""
+    timeframes = [Timeframe.D1, Timeframe.H4, Timeframe.H1, Timeframe.M15, Timeframe.M5]
+    async with BinanceProvider() as provider:
+        snapshot = await provider.fetch_market_snapshot(
+            "BTCUSDT", timeframes, limit=50, include_derivatives=True
+        )
+
+    # Every requested timeframe came back with candles.
+    for tf in timeframes:
+        assert tf in snapshot.klines, f"missing {tf.value}"
+        assert snapshot.klines[tf], f"{tf.value} returned no candles"
+
+    # Funding rate is a small decimal; open interest is positive.
+    assert snapshot.funding_rate is not None
+    assert -0.1 < snapshot.funding_rate < 0.1
+    assert snapshot.open_interest is not None
+    assert snapshot.open_interest > 0.0

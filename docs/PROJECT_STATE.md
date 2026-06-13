@@ -214,9 +214,17 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > **`smc_analyzer.analyze()` is now rewired to this** (the Slice-1 HTF-bias stub is gone — first
 > live-path change since Slice 1); the graph tests were repointed at a publishing series.
 > `confluence_score` is a raw tally surfaced in features/tags, NOT a calibrated probability.
-> **The full SMC analyzer is now live on the `analyze()` path.** Next: **Step 2.2 (multi-timeframe
-> data provider — D1/H1/M15/M5 + funding/OI + rate limiting)**, which feeds the analyzer real
-> top-down data and unlocks the derivatives gate (Gate 4, stubbed today).
+> **The full SMC analyzer is now live on the `analyze()` path.**
+> **Step 2.2 shipped:** `src/providers/rate_limit.py::TokenBucket` (async, injectable clock; Binance
+> 2400 weight/min preset) + `BinanceProvider` upgrades — concurrent multi-timeframe fetch
+> (`asyncio.gather`), `fetch_funding_rate`/`fetch_open_interest` methods, and `include_derivatives`
+> on `fetch_market_snapshot` to populate `funding_rate`/`open_interest` (best-effort; degrades to
+> None). All API calls now meter request weight through the bucket. Unit tests (mocked) + opt-in
+> integration test (real multi-TF + derivatives). NOTE: `run_scan` still requests only H4 — wiring
+> it to request the SMC timeframes + derivatives is a small follow-up (do it when the analyzer's
+> multi-TF top-down logic lands; the analyzer already falls back gracefully today).
+> Next: **Step 2.3 (macro providers — FRED for DXY/yields/Fed funds, Twelve Data for SPX/VIX, behind
+> the `DataProvider` interface with graceful degradation)** for the Skeptic agent.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
