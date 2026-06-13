@@ -277,3 +277,101 @@ class OrderBlock(BaseModel):
         if self.mitigated != (self.mitigation_index is not None):
             raise ValueError("mitigation_index must be set iff mitigated is True")
         return self
+
+
+class LiquiditySide(StrEnum):
+    """Which side of the book a liquidity pool rests on.
+
+    BUY_SIDE (BSL) sits above swing highs (buy stops); SELL_SIDE (SSL) sits below
+    swing lows (sell stops). Per the evidence review this round-number/stop-cluster
+    liquidity is the SMC concept with the most empirical support.
+    """
+
+    BUY_SIDE = "BUY_SIDE"
+    SELL_SIDE = "SELL_SIDE"
+
+
+class LiquidityStrength(StrEnum):
+    """Magnet strength of a pool by how many equal swings cluster at its level."""
+
+    SINGLE = "SINGLE"  # one swing
+    EQUAL = "EQUAL"  # two equal swings
+    TRIPLE = "TRIPLE"  # three or more — an extreme magnet
+
+
+class PoolStatus(StrEnum):
+    """Lifecycle of a liquidity pool relative to the last candle ("now")."""
+
+    RESTING = "RESTING"  # untouched — still a draw on liquidity / target
+    SWEPT = "SWEPT"  # wicked through, body rejected — a stop hunt
+    BROKEN = "BROKEN"  # body closed through — the level was taken (structural)
+
+
+class SweepType(StrEnum):
+    """A liquidity sweep (stop hunt): wick through a pool, body rejects.
+
+    SWEEP_BSL sweeps buy-side liquidity above a high (a bearish reversal signal);
+    SWEEP_SSL sweeps sell-side liquidity below a low (a bullish reversal signal).
+    """
+
+    SWEEP_BSL = "SWEEP_BSL"
+    SWEEP_SSL = "SWEEP_SSL"
+
+
+class LiquidityPool(BaseModel):
+    """A resting-liquidity level anchored to a confirmed swing.
+
+    `equal_count`/`strength` describe how many same-side swings cluster at the
+    level (a current-state magnet measure). `status` (and `resolved_index`) reflect
+    price action as of the last candle: RESTING until the first candle that either
+    sweeps (wick-through, body rejects) or breaks (body closes through) the level.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    side: LiquiditySide
+    price: float = Field(gt=0, description="The pool level (a confirmed swing price).")
+    swing_index: int = Field(ge=0, description="Index of the swing that anchors the pool.")
+    equal_count: int = Field(ge=1, description="Same-side swings within tolerance (incl. self).")
+    strength: LiquidityStrength
+    confirmed_at_index: int = Field(ge=0, description="When the anchoring swing was confirmable.")
+    status: PoolStatus
+    resolved_index: int | None = Field(
+        default=None, ge=0, description="Candle that swept/broke the pool; None while RESTING."
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> LiquidityPool:
+        if (self.status is PoolStatus.RESTING) != (self.resolved_index is None):
+            raise ValueError("resolved_index must be set iff status is not RESTING")
+        return self
+
+
+class LiquiditySweep(BaseModel):
+    """A confirmed stop hunt: a candle wicked through a pool but its body rejected."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sweep_type: SweepType
+    index: int = Field(ge=0, description="Candle index that performed the sweep.")
+    open_time: datetime = Field(description="UTC open time of the sweep candle.")
+    swept_level: float = Field(gt=0, description="The pool price that was swept.")
+    wick_extreme: float = Field(gt=0, description="The high (BSL) or low (SSL) of the sweep wick.")
+    swing_index: int = Field(ge=0, description="Index of the swing whose liquidity was swept.")
+
+
+class LiquidityAnalysis(BaseModel):
+    """Top-level output of the liquidity layer for one timeframe's candle series."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    current_price: float = Field(gt=0)
+    pools: list[LiquidityPool] = Field(description="All pools, ordered by price.")
+    sweeps: list[LiquiditySweep] = Field(description="Confirmed sweeps, chronological.")
+    nearest_bsl: float | None = Field(
+        default=None, description="Nearest RESTING buy-side pool above current price (a target)."
+    )
+    nearest_ssl: float | None = Field(
+        default=None, description="Nearest RESTING sell-side pool below current price (a target)."
+    )
+    atr: float | None = Field(default=None, ge=0, description="ATR as of the last candle.")

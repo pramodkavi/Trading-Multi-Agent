@@ -203,11 +203,15 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > **Step 2.1b shipped:** `fvg.py` — Fair Value Gap detector (3-candle imbalance, ATR-normalized
 > size + displacement, as-of mitigation/fill status) with a no-look-ahead invariant test.
 > **Step 2.1c shipped:** `order_block.py` — Order Block detector anchored to confirmed BOS/CHoCH
-> events (2.1a) with FVG confluence (2.1b), displacement, and as-of mitigation status; raw
-> `confluence_count` (NOT a calibrated probability) + no-look-ahead invariant test.
+> events (2.1a) with FVG confluence (2.1b), displacement, and as-of mitigation status.
+> **Step 2.1d shipped:** `liquidity.py` — BSL/SSL pools anchored to confirmed swings, equal-level
+> clustering (ATR-normalized) for magnet strength, stop-hunt sweeps vs body-close breaks (as-of
+> correct), and nearest resting targets; no-look-ahead invariant test on sweeps. This is the
+> highest-evidence SMC layer per the research, so it carries high weight at assembly.
 > The Slice-1 stub (`smc_analyzer.py`) is untouched; it gets rewired only at the assembly step.
-> Sub-steps (renumbered for focus): **next = 2.1d (liquidity: BSL/SSL pools + equal highs/lows +
-> sweeps), then 2.1e (5-gate assembly + scoring → SignalProposal).**
+> **All four detector layers done (structure/FVG/OB/liquidity). Next = 2.1e: the 5-gate assembly
+> + evidence-weighted scoring that combines them into a `SignalProposal` and finally rewires
+> `smc_analyzer.analyze()`.**
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
