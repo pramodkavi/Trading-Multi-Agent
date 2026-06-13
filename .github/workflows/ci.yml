@@ -75,7 +75,7 @@ jobs:
         run: docker build -f Dockerfile.lambda -t crypto-signals-lambda:${{ github.sha }} .
 
       - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.28.0
         with:
           image-ref: crypto-signals-lambda:${{ github.sha }}
           format: table
