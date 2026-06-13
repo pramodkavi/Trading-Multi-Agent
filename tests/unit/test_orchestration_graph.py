@@ -36,16 +36,9 @@ from src.providers import Kline, MarketSnapshot, Timeframe
 _ANCHOR = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
 
 
-def _kline(
-    minutes_offset: int,
-    *,
-    open_: float,
-    high: float,
-    low: float,
-    close: float,
-) -> Kline:
+def _c(idx: int, *, open_: float, high: float, low: float, close: float) -> Kline:
     return Kline(
-        open_time=_ANCHOR + timedelta(minutes=minutes_offset),
+        open_time=_ANCHOR + timedelta(hours=4 * idx),
         open=open_,
         high=high,
         low=low,
@@ -55,54 +48,28 @@ def _kline(
 
 
 def _flat(idx: int, *, level: float) -> Kline:
-    return _kline(idx * 240, open_=level, high=level + 0.1, low=level - 0.1, close=level)
-
-
-def _swing_high(idx: int, *, peak: float, base: float) -> Kline:
-    return _kline(idx * 240, open_=base, high=peak, low=base - 0.1, close=base)
-
-
-def _swing_low(idx: int, *, trough: float, base: float) -> Kline:
-    return _kline(idx * 240, open_=base, high=base + 0.1, low=trough, close=base)
+    return _c(idx, open_=level, high=level + 0.5, low=level - 0.5, close=level)
 
 
 def _bullish_series() -> list[Kline]:
-    """HH+HL staircase (mirrors test_smc_analyzer._bullish_series)."""
-    candles: list[Kline] = []
-    for i in range(0, 5):
-        candles.append(_flat(i, level=100.0))
-    candles.append(_swing_low(5, trough=99.0, base=100.0))
-    for i in range(6, 10):
-        candles.append(_flat(i, level=101.0))
-    candles.append(_swing_high(10, peak=103.0, base=101.5))
-    for i in range(11, 15):
-        candles.append(_flat(i, level=102.0))
-    candles.append(_swing_low(15, trough=101.0, base=102.0))
-    for i in range(16, 20):
-        candles.append(_flat(i, level=103.0))
-    candles.append(_swing_high(20, peak=106.0, base=103.5))
-    for i in range(21, 30):
-        candles.append(_flat(i, level=104.0))
-    return candles
+    """A full SMC LONG setup: bullish BOS then a shallow pullback into discount
+    over a fresh demand order block (verified to publish under the 2.1e analyzer)."""
+    s = [_flat(i, level=100.0) for i in range(10)]
+    s.append(_c(10, open_=100.0, high=105.0, low=99.5, close=100.0))
+    s += [_flat(11, level=100.0), _flat(12, level=100.0)]
+    s.append(_c(13, open_=101.0, high=101.5, low=98.5, close=99.0))
+    s.append(_c(14, open_=99.0, high=104.0, low=99.0, close=103.5))
+    s.append(_c(15, open_=103.5, high=108.0, low=103.0, close=107.0))
+    s.append(_c(16, open_=107.0, high=110.0, low=106.5, close=109.0))
+    s += [_flat(17, level=107.5), _flat(18, level=107.5)]
+    s.append(_c(19, open_=106.0, high=106.5, low=102.0, close=103.0))
+    s += [_flat(i, level=103.5) for i in range(20, 32)]
+    return s
 
 
 def _ranging_series() -> list[Kline]:
-    candles: list[Kline] = []
-    for i in range(0, 5):
-        candles.append(_flat(i, level=100.0))
-    candles.append(_swing_low(5, trough=99.0, base=100.0))
-    for i in range(6, 10):
-        candles.append(_flat(i, level=100.5))
-    candles.append(_swing_high(10, peak=102.0, base=100.5))
-    for i in range(11, 15):
-        candles.append(_flat(i, level=100.0))
-    candles.append(_swing_low(15, trough=98.0, base=100.0))  # LL
-    for i in range(16, 20):
-        candles.append(_flat(i, level=101.0))
-    candles.append(_swing_high(20, peak=103.0, base=101.0))  # HH (mixed)
-    for i in range(21, 30):
-        candles.append(_flat(i, level=101.0))
-    return candles
+    """Flat consolidation -> CONSOLIDATION phase -> NO_CLEAR_BIAS skip."""
+    return [_flat(i, level=100.0) for i in range(30)]
 
 
 def _snapshot(candles: list[Kline], symbol: str = "BTCUSDT") -> MarketSnapshot:

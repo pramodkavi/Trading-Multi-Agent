@@ -204,14 +204,19 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > size + displacement, as-of mitigation/fill status) with a no-look-ahead invariant test.
 > **Step 2.1c shipped:** `order_block.py` — Order Block detector anchored to confirmed BOS/CHoCH
 > events (2.1a) with FVG confluence (2.1b), displacement, and as-of mitigation status.
-> **Step 2.1d shipped:** `liquidity.py` — BSL/SSL pools anchored to confirmed swings, equal-level
-> clustering (ATR-normalized) for magnet strength, stop-hunt sweeps vs body-close breaks (as-of
-> correct), and nearest resting targets; no-look-ahead invariant test on sweeps. This is the
-> highest-evidence SMC layer per the research, so it carries high weight at assembly.
-> The Slice-1 stub (`smc_analyzer.py`) is untouched; it gets rewired only at the assembly step.
-> **All four detector layers done (structure/FVG/OB/liquidity). Next = 2.1e: the 5-gate assembly
-> + evidence-weighted scoring that combines them into a `SignalProposal` and finally rewires
-> `smc_analyzer.analyze()`.**
+> **Step 2.1d shipped:** `liquidity.py` — BSL/SSL pools, equal-level clustering, stop-hunt sweeps
+> vs breaks (as-of correct), nearest resting targets.
+> **Step 2.1e shipped — STEP 2.1 COMPLETE:** `analysis.py::full_smc_analysis` combines all four
+> detector layers via a HYBRID gate model — HARD gates (clear bias, Premium/Discount §1.6 rule 3,
+> a valid order-block POI) + an evidence-WEIGHTED confluence threshold (liquidity sweep highest
+> weight; OB displacement/FVG/fresh; OTE lowest) — emits a complete `SignalProposal | SkipDecision`
+> with Layer-5 risk geometry (entry at POI, SL beyond it, TP = nearest resting opposing liquidity).
+> **`smc_analyzer.analyze()` is now rewired to this** (the Slice-1 HTF-bias stub is gone — first
+> live-path change since Slice 1); the graph tests were repointed at a publishing series.
+> `confluence_score` is a raw tally surfaced in features/tags, NOT a calibrated probability.
+> **The full SMC analyzer is now live on the `analyze()` path.** Next: **Step 2.2 (multi-timeframe
+> data provider — D1/H1/M15/M5 + funding/OI + rate limiting)**, which feeds the analyzer real
+> top-down data and unlocks the derivatives gate (Gate 4, stubbed today).
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

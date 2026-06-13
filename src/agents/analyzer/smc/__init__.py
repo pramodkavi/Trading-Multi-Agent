@@ -23,6 +23,7 @@ BOS/CHoCH state machine, market phase, and Premium/Discount + directional OTE.
 FVG / Order Block / liquidity / derivatives land in 2.1b-2.1d.
 """
 
+from src.agents.analyzer.smc.analysis import full_smc_analysis
 from src.agents.analyzer.smc.fvg import detect_fvgs
 from src.agents.analyzer.smc.liquidity import analyze_liquidity
 from src.agents.analyzer.smc.models import (
@@ -82,4 +83,5 @@ __all__ = [
     "detect_fvgs",
     "detect_order_blocks",
     "detect_swings",
+    "full_smc_analysis",
 ]
