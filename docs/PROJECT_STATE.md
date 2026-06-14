@@ -236,8 +236,9 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > populated with only the fields it owns, or a `NoMacroData` sentinel when it can serve none (graceful
 > degradation per FR-4.3; per-field best-effort otherwise). Market-snapshot is unsupported on macro
 > providers (raises). Unit tests via `httpx.MockTransport`; opt-in integration tests skip without keys.
-> NOTE: providers take `api_key` directly; wiring them to Settings/Secrets (FRED_API_KEY,
-> TWELVE_DATA_API_KEY) happens with the Skeptic (Step 2.5) / Step 2.12 ops.
+> NOTE: providers take `api_key` directly; Settings wiring (`fred_api_key` / `twelve_data_api_key`)
+> landed with the Skeptic (Step 2.5). Remaining: Secrets Manager ARN hydration for these keys in the
+> cloud Lambda is deferred to Step 2.12 ops (today they read from plain env / `.env`).
 > **Step 2.4a shipped (schema + persistence foundation):** `signals` gained first-class
 > `tags TEXT[]` / `features JSONB` / `outcome` (enum-checked) / `outcome_metadata JSONB` columns
 > (idempotent `ALTER ... ADD COLUMN IF NOT EXISTS` + GIN index on tags). `SignalOutcome` enum added.
@@ -263,7 +264,26 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > `scripts/seed_signals.py` (`build_synthetic_signals` + dual-backend CLI) makes 50 outcome-bearing
 > synthetic signals. Tests: report/helpers/node (fake store) + find_similar SQL-shape & parse for BOTH
 > backends (mocked) + opt-in asyncpg integration (real ranking). Checkpoints green: ruff, mypy --strict
-> (48 files), pytest **465 passed**. Next: **Step 2.5 (the Skeptic).**
+> (48 files), pytest **465 passed**.
+> **Step 2.5 shipped — THE SKEPTIC:** new `src/agents/skeptic/` package. `Skeptic.gather_macro()`
+> fetches every injected macro provider in parallel (`asyncio.gather(return_exceptions=True)`) and
+> merges the partial `MacroContext` snapshots (FRED owns DXY/US10Y/FedFunds; Twelve Data owns SPX/VIX)
+> into one; if no provider serves data it returns the provider-level `NoMacroData` sentinel (FR-4.3
+> graceful degradation — Judge reads it as "downgrade confidence to medium", NOT "no objection").
+> `Skeptic.evaluate()` then calls Claude via `structured_completion` with the new `SkepticObjection`
+> schema (severity LOW/MEDIUM/HIGH + recommends_against + headline + reasoning + cited_macro) — and
+> short-circuits to NoMacroData (no LLM call) when macro is unavailable. The system prompt enforces:
+> reason only from supplied data, snapshots (no trend invention), treat SPX/VIX as possibly-proxy
+> regime cues (never absolute thresholds), forbidden indicators (RSI/MACD/…), honest severity
+> calibration. `make_skeptic_node` is a node FACTORY (providers + Anthropic client injected via
+> closure); `AgentState` gained `skeptic_objection: SkepticObjection | NoMacroData | None` (runtime
+> import in graph.py — the LangGraph get_type_hints gotcha) but the edge is wired at **Step 2.7** (live
+> path stays analyzer→END). `build_macro_providers(settings)` constructs FRED + Twelve Data (with the
+> SPY/VIXY free-tier ETF proxies, Step 2.3 cost decision) for whichever keys are set, else []. Settings
+> gained optional `fred_api_key` / `twelve_data_api_key` (SecretStr) + `.env.example` entries. Tests:
+> merge/gather (success/all-unavailable/exception-tolerant) + evaluate (mocked Anthropic client; macro
+> short-circuit) + node (skip/objection/NoMacroData) + prompt + build_macro_providers. Checkpoints
+> green: ruff, mypy --strict (51 files), pytest **483 passed**. Next: **Step 2.6 (the Judge).**
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

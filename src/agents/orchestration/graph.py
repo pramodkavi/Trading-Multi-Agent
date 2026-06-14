@@ -27,18 +27,19 @@ from langgraph.graph import END, START, StateGraph
 
 from src.agents.analyzer import analyze
 
-# Runtime (not TYPE_CHECKING) import: LangGraph resolves AgentState's annotations
+# Runtime (not TYPE_CHECKING) imports: LangGraph resolves AgentState's annotations
 # via get_type_hints() at StateGraph construction, so every type referenced in
-# AgentState must exist at runtime. The historian package imports AgentState only
-# under TYPE_CHECKING, so this direction introduces no import cycle.
+# AgentState must exist at runtime. The historian / skeptic packages import
+# AgentState only under TYPE_CHECKING, so this direction introduces no cycle.
 from src.agents.historian import HistorianReport
+from src.agents.skeptic import SkepticObjection
 from src.common.models import (
     JudgeRuling,
     ScanContext,
     SignalProposal,
     SkipDecision,
 )
-from src.providers import MarketSnapshot
+from src.providers import MarketSnapshot, NoMacroData
 
 # ---------------------------------------------------------------------------
 # State
@@ -61,6 +62,11 @@ class AgentState(TypedDict, total=False):
                            make_historian_node); None for skips / when the
                            node is not wired. The edge analyzer -> historian is
                            added in Step 2.7.
+        skeptic_objection: set by the skeptic node (Step 2.5's
+                           make_skeptic_node): a SkepticObjection, or NoMacroData
+                           when macro is unavailable (FR-4.3 -> Judge downgrades
+                           confidence to medium), or None for skips / when the
+                           node is not wired. Edge added in Step 2.7.
         decision         : set by analyzer_node (stub) -> overwritten by
                            judge_node in Slice 2 Step 2.6.
     """
@@ -69,6 +75,7 @@ class AgentState(TypedDict, total=False):
     snapshot: MarketSnapshot
     proposal: SignalProposal | SkipDecision | None
     historian_report: HistorianReport | None
+    skeptic_objection: SkepticObjection | NoMacroData | None
     decision: JudgeRuling | None
 
 
