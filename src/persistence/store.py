@@ -43,6 +43,7 @@ import asyncpg
 from src.common.models import (
     AgentRole,
     SignalDirection,
+    SignalOutcome,
     SignalProposal,
     SignalStatus,
     SkipDecision,
@@ -52,6 +53,7 @@ from src.persistence.repositories import (
     AgentRunRepository,
     ScanRunRepository,
     SignalRepository,
+    _assert_safe_feature_key,
     _parse_jsonb_field,
     _to_jsonb,
 )
@@ -197,6 +199,31 @@ class SignalStore(Protocol):
     async def list_recent_signals(
         self, *, limit: int = 50, symbol: str | None = None
     ) -> list[StoredSignal]: ...
+
+    async def set_signal_outcome(
+        self,
+        *,
+        signal_id: UUID,
+        outcome: SignalOutcome,
+        outcome_metadata: Mapping[str, Any] | None = None,
+    ) -> None: ...
+
+    async def find_similar_signals(
+        self,
+        *,
+        direction: str,
+        session: str | None,
+        primary_poi_type: str | None,
+        query_tags: list[str],
+        l2_features: Sequence[tuple[str, float]],
+        limit: int = 10,
+        tag_pool: int = 50,
+        exclude_signal_id: UUID | None = None,
+    ) -> list[StoredSignal]:
+        """Historian three-stage retrieval (SPEC FR-1.4): hard filters -> tag
+        overlap -> L2 distance. Returns up to ``limit`` precedents, most-similar
+        first, restricted to PUBLISHED rows with a known outcome."""
+        ...
 
     async def log_agent_run(
         self,
@@ -486,10 +513,129 @@ class DataApiSignalStore:
             )
         return [self._row_to_signal(row) for row in _parse_records(response)]
 
+    async def set_signal_outcome(
+        self,
+        *,
+        signal_id: UUID,
+        outcome: SignalOutcome,
+        outcome_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        await self._execute(
+            """
+            UPDATE signals
+            SET outcome = :outcome, outcome_metadata = :outcome_metadata::jsonb
+            WHERE id = :id::uuid
+            """,
+            [
+                _str_param("outcome", outcome.value),
+                _str_param(
+                    "outcome_metadata",
+                    _to_jsonb(dict(outcome_metadata)) if outcome_metadata is not None else None,
+                ),
+                _str_param("id", str(signal_id)),
+            ],
+        )
+
+    async def find_similar_signals(
+        self,
+        *,
+        direction: str,
+        session: str | None,
+        primary_poi_type: str | None,
+        query_tags: list[str],
+        l2_features: Sequence[tuple[str, float]],
+        limit: int = 10,
+        tag_pool: int = 50,
+        exclude_signal_id: UUID | None = None,
+    ) -> list[StoredSignal]:
+        """Historian three-stage retrieval over the Data API (SPEC FR-1.4)."""
+        capped_limit = max(1, min(limit, 1000))
+        capped_pool = max(capped_limit, min(tag_pool, 1000))
+
+        params: list[dict[str, Any]] = [_str_param("direction", direction)]
+
+        # --- stage 1: hard categorical filters ---
+        where = [
+            "s.status = 'PUBLISHED'",
+            "s.outcome IS NOT NULL",
+            "s.direction = :direction",
+        ]
+        if session is not None:
+            where.append("r.session = :session")
+            params.append(_str_param("session", session))
+        if primary_poi_type is not None:
+            where.append("s.features->>'primary_poi_type' = :primary_poi_type")
+            params.append(_str_param("primary_poi_type", primary_poi_type))
+        if exclude_signal_id is not None:
+            where.append("s.id <> :exclude_id::uuid")
+            params.append(_str_param("exclude_id", str(exclude_signal_id)))
+
+        # --- stage 2: tag-overlap via PG array operators. The Data API rejects
+        # array params, so tags cross the wire as a comma string and are rebuilt
+        # with string_to_array (mirrors create_signal). None -> NULL -> 0 overlap.
+        params.append(_str_param("qtags", ",".join(query_tags) if query_tags else None))
+        overlap_expr = (
+            "COALESCE(cardinality(ARRAY(SELECT unnest(s.tags) "
+            "INTERSECT SELECT unnest(string_to_array(:qtags, ',')))), 0)"
+        )
+
+        # --- stage 3: L2 distance over the numeric feature vector ---
+        l2_expr = self._l2_expr_named(l2_features, params)
+
+        params.append(_long_param("tag_pool", capped_pool))
+        params.append(_long_param("lim", capped_limit))
+
+        sql = f"""
+            WITH filtered AS (
+                SELECT s.id::text AS id, s.scan_id::text AS scan_id, s.symbol, s.strategy,
+                       s.direction, s.status,
+                       {_utc_iso("s.created_at", alias="created_at")},
+                       s.payload::text AS payload, s.tags, s.features::text AS features,
+                       s.outcome, s.outcome_metadata::text AS outcome_metadata,
+                       {overlap_expr} AS tag_overlap,
+                       {l2_expr} AS l2_distance
+                FROM signals s
+                JOIN scan_runs r ON s.scan_id = r.id
+                WHERE {" AND ".join(where)}
+            ),
+            tag_ranked AS (
+                SELECT * FROM filtered
+                ORDER BY tag_overlap DESC, l2_distance ASC
+                LIMIT :tag_pool
+            )
+            SELECT * FROM tag_ranked
+            ORDER BY l2_distance ASC, tag_overlap DESC
+            LIMIT :lim
+        """
+        response = await self._execute(sql, params, with_metadata=True)
+        return [self._row_to_signal(row) for row in _parse_records(response)]
+
+    @staticmethod
+    def _l2_expr_named(
+        l2_features: Sequence[tuple[str, float]],
+        params: list[dict[str, Any]],
+    ) -> str:
+        """Build the L2-distance SQL expression with named params (appends to ``params``)."""
+        if not l2_features:
+            return "0::double precision"
+        terms: list[str] = []
+        for index, (key, value) in enumerate(l2_features):
+            _assert_safe_feature_key(key)
+            name = f"l2_{index}"
+            params.append(_double_param(name, value))
+            terms.append(
+                f"power(COALESCE((s.features->>'{key}')::double precision, :{name}) - :{name}, 2)"
+            )
+        return f"sqrt({' + '.join(terms)})"
+
     @staticmethod
     def _row_to_signal(row: dict[str, Any]) -> StoredSignal:
         # tags (text[]) already parsed to list[str] by _parse_field; features and
         # outcome_metadata come back as ::text JSONB strings.
+        # find_similar adds ranking columns the StoredSignal model forbids; the
+        # Historian recomputes them in Python, so drop them here.
+        row.pop("tag_overlap", None)
+        row.pop("l2_distance", None)
         row["payload"] = _parse_jsonb_field(row["payload"])
         row["features"] = _parse_jsonb_field(row["features"])
         if row.get("outcome_metadata") is not None:
@@ -652,6 +798,42 @@ class AsyncpgSignalStore:
         self, *, limit: int = 50, symbol: str | None = None
     ) -> list[StoredSignal]:
         return await self._signals.list_recent(limit=limit, symbol=symbol)
+
+    async def set_signal_outcome(
+        self,
+        *,
+        signal_id: UUID,
+        outcome: SignalOutcome,
+        outcome_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        await self._signals.set_outcome(
+            signal_id=signal_id,
+            outcome=outcome,
+            outcome_metadata=outcome_metadata,
+        )
+
+    async def find_similar_signals(
+        self,
+        *,
+        direction: str,
+        session: str | None,
+        primary_poi_type: str | None,
+        query_tags: list[str],
+        l2_features: Sequence[tuple[str, float]],
+        limit: int = 10,
+        tag_pool: int = 50,
+        exclude_signal_id: UUID | None = None,
+    ) -> list[StoredSignal]:
+        return await self._signals.find_similar(
+            direction=direction,
+            session=session,
+            primary_poi_type=primary_poi_type,
+            query_tags=query_tags,
+            l2_features=l2_features,
+            limit=limit,
+            tag_pool=tag_pool,
+            exclude_signal_id=exclude_signal_id,
+        )
 
     # ---- agent_runs -------------------------------------------------------
 

@@ -26,6 +26,12 @@ from typing import Any, TypedDict, cast
 from langgraph.graph import END, START, StateGraph
 
 from src.agents.analyzer import analyze
+
+# Runtime (not TYPE_CHECKING) import: LangGraph resolves AgentState's annotations
+# via get_type_hints() at StateGraph construction, so every type referenced in
+# AgentState must exist at runtime. The historian package imports AgentState only
+# under TYPE_CHECKING, so this direction introduces no import cycle.
+from src.agents.historian import HistorianReport
 from src.common.models import (
     JudgeRuling,
     ScanContext,
@@ -48,16 +54,21 @@ class AgentState(TypedDict, total=False):
     they extend it. Until then, only the four fields below are populated.
 
     Field lifecycle:
-        scan_context : seeded by the caller (scan runner); never mutated.
-        snapshot     : seeded by the caller after fetching market data.
-        proposal     : set by analyzer_node.
-        decision     : set by analyzer_node (stub) -> overwritten by judge_node
-                       in Slice 2 Step 2.6.
+        scan_context     : seeded by the caller (scan runner); never mutated.
+        snapshot         : seeded by the caller after fetching market data.
+        proposal         : set by analyzer_node.
+        historian_report : set by the historian node (Step 2.4b's
+                           make_historian_node); None for skips / when the
+                           node is not wired. The edge analyzer -> historian is
+                           added in Step 2.7.
+        decision         : set by analyzer_node (stub) -> overwritten by
+                           judge_node in Slice 2 Step 2.6.
     """
 
     scan_context: ScanContext
     snapshot: MarketSnapshot
     proposal: SignalProposal | SkipDecision | None
+    historian_report: HistorianReport | None
     decision: JudgeRuling | None
 
 

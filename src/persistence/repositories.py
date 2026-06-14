@@ -22,6 +22,7 @@ asyncpg notes:
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
@@ -29,6 +30,7 @@ from src.common.models import (
     AgentRole,
     ScanStatus,
     SignalDirection,
+    SignalOutcome,
     SignalProposal,
     SignalStatus,
     SkipDecision,
@@ -36,10 +38,21 @@ from src.common.models import (
 from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
 
     import asyncpg
+
+# Historian stage-3 builds the L2-distance SQL by interpolating feature KEY names
+# (the values are always bound parameters). Keys originate from a code constant
+# (historian.L2_FEATURE_KEYS), never user input -- but we whitelist their shape
+# anyway as defence-in-depth against SQL injection through a JSONB key.
+_SAFE_FEATURE_KEY = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _assert_safe_feature_key(key: str) -> None:
+    if not _SAFE_FEATURE_KEY.match(key):
+        raise ValueError(f"unsafe feature key for SQL interpolation: {key!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +309,132 @@ class SignalRepository:
         # asyncpg.fetch returns list[Record], never with None entries.
         return [self._record_to_stored(r) for r in rows]
 
+    async def set_outcome(
+        self,
+        *,
+        signal_id: UUID,
+        outcome: SignalOutcome,
+        outcome_metadata: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Stamp a terminal outcome on a signal (Forecaster write side, Step 2.9).
+
+        Used now by the Step 2.4b seed fixture so the journal has outcome-bearing
+        rows for the Historian to retrieve; the Forecaster reuses it unchanged.
+        """
+        await self._conn.execute(
+            """
+            UPDATE signals
+            SET outcome = $1, outcome_metadata = $2::jsonb
+            WHERE id = $3
+            """,
+            outcome.value,
+            _to_jsonb(dict(outcome_metadata)) if outcome_metadata is not None else None,
+            signal_id,
+        )
+
+    async def find_similar(
+        self,
+        *,
+        direction: str,
+        session: str | None,
+        primary_poi_type: str | None,
+        query_tags: list[str],
+        l2_features: Sequence[tuple[str, float]],
+        limit: int = 10,
+        tag_pool: int = 50,
+        exclude_signal_id: UUID | None = None,
+    ) -> list[StoredSignal]:
+        """Historian three-stage retrieval (asyncpg backend; SPEC FR-1.4).
+
+        Stage 1 = the WHERE clause (direction / session / primary_poi_type, plus
+        PUBLISHED + known-outcome). Stage 2 = ``tag_overlap`` via the array
+        INTERSECT, narrowing to ``tag_pool`` rows. Stage 3 = ``l2_distance`` over
+        the scale-free numeric feature vector, returning the top ``limit``.
+        """
+        capped_limit = max(1, min(limit, 1000))
+        capped_pool = max(capped_limit, min(tag_pool, 1000))
+
+        args: list[Any] = []
+
+        def add(value: Any) -> str:
+            args.append(value)
+            return f"${len(args)}"
+
+        # --- stage 1: hard categorical filters ---
+        where = [
+            "s.status = 'PUBLISHED'",
+            "s.outcome IS NOT NULL",
+            f"s.direction = {add(direction)}",
+        ]
+        if session is not None:
+            where.append(f"r.session = {add(session)}")
+        if primary_poi_type is not None:
+            where.append(f"s.features->>'primary_poi_type' = {add(primary_poi_type)}")
+        if exclude_signal_id is not None:
+            where.append(f"s.id <> {add(exclude_signal_id)}")
+
+        # --- stage 2: tag-overlap count via PostgreSQL array operators ---
+        tags_placeholder = add(query_tags)
+        overlap_expr = (
+            "COALESCE(cardinality(ARRAY(SELECT unnest(s.tags) "
+            f"INTERSECT SELECT unnest({tags_placeholder}::text[]))), 0)"
+        )
+
+        # --- stage 3: Euclidean distance over the numeric feature vector ---
+        l2_expr = self._l2_expr(l2_features, add)
+
+        pool_placeholder = add(capped_pool)
+        limit_placeholder = add(capped_limit)
+
+        sql = f"""
+            WITH filtered AS (
+                SELECT s.id, s.scan_id, s.symbol, s.strategy, s.direction, s.status,
+                       s.created_at, s.payload, s.tags, s.features, s.outcome,
+                       s.outcome_metadata,
+                       {overlap_expr} AS tag_overlap,
+                       {l2_expr} AS l2_distance
+                FROM signals s
+                JOIN scan_runs r ON s.scan_id = r.id
+                WHERE {" AND ".join(where)}
+            ),
+            tag_ranked AS (
+                SELECT * FROM filtered
+                ORDER BY tag_overlap DESC, l2_distance ASC
+                LIMIT {pool_placeholder}
+            )
+            SELECT * FROM tag_ranked
+            ORDER BY l2_distance ASC, tag_overlap DESC
+            LIMIT {limit_placeholder}
+        """
+        rows = await self._conn.fetch(sql, *args)
+        return [self._record_to_stored(r) for r in rows]
+
+    @staticmethod
+    def _l2_expr(l2_features: Sequence[tuple[str, float]], add: Any) -> str:
+        """Build the L2-distance SQL expression (asyncpg placeholders).
+
+        Each missing-or-non-numeric feature on a candidate contributes nothing
+        (``COALESCE(value, query_value) - query_value``), so rows are never
+        penalised for features they predate.
+        """
+        if not l2_features:
+            return "0::double precision"
+        terms: list[str] = []
+        for key, value in l2_features:
+            _assert_safe_feature_key(key)
+            placeholder = add(value)
+            terms.append(
+                f"power(COALESCE((s.features->>'{key}')::double precision, "
+                f"{placeholder}) - {placeholder}, 2)"
+            )
+        return f"sqrt({' + '.join(terms)})"
+
     def _record_to_stored(self, record: asyncpg.Record) -> StoredSignal:
         data = _record_to_dict(record)
+        # find_similar adds ranking columns the StoredSignal model forbids; the
+        # Historian recomputes them in Python, so drop them here.
+        data.pop("tag_overlap", None)
+        data.pop("l2_distance", None)
         data["payload"] = _parse_jsonb_field(data["payload"])
         data["features"] = _parse_jsonb_field(data["features"])
         if data.get("outcome_metadata") is not None:

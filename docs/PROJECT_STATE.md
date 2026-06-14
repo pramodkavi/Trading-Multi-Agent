@@ -246,9 +246,24 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > `StoredSignal`. Data-API migration statement count 12→18. **⚠️ MIGRATION ORDERING: apply the schema
 > (migrate.py) to the live DB BEFORE deploying this code — `create_signal` now INSERTs the new
 > columns, which must exist.** outcome/outcome_metadata stay NULL at creation (set by the Forecaster,
-> Step 2.9). Next: **Step 2.4b (the Historian itself — `HistorianRepository` 3-stage retrieval
-> [SQL hard filters → tag-overlap via PG array ops → numeric L2 distance], `historian_node` +
-> `HistorianReport`, ~50-signal synthetic seed fixture).**
+> Step 2.9).
+> **Step 2.4b shipped — THE HISTORIAN:** new `src/agents/historian/` package. `HistorianRepository`
+> does the three-stage retrieval (SPEC FR-1.4): stage 1 = SQL hard filters (direction, session via a
+> `scan_runs` JOIN, `primary_poi_type`, PUBLISHED + known-outcome); stage 2 = tag-overlap ranking via
+> PG array ops (`cardinality(... INTERSECT ...)`); stage 3 = L2 distance over a *scale-free* numeric
+> vector (`L2_FEATURE_KEYS` = confluence_score, ob_confluence_count — price-scale features
+> deliberately excluded) via a `sqrt/power` SQL expression. Produces a `HistorianReport` (empirical
+> win rate = wins/(wins+losses), with `sample_size` + outcome breakdown + a Telegram/Judge summary;
+> win_rate is `None` when no decisive outcomes — never faked). `make_historian_node` is a node FACTORY
+> (store injected via closure, never in checkpointed state); wired into the graph at **Step 2.7** (the
+> edge is NOT added yet — `AgentState` gained `historian_report` but the live scan path stays
+> analyzer→END). The 3-stage SQL lives in both store backends (`find_similar_signals` on
+> DataApiSignalStore + SignalRepository); `set_signal_outcome` added to both (Forecaster write-side,
+> used now by the seed). Analyzer gained one feature: `primary_poi_type="order_block"`. Seed fixture
+> `scripts/seed_signals.py` (`build_synthetic_signals` + dual-backend CLI) makes 50 outcome-bearing
+> synthetic signals. Tests: report/helpers/node (fake store) + find_similar SQL-shape & parse for BOTH
+> backends (mocked) + opt-in asyncpg integration (real ranking). Checkpoints green: ruff, mypy --strict
+> (48 files), pytest **465 passed**. Next: **Step 2.5 (the Skeptic).**
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

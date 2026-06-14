@@ -65,6 +65,10 @@ MIN_CONFLUENCE_SCORE: Final[int] = 2
 SWEEP_WEIGHT: Final[int] = 2
 """Liquidity sweep carries double weight (highest-evidence SMC component)."""
 
+PRIMARY_POI_TYPE_ORDER_BLOCK: Final[str] = "order_block"
+"""Value of the ``primary_poi_type`` feature: every SMC entry is anchored to an
+order block today. Surfaced first-class for the Historian's stage-1 hard filter."""
+
 # Order in which to fall back when choosing the analysis timeframe (HTF preferred).
 _TIMEFRAME_PRIORITY: Final[tuple[Timeframe, ...]] = (
     Timeframe.H4,
@@ -378,6 +382,12 @@ def _build_proposal(
         "timeframe": timeframe.value,
         "phase": structure.phase.value,
         "zone": structure.zone.value if structure.zone else "UNKNOWN",
+        # The kind of Point of Interest the entry is anchored to. The SMC analyzer
+        # only produces order-block-anchored entries today, but this is a first-class
+        # categorical so the Historian's stage-1 hard filter (SPEC §4 Step 2.4) can
+        # match like-for-like setups -- and stays discriminating once future POI kinds
+        # (breaker, FVG-as-POI) appear without a schema change.
+        "primary_poi_type": PRIMARY_POI_TYPE_ORDER_BLOCK,
         "confluence_score": score,
         "current_price": current_price,
         "atr": structure.atr if structure.atr is not None else 0.0,
