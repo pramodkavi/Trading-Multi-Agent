@@ -129,9 +129,15 @@ export JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION=1                  # silence N
 cdk deploy --all --require-approval never
 #   ^ if an ECR push hits "TLS handshake timeout", just re-run — the image is cached.
 
-# DB migration over the Data API (idempotent)
-.\.venv\Scripts\python.exe scripts\migrate.py --backend dataapi \
+# DB migration over the Data API (idempotent).
+#   NOTE: as of Slice 2 the CD workflows run this AUTOMATICALLY before `cdk deploy`
+#   (discovering the ARNs from the CryptoSignals-Data stack outputs), so a normal
+#   push-to-main deploy needs no manual migration. The command below is for LOCAL
+#   dev DBs and break-glass / out-of-band schema applies only.
+.\.venv\Scripts\python.exe -m scripts.migrate --backend dataapi `
   --cluster-arn <cluster-arn> --secret-arn <db-secret-arn> --db-name signals
+#   ARNs for the live cluster are in §3. If the first call throws
+#   DatabaseResumingException (Aurora waking from scale-to-zero), just re-run it.
 
 # Manually invoke the scan Lambda
 aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat out.json
@@ -184,12 +190,65 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | Priority | Item |
 |---|---|
 | 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. After rotating, update Secrets Manager: `aws secretsmanager update-secret --secret-id crypto-signals/anthropic-api-key --secret-string '<key>'` and `... telegram-bot-token --secret-string '{"bot_token":"<t>","chat_id":"8300889332"}'`. Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. |
-| 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. |
-| 🟡 Hardening | Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily scan survives Aurora waking. |
+| 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. **(done for dev — OIDC live.)** |
+| 🟠 Infra/CD | **Auto-migration IAM (Slice 2):** the deploy workflows now run the DB migration before `cdk deploy` using the OIDC deploy role. That role must allow `cloudformation:DescribeStacks` (already has it), `rds-data:ExecuteStatement` on the cluster, and `secretsmanager:GetSecretValue` on the DB secret. If the role is admin-ish this is already covered; if it's scoped, attach the policy in §4 / the deploy notes or the migration step fails with `AccessDenied`. |
+| 🟡 Hardening | Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking. (The CD migration step already retries; this item is the separate runtime/scan path.) |
 
 ---
 
 ## 8. What's next — Slice 2 (Weeks 4–7), per `SPEC.md §4`
+
+> **Progress (2026-06-13):** CD pipeline is fully working (push to `main` → auto-deploy dev via
+> OIDC). The user supplied their reference SMC scripts (`requested_scripts/`); we ran an
+> evidence review (`docs/research/smc-evidence-review.md`) and agreed an **evidence-weighted +
+> calibrated** Analyzer philosophy (premium/discount + liquidity at obvious levels = high
+> trust; derivatives = regime/risk filter not direction; OTE/PO3 = low-weight context;
+> **as-of correctness mandatory**; forward-test, not backtest, is the real validation).
+> **Step 2.1a shipped:** `src/agents/analyzer/smc/` — typed, look-ahead-free structure layer
+> (swings, BOS/CHoCH state machine, market phase, directional Premium/Discount + OTE,
+> ATR normalization) with a no-look-ahead invariant test.
+> **Step 2.1b shipped:** `fvg.py` — Fair Value Gap detector (3-candle imbalance, ATR-normalized
+> size + displacement, as-of mitigation/fill status) with a no-look-ahead invariant test.
+> **Step 2.1c shipped:** `order_block.py` — Order Block detector anchored to confirmed BOS/CHoCH
+> events (2.1a) with FVG confluence (2.1b), displacement, and as-of mitigation status.
+> **Step 2.1d shipped:** `liquidity.py` — BSL/SSL pools, equal-level clustering, stop-hunt sweeps
+> vs breaks (as-of correct), nearest resting targets.
+> **Step 2.1e shipped — STEP 2.1 COMPLETE:** `analysis.py::full_smc_analysis` combines all four
+> detector layers via a HYBRID gate model — HARD gates (clear bias, Premium/Discount §1.6 rule 3,
+> a valid order-block POI) + an evidence-WEIGHTED confluence threshold (liquidity sweep highest
+> weight; OB displacement/FVG/fresh; OTE lowest) — emits a complete `SignalProposal | SkipDecision`
+> with Layer-5 risk geometry (entry at POI, SL beyond it, TP = nearest resting opposing liquidity).
+> **`smc_analyzer.analyze()` is now rewired to this** (the Slice-1 HTF-bias stub is gone — first
+> live-path change since Slice 1); the graph tests were repointed at a publishing series.
+> `confluence_score` is a raw tally surfaced in features/tags, NOT a calibrated probability.
+> **The full SMC analyzer is now live on the `analyze()` path.**
+> **Step 2.2 shipped:** `src/providers/rate_limit.py::TokenBucket` (async, injectable clock; Binance
+> 2400 weight/min preset) + `BinanceProvider` upgrades — concurrent multi-timeframe fetch
+> (`asyncio.gather`), `fetch_funding_rate`/`fetch_open_interest` methods, and `include_derivatives`
+> on `fetch_market_snapshot` to populate `funding_rate`/`open_interest` (best-effort; degrades to
+> None). All API calls now meter request weight through the bucket. Unit tests (mocked) + opt-in
+> integration test (real multi-TF + derivatives). NOTE: `run_scan` still requests only H4 — wiring
+> it to request the SMC timeframes + derivatives is a small follow-up (do it when the analyzer's
+> multi-TF top-down logic lands; the analyzer already falls back gracefully today).
+> **Step 2.3 shipped:** `src/providers/macro.py` — `FREDProvider` (DXY proxy DTWEXBGS / US 10Y DGS10 /
+> Fed Funds DFF) and `TwelveDataProvider` (SPX, VIX), both behind a shared `MacroProvider(DataProvider)`
+> base (httpx, not ccxt). Each returns a normalized `MacroContext` (extended with a `fed_funds` field)
+> populated with only the fields it owns, or a `NoMacroData` sentinel when it can serve none (graceful
+> degradation per FR-4.3; per-field best-effort otherwise). Market-snapshot is unsupported on macro
+> providers (raises). Unit tests via `httpx.MockTransport`; opt-in integration tests skip without keys.
+> NOTE: providers take `api_key` directly; wiring them to Settings/Secrets (FRED_API_KEY,
+> TWELVE_DATA_API_KEY) happens with the Skeptic (Step 2.5) / Step 2.12 ops.
+> **Step 2.4a shipped (schema + persistence foundation):** `signals` gained first-class
+> `tags TEXT[]` / `features JSONB` / `outcome` (enum-checked) / `outcome_metadata JSONB` columns
+> (idempotent `ALTER ... ADD COLUMN IF NOT EXISTS` + GIN index on tags). `SignalOutcome` enum added.
+> Both store backends write tags/features at `create_signal` (Data API uses the `string_to_array`
+> comma-string workaround; asyncpg binds the list natively) and read all four back into an extended
+> `StoredSignal`. Data-API migration statement count 12→18. **⚠️ MIGRATION ORDERING: apply the schema
+> (migrate.py) to the live DB BEFORE deploying this code — `create_signal` now INSERTs the new
+> columns, which must exist.** outcome/outcome_metadata stay NULL at creation (set by the Forecaster,
+> Step 2.9). Next: **Step 2.4b (the Historian itself — `HistorianRepository` 3-stage retrieval
+> [SQL hard filters → tag-overlap via PG array ops → numeric L2 distance], `historian_node` +
+> `HistorianReport`, ~50-signal synthetic seed fixture).**
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

@@ -211,21 +211,24 @@ class SignalRepository:
         if isinstance(payload, SignalProposal):
             status = SignalStatus.PUBLISHED
             direction: SignalDirection | None = payload.direction
-            symbol = payload.symbol
-            strategy = payload.strategy
-            scan_id = payload.scan_id
+            tags = list(payload.tags)
+            features: dict[str, Any] = dict(payload.features)
         else:
             status = SignalStatus.SKIPPED
             direction = None
-            symbol = payload.symbol
-            strategy = payload.strategy
-            scan_id = payload.scan_id
+            tags = []
+            features = {}
+        symbol = payload.symbol
+        strategy = payload.strategy
+        scan_id = payload.scan_id
 
+        # asyncpg binds Python lists to text[] natively, so tags goes as $8 directly
+        # (no string_to_array workaround needed here -- that is only for the Data API).
         await self._conn.execute(
             """
             INSERT INTO signals
-                (id, scan_id, symbol, strategy, direction, status, payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                (id, scan_id, symbol, strategy, direction, status, payload, tags, features)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9::jsonb)
             """,
             signal_id,
             scan_id,
@@ -234,6 +237,8 @@ class SignalRepository:
             direction.value if direction is not None else None,
             status.value,
             _to_jsonb(payload.model_dump(mode="json")),
+            tags,
+            _to_jsonb(features),
         )
         return signal_id
 
@@ -241,7 +246,7 @@ class SignalRepository:
         record = await self._conn.fetchrow(
             """
             SELECT id, scan_id, symbol, strategy, direction, status,
-                   created_at, payload
+                   created_at, payload, tags, features, outcome, outcome_metadata
             FROM signals
             WHERE id = $1
             """,
@@ -268,7 +273,7 @@ class SignalRepository:
             rows = await self._conn.fetch(
                 """
                 SELECT id, scan_id, symbol, strategy, direction, status,
-                       created_at, payload
+                       created_at, payload, tags, features, outcome, outcome_metadata
                 FROM signals
                 ORDER BY created_at DESC
                 LIMIT $1
@@ -279,7 +284,7 @@ class SignalRepository:
             rows = await self._conn.fetch(
                 """
                 SELECT id, scan_id, symbol, strategy, direction, status,
-                       created_at, payload
+                       created_at, payload, tags, features, outcome, outcome_metadata
                 FROM signals
                 WHERE symbol = $1
                 ORDER BY created_at DESC
@@ -294,6 +299,9 @@ class SignalRepository:
     def _record_to_stored(self, record: asyncpg.Record) -> StoredSignal:
         data = _record_to_dict(record)
         data["payload"] = _parse_jsonb_field(data["payload"])
+        data["features"] = _parse_jsonb_field(data["features"])
+        if data.get("outcome_metadata") is not None:
+            data["outcome_metadata"] = _parse_jsonb_field(data["outcome_metadata"])
         return StoredSignal.model_validate(data)
 
 

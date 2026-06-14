@@ -21,8 +21,9 @@ CCXT mapping notes:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 import aiohttp
 import ccxt
@@ -38,9 +39,14 @@ from src.providers.base import (
     ProviderUnavailableError,
     Timeframe,
 )
+from src.providers.rate_limit import TokenBucket
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Sequence
+
+# Binance USDT-M Futures request weights used to meter the rate limiter.
+_FUNDING_WEIGHT: Final[int] = 1
+_OPEN_INTEREST_WEIGHT: Final[int] = 1
 
 
 class BinanceProvider(DataProvider):
@@ -55,12 +61,20 @@ class BinanceProvider(DataProvider):
 
     name = "binance"
 
-    def __init__(self, *, client: ccxt_async.binance | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        client: ccxt_async.binance | None = None,
+        rate_limiter: TokenBucket | None = None,
+    ) -> None:
         """Construct a BinanceProvider.
 
         Args:
             client: Optional pre-built ccxt async client. Tests inject a mock
                 here. Production code passes None to get a fresh Futures client.
+            rate_limiter: Optional token bucket metering request weight. Defaults
+                to Binance Futures' 2400 weight/minute budget (Step 2.2). Tests
+                inject one with a fake clock to assert blocking deterministically.
 
         Resolver note:
             When we build the client ourselves, we attach an aiohttp session
@@ -73,6 +87,9 @@ class BinanceProvider(DataProvider):
             across platforms. The session is only created when no client is
             injected, so tests (which inject a mock) never touch the network.
         """
+        self._bucket = (
+            rate_limiter if rate_limiter is not None else TokenBucket.for_binance_futures()
+        )
         self._session: aiohttp.ClientSession | None = None
         if client is not None:
             self._client: ccxt_async.binance = client
@@ -96,7 +113,12 @@ class BinanceProvider(DataProvider):
             await self._session.close()
 
     async def fetch_market_snapshot(
-        self, symbol: str, timeframes: list[Timeframe], *, limit: int = 200
+        self,
+        symbol: str,
+        timeframes: list[Timeframe],
+        *,
+        limit: int = 200,
+        include_derivatives: bool = False,
     ) -> MarketSnapshot:
         if not timeframes:
             raise ProviderInvalidResponseError(
@@ -107,9 +129,24 @@ class BinanceProvider(DataProvider):
                 f"limit must be positive (got {limit})", provider=self.name
             )
 
+        # Fetch all timeframes concurrently. return_exceptions keeps every result
+        # retrievable, so a failure in one timeframe does not leave an un-awaited
+        # task whose exception would surface as a fatal warning under
+        # filterwarnings=error; we re-raise the first error after the gather.
+        results = await asyncio.gather(
+            *(self._fetch_one_timeframe(symbol, tf, limit) for tf in timeframes),
+            return_exceptions=True,
+        )
         klines: dict[Timeframe, list[Kline]] = {}
-        for tf in timeframes:
-            klines[tf] = await self._fetch_one_timeframe(symbol, tf, limit)
+        for tf, result in zip(timeframes, results, strict=True):
+            if isinstance(result, BaseException):
+                raise result
+            klines[tf] = result
+
+        funding_rate: float | None = None
+        open_interest: float | None = None
+        if include_derivatives:
+            funding_rate, open_interest = await self._fetch_derivatives(symbol)
 
         try:
             return MarketSnapshot(
@@ -117,6 +154,8 @@ class BinanceProvider(DataProvider):
                 venue=self.name,
                 fetched_at=datetime.now(UTC),
                 klines=klines,
+                funding_rate=funding_rate,
+                open_interest=open_interest,
             )
         except ValueError as exc:
             # Pydantic ValidationError is a ValueError subclass.
@@ -124,9 +163,63 @@ class BinanceProvider(DataProvider):
                 f"MarketSnapshot validation failed: {exc}", provider=self.name
             ) from exc
 
+    async def fetch_funding_rate(self, symbol: str) -> float | None:
+        """Latest perpetual funding rate as a decimal (e.g. 0.0001 = 0.01%).
+
+        Returns None when the venue does not expose a funding rate for the symbol.
+        """
+        await self._bucket.acquire(_FUNDING_WEIGHT)
+        try:
+            result = await self._client.fetch_funding_rate(symbol)
+        except ccxt.BaseError as exc:
+            raise self._translate_ccxt_error(exc) from exc
+        rate = result.get("fundingRate") if isinstance(result, dict) else None
+        return float(rate) if rate is not None else None
+
+    async def fetch_open_interest(self, symbol: str) -> float | None:
+        """Latest open interest in base-asset units, or None when unavailable."""
+        await self._bucket.acquire(_OPEN_INTEREST_WEIGHT)
+        try:
+            result = await self._client.fetch_open_interest(symbol)
+        except ccxt.BaseError as exc:
+            raise self._translate_ccxt_error(exc) from exc
+        if not isinstance(result, dict):
+            return None
+        amount = result.get("openInterestAmount")
+        if amount is None:
+            amount = result.get("openInterest")
+        return float(amount) if amount is not None else None
+
+    async def _fetch_derivatives(self, symbol: str) -> tuple[float | None, float | None]:
+        """Fetch funding rate + open interest concurrently, degrading to None on error.
+
+        Per FR-4.3, a derivatives hiccup should not sink the whole snapshot — the
+        analyzer's derivatives gate treats absence as neutral, not as a failure.
+        """
+        funding, oi = await asyncio.gather(
+            self.fetch_funding_rate(symbol),
+            self.fetch_open_interest(symbol),
+            return_exceptions=True,
+        )
+        funding_rate = None if isinstance(funding, BaseException) else funding
+        open_interest = None if isinstance(oi, BaseException) else oi
+        return funding_rate, open_interest
+
+    @staticmethod
+    def _klines_weight(limit: int) -> int:
+        """Binance Futures /klines request weight as a function of the limit."""
+        if limit <= 100:
+            return 1
+        if limit <= 500:
+            return 2
+        if limit <= 1000:
+            return 5
+        return 10
+
     async def _fetch_one_timeframe(
         self, symbol: str, timeframe: Timeframe, limit: int
     ) -> list[Kline]:
+        await self._bucket.acquire(self._klines_weight(limit))
         try:
             raw = await self._client.fetch_ohlcv(symbol, timeframe.value, limit=limit)
         except ccxt.BaseError as exc:

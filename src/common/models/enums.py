@@ -85,3 +85,18 @@ class AgentRole(StrEnum):
     JUDGE = "judge"
     FORECASTER = "forecaster"
     CRITIC = "critic"
+
+
+class SignalOutcome(StrEnum):
+    """Terminal result of a published setup, written to `signals.outcome`.
+
+    Set by the Forecaster (Step 2.9) when an active setup closes; NULL until then
+    and for SKIPPED rows. Drives the Historian's outcome-aware retrieval and the
+    Critic's win/loss analysis. Mirrors the CHECK constraint in schema.sql.
+    """
+
+    WIN = "WIN"  # take-profit reached
+    LOSS = "LOSS"  # stop-loss hit
+    BREAKEVEN = "BREAKEVEN"  # closed at/near entry
+    INVALIDATED = "INVALIDATED"  # setup premise broke before triggering
+    EXPIRED = "EXPIRED"  # never triggered within its validity window

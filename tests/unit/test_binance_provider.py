@@ -218,6 +218,136 @@ class TestExceptionTranslation:
 # ---------------------------------------------------------------------------
 
 
+def _make_full_client(
+    *,
+    ohlcv_by_tf: dict[str, Any] | None = None,
+    funding: Any = None,
+    oi: Any = None,
+) -> MagicMock:
+    """A mock ccxt client with per-timeframe klines + funding/OI endpoints."""
+    client = MagicMock()
+
+    async def _ohlcv(symbol: str, tf: str, limit: int = 200) -> Any:
+        table = ohlcv_by_tf or {}
+        return table.get(tf, [_ccxt_row(1_700_000_000_000)])
+
+    client.fetch_ohlcv = AsyncMock(side_effect=_ohlcv)
+    client.fetch_funding_rate = AsyncMock(return_value=funding)
+    client.fetch_open_interest = AsyncMock(return_value=oi)
+    client.close = AsyncMock()
+    return client
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe (Step 2.2)
+# ---------------------------------------------------------------------------
+
+
+class TestMultiTimeframe:
+    async def test_fetches_all_requested_timeframes(self) -> None:
+        rows = [
+            _ccxt_row(1_700_000_000_000),
+            _ccxt_row(1_700_000_000_000 + 4 * 3600 * 1000),
+        ]
+        client = _make_full_client(ohlcv_by_tf={"1d": rows, "4h": rows, "1h": rows})
+        provider = BinanceProvider(client=client)
+
+        snapshot = await provider.fetch_market_snapshot(
+            "BTCUSDT", [Timeframe.D1, Timeframe.H4, Timeframe.H1]
+        )
+
+        assert set(snapshot.klines) == {Timeframe.D1, Timeframe.H4, Timeframe.H1}
+        assert client.fetch_ohlcv.await_count == 3
+
+    async def test_one_timeframe_failure_propagates(self) -> None:
+        async def _ohlcv(symbol: str, tf: str, limit: int = 200) -> Any:
+            if tf == "1h":
+                raise ccxt.NetworkError("1h down")
+            return [_ccxt_row(1_700_000_000_000)]
+
+        client = MagicMock()
+        client.fetch_ohlcv = AsyncMock(side_effect=_ohlcv)
+        client.close = AsyncMock()
+        provider = BinanceProvider(client=client)
+
+        with pytest.raises(ProviderUnavailableError):
+            await provider.fetch_market_snapshot("BTCUSDT", [Timeframe.H4, Timeframe.H1])
+
+
+# ---------------------------------------------------------------------------
+# Derivatives: funding rate + open interest (Step 2.2)
+# ---------------------------------------------------------------------------
+
+
+class TestDerivatives:
+    async def test_fetch_funding_rate(self) -> None:
+        provider = BinanceProvider(client=_make_full_client(funding={"fundingRate": 0.0001}))
+        assert await provider.fetch_funding_rate("BTCUSDT") == pytest.approx(0.0001)
+
+    async def test_fetch_funding_rate_none_when_absent(self) -> None:
+        provider = BinanceProvider(client=_make_full_client(funding={}))
+        assert await provider.fetch_funding_rate("BTCUSDT") is None
+
+    async def test_fetch_open_interest_amount_key(self) -> None:
+        provider = BinanceProvider(client=_make_full_client(oi={"openInterestAmount": 12345.6}))
+        assert await provider.fetch_open_interest("BTCUSDT") == pytest.approx(12345.6)
+
+    async def test_fetch_open_interest_fallback_key(self) -> None:
+        provider = BinanceProvider(client=_make_full_client(oi={"openInterest": 999.0}))
+        assert await provider.fetch_open_interest("BTCUSDT") == pytest.approx(999.0)
+
+    async def test_include_derivatives_populates_snapshot(self) -> None:
+        client = _make_full_client(
+            funding={"fundingRate": -0.0002}, oi={"openInterestAmount": 5000.0}
+        )
+        provider = BinanceProvider(client=client)
+        snapshot = await provider.fetch_market_snapshot(
+            "BTCUSDT", [Timeframe.H4], include_derivatives=True
+        )
+        assert snapshot.funding_rate == pytest.approx(-0.0002)
+        assert snapshot.open_interest == pytest.approx(5000.0)
+
+    async def test_derivatives_off_by_default(self) -> None:
+        client = _make_full_client(funding={"fundingRate": 0.1}, oi={"openInterestAmount": 1.0})
+        provider = BinanceProvider(client=client)
+        snapshot = await provider.fetch_market_snapshot("BTCUSDT", [Timeframe.H4])
+        assert snapshot.funding_rate is None
+        assert snapshot.open_interest is None
+        client.fetch_funding_rate.assert_not_awaited()
+
+    async def test_derivative_failure_degrades_to_none(self) -> None:
+        client = _make_full_client(oi={"openInterestAmount": 5000.0})
+        client.fetch_funding_rate = AsyncMock(side_effect=ccxt.NetworkError("down"))
+        provider = BinanceProvider(client=client)
+        snapshot = await provider.fetch_market_snapshot(
+            "BTCUSDT", [Timeframe.H4], include_derivatives=True
+        )
+        # Funding failed -> None; OI still present. The snapshot survives.
+        assert snapshot.funding_rate is None
+        assert snapshot.open_interest == pytest.approx(5000.0)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (Step 2.2)
+# ---------------------------------------------------------------------------
+
+
+class TestRateLimiting:
+    async def test_acquires_kline_weight_for_limit(self) -> None:
+        bucket = MagicMock()
+        bucket.acquire = AsyncMock()
+        provider = BinanceProvider(client=_make_full_client(), rate_limiter=bucket)
+        await provider.fetch_market_snapshot("BTCUSDT", [Timeframe.H4], limit=200)
+        # limit 200 -> Binance kline weight 2.
+        bucket.acquire.assert_awaited_with(2)
+
+    def test_kline_weight_scales_with_limit(self) -> None:
+        assert BinanceProvider._klines_weight(100) == 1
+        assert BinanceProvider._klines_weight(200) == 2
+        assert BinanceProvider._klines_weight(1000) == 5
+        assert BinanceProvider._klines_weight(1500) == 10
+
+
 class TestLifecycle:
     async def test_aclose_calls_underlying_close(self) -> None:
         provider, _ = _make_provider(fetch_ohlcv_return=[_ccxt_row(1_700_000_000_000)])

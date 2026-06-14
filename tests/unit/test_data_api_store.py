@@ -297,6 +297,31 @@ async def test_create_signal_proposal_publishes() -> None:
     assert payload["symbol"] == "BTCUSDT"
 
 
+async def test_create_signal_binds_tags_and_features() -> None:
+    store, client = make_store()
+    proposal = make_proposal(tags=["bullish-ob", "liquidity-sweep"], features={"score": 3})
+
+    await store.create_signal(proposal)
+
+    call = client.calls[0]
+    # tags use the comma-string + string_to_array workaround (Data API rejects arrays).
+    assert "string_to_array" in call["sql"]
+    params = params_by_name(call)
+    assert params["tags"] == {"stringValue": "bullish-ob,liquidity-sweep"}
+    assert json.loads(params["features"]["stringValue"]) == {"score": 3}
+
+
+async def test_create_signal_skip_has_empty_tags() -> None:
+    store, client = make_store()
+    skip = make_skip()
+
+    await store.create_signal(skip)
+
+    # A skip has no tags -> NULL param -> server-side '{}'::text[].
+    params = params_by_name(client.calls[0])
+    assert params["tags"] == {"isNull": True}
+
+
 async def test_create_signal_skip_has_null_direction() -> None:
     store, client = make_store()
     skip = make_skip()
@@ -323,6 +348,10 @@ def _signal_columns() -> list[str]:
         "status",
         "created_at",
         "payload",
+        "tags",
+        "features",
+        "outcome",
+        "outcome_metadata",
     ]
 
 
@@ -336,6 +365,10 @@ def _signal_record(proposal: SignalProposal, signal_id: UUID) -> list[dict[str, 
         {"stringValue": "PUBLISHED"},
         {"stringValue": "2026-06-01T08:03:00.000000+00:00"},
         {"stringValue": json.dumps(proposal.model_dump(mode="json"))},
+        {"arrayValue": {"stringValues": list(proposal.tags)}},  # tags text[]
+        {"stringValue": json.dumps(proposal.features)},  # features JSONB
+        {"isNull": True},  # outcome (set later by the Forecaster)
+        {"isNull": True},  # outcome_metadata
     ]
 
 
@@ -351,6 +384,11 @@ async def test_get_signal_parses_payload_into_dict() -> None:
     assert result.status is SignalStatus.PUBLISHED
     # JSONB round-trips back into a typed proposal.
     assert result.as_proposal().symbol == "BTCUSDT"
+    # Step 2.4 columns parse: tags (text[]) -> list, features (JSONB) -> dict, outcome NULL.
+    assert result.tags == list(proposal.tags)
+    assert result.features == proposal.features
+    assert result.outcome is None
+    assert result.outcome_metadata is None
 
 
 async def test_get_signal_returns_none_when_empty() -> None:

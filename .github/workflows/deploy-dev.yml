@@ -7,6 +7,12 @@
 # DockerImageCode.from_image_asset, so `cdk deploy` builds the Lambda image and
 # pushes it to the CDK-managed ECR asset repo itself (ubuntu-latest has Docker).
 #
+# DB schema migration runs automatically BEFORE `cdk deploy` (Slice 2): the
+# schema is additive + idempotent and must exist before the new Lambda code
+# (which INSERTs the new columns) goes live. The cluster/secret ARNs are
+# discovered from the DataStack's CloudFormation outputs, so there is nothing
+# to configure per environment. See docs/PROJECT_STATE.md §4.
+#
 # Auth is keyless via GitHub OIDC -> an AWS IAM role (no long-lived keys).
 #
 # One-time prerequisites (configured outside this repo):
@@ -53,6 +59,11 @@ jobs:
       - name: Install CDK app dependencies
         run: pip install -r infrastructure/requirements.txt
 
+      - name: Install the migration runner (project package)
+        # scripts/migrate.py imports the project; -e gives it psycopg + boto3
+        # (both base deps) and the runtime src package. Pip cache makes repeats fast.
+        run: pip install -e .
+
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -65,6 +76,42 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Apply DB schema migration (Data API, before deploy)
+        env:
+          DATA_STACK: CryptoSignals-Data
+        run: |
+          set -euo pipefail
+          # First-ever deploy: the cluster doesn't exist yet. Skip — `cdk deploy`
+          # creates it, and the schema applies on the next deploy.
+          if ! aws cloudformation describe-stacks --stack-name "$DATA_STACK" >/dev/null 2>&1; then
+            echo "::notice::$DATA_STACK not found — skipping pre-deploy migration (first deploy?)."
+            exit 0
+          fi
+          q() { aws cloudformation describe-stacks --stack-name "$DATA_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue | [0]" --output text; }
+          CLUSTER_ARN=$(q ClusterArn)
+          SECRET_ARN=$(q DbSecretArn)
+          DB_NAME=$(q DatabaseName)
+          if [ -z "$CLUSTER_ARN" ] || [ "$CLUSTER_ARN" = "None" ] || [ -z "$SECRET_ARN" ] || [ "$SECRET_ARN" = "None" ]; then
+            echo "::error::Could not resolve ClusterArn/DbSecretArn from $DATA_STACK outputs."
+            exit 1
+          fi
+          if [ -z "$DB_NAME" ] || [ "$DB_NAME" = "None" ]; then DB_NAME=signals; fi
+          echo "Applying schema to $CLUSTER_ARN (db=$DB_NAME)"
+          # Retry to ride out Aurora Serverless v2 scale-to-zero: the first Data
+          # API call after idle throws DatabaseResumingException while it wakes.
+          for attempt in 1 2 3 4 5; do
+            if python -m scripts.migrate --backend dataapi \
+                 --cluster-arn "$CLUSTER_ARN" --secret-arn "$SECRET_ARN" --db-name "$DB_NAME"; then
+              echo "Migration applied."
+              exit 0
+            fi
+            echo "::warning::Migration attempt $attempt failed (Aurora resuming?); retrying in 20s."
+            sleep 20
+          done
+          echo "::error::Migration failed after 5 attempts."
+          exit 1
 
       - name: Deploy all stacks
         working-directory: infrastructure

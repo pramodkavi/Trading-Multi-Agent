@@ -29,6 +29,7 @@ from src.common.models import (
     AgentRole,
     ScanStatus,
     SignalDirection,
+    SignalOutcome,
     SignalProposal,
     SignalStatus,
     SkipDecision,
@@ -61,6 +62,26 @@ class StoredSignal(BaseModel):
     created_at: datetime = Field(description="UTC; must be timezone-aware.")
     payload: dict[str, Any] = Field(
         description="Raw JSONB payload. Use as_proposal() / as_skip() to parse.",
+    )
+    # ---- Step 2.4 Historian retrieval columns -----------------------------
+    tags: list[str] = Field(
+        default_factory=list,
+        description="First-class copy of the proposal's tags (signals.tags text[]); "
+        "the Historian's stage-2 tag-overlap retrieval ranks on these. Empty for skips.",
+    )
+    features: dict[str, Any] = Field(
+        default_factory=dict,
+        description="First-class copy of the proposal's numeric/categorical features "
+        "(signals.features JSONB); the Historian's stage-3 L2-distance retrieval uses these.",
+    )
+    outcome: SignalOutcome | None = Field(
+        default=None,
+        description="Terminal result, set by the Forecaster when the setup closes; "
+        "NULL until then and for skips.",
+    )
+    outcome_metadata: dict[str, Any] | None = Field(
+        default=None,
+        description="Free-form details about the outcome (exit price, realized R, etc.).",
     )
 
     @field_validator("created_at")

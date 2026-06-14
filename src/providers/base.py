@@ -264,6 +264,11 @@ class MacroContext(BaseModel):
         ge=0,
         description="VIX volatility index level. None when intraday data unavailable.",
     )
+    fed_funds: float | None = Field(
+        default=None,
+        description="Effective Federal Funds rate, as a percent (e.g., 5.33). "
+        "None when FRED is unavailable. Unconstrained sign for robustness.",
+    )
 
     @field_validator("fetched_at")
     @classmethod
@@ -271,6 +276,24 @@ class MacroContext(BaseModel):
         if v.tzinfo is None:
             raise ValueError("fetched_at must be timezone-aware (use UTC)")
         return v
+
+
+class NoMacroData(BaseModel):
+    """Sentinel returned when a macro provider cannot serve *any* data.
+
+    Per FR-4.3 the Skeptic degrades gracefully: it treats NoMacroData as "macro
+    context unavailable — downgrade confidence to medium", NOT as "no objection".
+    A distinct type (rather than an all-None MacroContext) lets callers branch with
+    `isinstance(result, NoMacroData)` and keeps "we have no data" unambiguous versus
+    "we fetched data and these fields happened to be absent".
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    provider: str = Field(min_length=1, description="Which provider failed (e.g., 'fred').")
+    reason: str = Field(
+        min_length=1, max_length=500, description="Human-readable cause for logs/dashboards."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +319,12 @@ class DataProvider(ABC):
 
     @abstractmethod
     async def fetch_market_snapshot(
-        self, symbol: str, timeframes: list[Timeframe], *, limit: int = 200
+        self,
+        symbol: str,
+        timeframes: list[Timeframe],
+        *,
+        limit: int = 200,
+        include_derivatives: bool = False,
     ) -> MarketSnapshot:
         """Fetch a normalized snapshot for one symbol across one or more timeframes.
 
@@ -304,6 +332,11 @@ class DataProvider(ABC):
             symbol: market symbol in venue-native format (e.g., 'BTCUSDT').
             timeframes: which timeframes to include in the snapshot.
             limit: max number of candles per timeframe (most-recent N).
+            include_derivatives: when True and the venue supports it, also populate
+                `funding_rate` and `open_interest` on the snapshot (Step 2.2). On a
+                venue without derivatives data these stay None. Derivative fetches
+                degrade gracefully — a failure leaves the field None rather than
+                failing the whole snapshot.
 
         Raises:
             ProviderUnavailableError: venue unreachable or returned 5xx.
@@ -311,6 +344,18 @@ class DataProvider(ABC):
             ProviderTimeoutError: request did not complete in time.
             ProviderInvalidResponseError: response did not parse to a MarketSnapshot.
         """
+
+    async def fetch_macro_context(self) -> MacroContext | NoMacroData:
+        """Fetch this provider's slice of macro context (Step 2.3).
+
+        Macro providers (FRED, Twelve Data) override this; market-only providers
+        (Binance) inherit the default below. Each macro provider populates only the
+        fields it owns (FRED: dxy/us10y_yield/fed_funds; Twelve Data: spx/vix) and
+        leaves the rest None — the Skeptic merges them. Returns a NoMacroData
+        sentinel when the provider cannot serve any field (graceful degradation,
+        FR-4.3), rather than raising.
+        """
+        raise NotImplementedError(f"{self.name} does not provide macro context")
 
     async def aclose(self) -> None:  # noqa: B027  (intentional no-op default)
         """Release any held async resources (HTTP sessions, etc.).
