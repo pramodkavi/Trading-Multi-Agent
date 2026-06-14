@@ -32,6 +32,7 @@ from src.agents.analyzer import analyze
 # AgentState must exist at runtime. The historian / skeptic packages import
 # AgentState only under TYPE_CHECKING, so this direction introduces no cycle.
 from src.agents.historian import HistorianReport
+from src.agents.judge import JudgeDecision
 from src.agents.skeptic import SkepticObjection
 from src.common.models import (
     JudgeRuling,
@@ -67,8 +68,13 @@ class AgentState(TypedDict, total=False):
                            when macro is unavailable (FR-4.3 -> Judge downgrades
                            confidence to medium), or None for skips / when the
                            node is not wired. Edge added in Step 2.7.
+        judge_decision   : set by the judge node (Step 2.6's make_judge_node):
+                           the full JudgeDecision (ruling + confidence +
+                           reasoning + caveat), or None for skips / when the node
+                           is not wired. Edge added in Step 2.7.
         decision         : set by analyzer_node (stub) -> overwritten by
-                           judge_node in Slice 2 Step 2.6.
+                           judge_node (Step 2.6) with judge_decision.ruling, so
+                           the existing dispatcher keeps consuming a JudgeRuling.
     """
 
     scan_context: ScanContext
@@ -76,6 +82,7 @@ class AgentState(TypedDict, total=False):
     proposal: SignalProposal | SkipDecision | None
     historian_report: HistorianReport | None
     skeptic_objection: SkepticObjection | NoMacroData | None
+    judge_decision: JudgeDecision | None
     decision: JudgeRuling | None
 
 

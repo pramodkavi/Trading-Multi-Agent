@@ -283,7 +283,29 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > gained optional `fred_api_key` / `twelve_data_api_key` (SecretStr) + `.env.example` entries. Tests:
 > merge/gather (success/all-unavailable/exception-tolerant) + evaluate (mocked Anthropic client; macro
 > short-circuit) + node (skip/objection/NoMacroData) + prompt + build_macro_providers. Checkpoints
-> green: ruff, mypy --strict (51 files), pytest **483 passed**. Next: **Step 2.6 (the Judge).**
+> green: ruff, mypy --strict (51 files), pytest **483 passed**.
+> **Step 2.6 shipped — THE JUDGE:** new `src/agents/judge/` package — the final arbiter (FR-1.6).
+> `Judge.evaluate(proposal, historian_report, skeptic_objection)` weighs the three already-gathered
+> inputs (it fetches nothing) and calls Claude via `structured_completion` with the new `JudgeDecision`
+> schema (ruling PUBLISH / PUBLISH_WITH_CAVEAT / SKIP + `confidence` LOW/MEDIUM/HIGH + written
+> `reasoning` + optional `caveat`). A model validator requires a non-empty caveat exactly when the
+> ruling is PUBLISH_WITH_CAVEAT (malformed → structured-output retry). **FR-4.3 is enforced
+> DETERMINISTICALLY**: when the Skeptic returned `NoMacroData`, `evaluate` clamps confidence HIGH→MEDIUM
+> after the LLM call (the system prompt also asks for it, but the clamp guarantees it). System prompt
+> bakes in the signal-only precision-over-recall asymmetry ("a missed signal costs nothing; a bad
+> published signal costs real money"), how to weight each input (historian win rate by SAMPLE SIZE;
+> win_rate=None = absence of evidence, treat neutrally; skeptic severity → SKIP/caveat/minor), the
+> three calibration shapes, forbidden indicators, and "hard numeric risk rules are enforced by code
+> (risk_gates), not you". `make_judge_node` is a node FACTORY; the node SKIPs non-proposals without an
+> LLM call and, for proposals, sets BOTH `judge_decision` (full object) and `decision` (the ruling enum
+> the existing dispatcher/scan-runner already consume via `state["decision"].value`). New
+> `JudgeConfidence` enum in common/models/enums.py + exported. `AgentState` gained `judge_decision:
+> JudgeDecision | None` (runtime import in graph.py — same get_type_hints gotcha). **Edge still NOT
+> wired — Step 2.7** (live path stays analyzer→END). 15 tests: schema/caveat validation, the three SPEC
+> scenarios (ruling plumbs through + prompt encodes the facts), FR-4.3 cap (+ no-cap when macro
+> available), node skip/proposal/missing-inputs, prompt rendering of None/NoMacroData. Checkpoints
+> green: ruff, ruff-format, mypy --strict (54 files), pytest **498 passed**. Next: **Step 2.7 (wire the
+> full LangGraph pipeline + Langfuse + Postgres checkpointer)**.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

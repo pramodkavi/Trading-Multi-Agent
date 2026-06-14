@@ -9,6 +9,7 @@ Public API:
     SkipDecision    -- structured non-action with categorical reason
     SkipReason      -- enum of categorical skip reasons (SPEC §1.6 mapping)
     JudgeRuling     -- terminal Judge decision enum
+    JudgeConfidence -- LOW / MEDIUM / HIGH confidence in the Judge's ruling
     ObjectionSeverity -- LOW / MEDIUM / HIGH for the Skeptic's objection
     SignalDirection -- LONG / SHORT
     SignalStatus    -- persisted PUBLISHED / SKIPPED row status
@@ -20,6 +21,7 @@ Public API:
 
 from src.common.models.enums import (
     AgentRole,
+    JudgeConfidence,
     JudgeRuling,
     ObjectionSeverity,
     ScanSession,
@@ -34,6 +36,7 @@ from src.common.models.skip_decision import SkipDecision, SkipReason
 
 __all__ = [
     "AgentRole",
+    "JudgeConfidence",
     "JudgeRuling",
     "ObjectionSeverity",
     "ScanContext",

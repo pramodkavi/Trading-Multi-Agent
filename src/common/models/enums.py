@@ -49,6 +49,20 @@ class ObjectionSeverity(StrEnum):
     HIGH = "HIGH"
 
 
+class JudgeConfidence(StrEnum):
+    """The Judge's confidence in its own ruling (SPEC §3.1.1 FR-1.6 / FR-4.3).
+
+    Distinct from the ruling itself: the Judge can PUBLISH at LOW confidence
+    (with a caveat) or SKIP at HIGH confidence. Per FR-4.3, when the Skeptic
+    could not fetch macro context (NoMacroData) the Judge must cap confidence at
+    MEDIUM -- absence of macro data is a reason for caution, not an all-clear.
+    """
+
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
 class ScanSession(StrEnum):
     """UTC trading session windows used by the scheduler and risk gates.
 
