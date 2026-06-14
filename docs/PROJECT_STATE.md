@@ -322,14 +322,30 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > integration test only.** `build_graph`/`run_scan` stay analyzer-only — **the pipeline is NOT on the live
 > scan path yet.** 8 tests (offline, all agents mocked): publish-through-all-nodes, skip short-circuits
 > (historian/skeptic/judge never called), checkpointer persists state, tracer wraps every node + tracing
-> seam unit tests. Checkpoints green: ruff, mypy --strict (55 files), pytest **506 passed**. **OPEN
-> FOLLOW-UP (the deferred "live adoption" half of 2.7):** rewire `run_scan`/`lambda_handler` to use
-> `build_pipeline_graph` (construct store + macro providers via `build_macro_providers` + Anthropic
-> client; → live LLM cost ~$3-5/mo on deploy), persist each agent's reasoning to `agent_runs` (FR-1.7),
-> enrich the Telegram message with historian win-rate + skeptic objection + judge ruling (FR-5.2), and
-> construct an `AsyncPostgresSaver` (needs the `langgraph-checkpoint-postgres` dep) for the local path.
-> Next: **Step 2.8 (active_setups table + ActiveSetupRepository)** — or the 2.7 live-adoption follow-up
-> first, user's call.
+> seam unit tests. Checkpoints green: ruff, mypy --strict (55 files), pytest **506 passed**.
+> **Step 2.7 LIVE ADOPTION shipped (user-confirmed) — THE PIPELINE IS NOW THE LIVE SCAN PATH:**
+> `scripts/run_scan.py` rewritten. `build_pipeline(settings, store, client)` constructs the graph ONCE
+> per process (Historian over the store + Skeptic with `build_macro_providers(settings)` + Judge, all on
+> one `AsyncAnthropic` client) and `run_one_symbol` now runs `build_pipeline_graph(...).ainvoke(...)`
+> instead of the analyzer-only graph. **The Slice-1 `generate_commentary` / `MarketCommentary` stand-in
+> is DELETED — the Skeptic + Judge nodes make the live Claude calls now.** ⚠️ **DEPLOYING THIS CHANGES
+> LIVE BEHAVIOUR + INTRODUCES ONGOING LLM COST (~$3-5/mo at the ≤5-signal/day cap; skips cost nothing —
+> the conditional edge short-circuits).** FR-1.7: `_persist` writes `create_signal` + one `agent_run` per
+> agent that ran (analyzer always; historian/skeptic/judge only on a publish path) via `model_dump(mode=
+> "json")`; latency/token/cost omitted for now (Langfuse covers that when enabled). FR-5.2:
+> `compose_message` branches on the Judge ruling — PUBLISH/PUBLISH_WITH_CAVEAT → `format_new_signal` (now
+> takes a `caveat` kwarg) enriched with historian win-rate + skeptic objection (+ caveat); analyzer skip →
+> `format_skip`; Judge veto on a real proposal → a "JUDGED SKIP" note. `run_one_symbol` signature changed:
+> drops `settings`/`anthropic_client`, takes the prebuilt `graph` (+ provider/store/notifier). The
+> `AsyncAnthropic` client is created in `_run_symbols`/`_amain` and **closed** in finally (`await
+> client.close()` — confirmed `close`, not `aclose`) to avoid a ResourceWarning under
+> `filterwarnings=error`. `test_run_scan.py` fully rewritten (mocked pipeline graph + clients): publish
+> persists 4 agent_runs, skip persists 1, compose_message variants, lambda lifecycle (now also patches
+> `AsyncAnthropic`). Checkpoints green: ruff, mypy --strict (55 files), pytest **507 passed**.
+> **STILL DEFERRED (smaller follow-ups, not blockers):** local `AsyncPostgresSaver` checkpointer (Lambda
+> runs without one; needs `langgraph-checkpoint-postgres` + table setup); per-agent token/cost on
+> agent_runs rows; multi-TF/derivatives fetch (still H4-only); the scan `session` is hardcoded AD_HOC
+> (the EventBridge cron→session mapping is Step 2.10). Next: **Step 2.8 (active_setups + ActiveSetupRepository)**.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

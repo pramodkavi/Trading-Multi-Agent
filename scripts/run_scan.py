@@ -1,31 +1,37 @@
-"""Local end-to-end scan runner (Slice 1 Step 1.12).
+"""End-to-end scan runner (Slice 2 Step 2.7 live adoption).
 
-Wires every Slice 1 component into one pass and proves the production stack
-works against real external services:
+Wires the full per-signal pipeline into one pass and proves the production
+stack works against real external services:
 
-    config (Step 1.11)        -> load Settings from .env
-    Binance (Step 1.4)        -> fetch 4H klines for one symbol
-    LangGraph (Step 1.7)      -> run the analyzer-only graph
-    Anthropic (Step 1.6)      -> a LIVE Claude Sonnet 4.5 call generates an
-                                 analyst commentary on the scan result
-    Postgres (Steps 1.8-1.9)  -> persist scan_runs + signals + agent_runs
-    Telegram (Step 1.10)      -> deliver the result to the operator's phone
+    config (Step 1.11)        -> load Settings from .env / Secrets Manager
+    Binance (Step 2.2)        -> fetch 4H klines for one symbol
+    LangGraph (Step 2.7)      -> run the full pipeline graph:
+                                 analyzer -> historian -> skeptic -> judge
+    Anthropic (Step 1.6)      -> the Skeptic + Judge nodes make the LIVE Claude
+                                 calls (the Slice-1 commentary stand-in is gone)
+    Postgres (Steps 1.8-1.9)  -> persist scan_runs + signals + the full
+                                 reasoning chain to agent_runs (FR-1.7)
+    Telegram (Step 1.10)      -> deliver the Judge's decision to the operator
 
-LLM placement note:
-    The Slice 1 analyzer is pure-Python HTF bias detection (Step 1.5) -- it
-    does not call the LLM. To satisfy the Step 1.12 requirement of a real
-    Anthropic call end-to-end, the runner makes one structured_completion
-    call AFTER the graph runs, producing a short analyst note. The graph
-    itself stays "analyzer only" per the spec wording. Slice 2 promotes the
-    LLM into proper agent nodes (Skeptic, Judge); the commentary here is the
-    Slice 1 stand-in and is logged to agent_runs like any other agent call.
+Pipeline placement:
+    The graph is built ONCE per process (it embeds the store-backed Historian
+    and the Skeptic/Judge bound to one Anthropic client) and reused across
+    symbols. A SkipDecision short-circuits the conditional edge, so skips cost
+    no LLM calls (see src/agents/orchestration/graph.py).
 
 Telegram trigger:
-    A message is sent on BOTH outcomes (published proposal OR skip) so the
-    operator always sees the end-to-end result regardless of market state.
+    A message is sent on every outcome (published signal, analyzer skip, or a
+    Judge veto) so the operator always sees the end-to-end result. The message
+    shape is chosen from the Judge's ruling.
+
+Deferred (Step 2.7 follow-ups, see docs/PROJECT_STATE.md): a local
+AsyncPostgresSaver checkpointer (the Data API Lambda runs without one),
+per-agent token/cost accounting on the agent_runs rows (Langfuse covers
+observability when enabled), and multi-timeframe / derivatives fetching.
 
 Usage:
     # .env must provide ANTHROPIC_API_KEY, TELEGRAM_*, DATABASE_URL.
+    # FRED_API_KEY / TWELVE_DATA_API_KEY are optional (Skeptic macro context).
     python scripts/run_scan.py                 # first symbol in SCAN_SYMBOLS
     python scripts/run_scan.py --symbol ETHUSDT
     python scripts/run_scan.py --no-notify     # skip Telegram (DB + LLM only)
@@ -42,12 +48,14 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from anthropic import AsyncAnthropic
-from pydantic import BaseModel, Field
 
-from src.agents.orchestration import run_scan
-from src.common.llm import structured_completion
+from src.agents.historian import HistorianRepository
+from src.agents.judge import Judge
+from src.agents.orchestration import build_pipeline_graph
+from src.agents.skeptic import Skeptic, SkepticObjection, build_macro_providers
 from src.common.models import (
     AgentRole,
+    JudgeRuling,
     ScanContext,
     ScanSession,
     SignalProposal,
@@ -61,13 +69,14 @@ from src.notifications import (
     format_skip,
 )
 from src.persistence import create_store
-from src.providers import BinanceProvider, Timeframe
+from src.providers import BinanceProvider, NoMacroData, Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Sequence
 
+    from pydantic import BaseModel
+
     from src.agents.orchestration import AgentState
-    from src.common.llm import StructuredCompletionResult
     from src.config import Settings
     from src.notifications import Notifier
     from src.persistence import SignalStore
@@ -79,115 +88,80 @@ logger = logging.getLogger(__name__)
 # (MIN_KLINES_REQUIRED=30 plus comfortable headroom for the pivot window).
 CANDLE_LIMIT: int = 200
 
-
-# ---------------------------------------------------------------------------
-# LLM commentary schema + prompt
-# ---------------------------------------------------------------------------
-
-
-class MarketCommentary(BaseModel):
-    """Structured analyst note produced by a live Claude call.
-
-    Deliberately small: this is the Slice 1 LLM touchpoint, not the full
-    Skeptic/Judge reasoning that arrives in Slice 2. Field length bounds keep
-    the Telegram message tidy and the token cost negligible.
-    """
-
-    commentary: str = Field(
-        min_length=10,
-        max_length=600,
-        description="One to three sentences of plain-English analysis of the "
-        "scan result. No markdown; the caller escapes it for Telegram.",
-    )
-    key_risk: str = Field(
-        min_length=3,
-        max_length=300,
-        description="The single most important risk or caveat for this setup "
-        "(or, on a skip, why acting now would be premature).",
-    )
-
-
-ANALYST_SYSTEM_PROMPT: str = (
-    "You are a concise Smart Money Concepts (SMC) trading analyst. You are "
-    "given the structured result of an automated 4H scan for one crypto "
-    "perpetual. Write a brief, sober analyst note. Do not invent price levels "
-    "or data not present in the input. Do not use markdown formatting. Be "
-    "direct and avoid hype. This is a signal-only system; never tell the user "
-    "to place a trade."
+# Rulings that publish a signal to the operator (vs SKIP).
+_PUBLISH_RULINGS: frozenset[JudgeRuling] = frozenset(
+    {JudgeRuling.PUBLISH, JudgeRuling.PUBLISH_WITH_CAVEAT}
 )
 
 
-def _summarise_state_for_llm(symbol: str, state: AgentState) -> str:
-    """Render the scan outcome into a compact prompt for the analyst LLM call."""
-    proposal = state.get("proposal")
-    decision = state.get("decision")
-    lines: list[str] = [
-        f"Symbol: {symbol}",
-        f"Decision: {decision.value if decision is not None else 'UNKNOWN'}",
-    ]
-
-    snapshot = state.get("snapshot")
-    if snapshot is not None:
-        candles = snapshot.klines.get(Timeframe.H4)
-        if candles:
-            latest = candles[-1]
-            lines.append(f"Latest 4H close: {latest.close}")
-            lines.append(f"4H candles analysed: {len(candles)}")
-
-    if isinstance(proposal, SignalProposal):
-        lines.extend(
-            [
-                f"Direction: {proposal.direction.value}",
-                f"Entry: {proposal.entry_price}",
-                f"Stop loss: {proposal.stop_loss}",
-                f"Take profit 1: {proposal.take_profit_1}",
-                f"Risk:reward: 1:{proposal.risk_reward_ratio:.1f}",
-                f"Tags: {', '.join(proposal.tags) if proposal.tags else '(none)'}",
-                f"Strategy narrative: {proposal.confluence_narrative}",
-            ]
-        )
-    elif isinstance(proposal, SkipDecision):
-        lines.extend(
-            [
-                f"Skip reason: {proposal.reason.value}",
-                f"Skip details: {proposal.details}",
-            ]
-        )
-
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# Pipeline construction
+# ---------------------------------------------------------------------------
 
 
-async def generate_commentary(
+def build_pipeline(
     *,
     settings: Settings,
-    symbol: str,
-    state: AgentState,
-    client: AsyncAnthropic | None = None,
-) -> StructuredCompletionResult[MarketCommentary]:
-    """Make one live Anthropic call to produce an analyst note on the scan.
+    store: SignalStore,
+    client: AsyncAnthropic,
+) -> tuple[Any, list[DataProvider]]:
+    """Construct the compiled pipeline graph and the macro providers it owns.
 
-    The client is constructed from the configured API key unless a caller
-    injects one (tests pass a mock). structured_completion handles the
-    tool-use schema enforcement, validation retries, and cost accounting.
+    Built once per process and reused across symbols. Returns the compiled
+    graph plus the Skeptic's macro providers so the caller can ``aclose`` them
+    (they each hold an httpx client). With no FRED / Twelve Data keys configured
+    the provider list is empty and the Skeptic degrades to NoMacroData (FR-4.3).
     """
-    user_prompt = _summarise_state_for_llm(symbol, state)
-    cli = client or AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
-    return await structured_completion(
-        output_schema=MarketCommentary,
-        system=ANALYST_SYSTEM_PROMPT,
-        user=user_prompt,
-        client=cli,
+    macro_providers = build_macro_providers(settings)
+    graph = build_pipeline_graph(
+        historian=HistorianRepository(store),
+        skeptic=Skeptic(macro_providers, client=client),
+        judge=Judge(client=client),
     )
+    return graph, macro_providers
+
+
+def _initial_state(ctx: ScanContext, snapshot: Any) -> AgentState:
+    return {
+        "scan_context": ctx,
+        "snapshot": snapshot,
+        "proposal": None,
+        "decision": None,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# Persistence (FR-1.7: persist the full reasoning chain, including skips)
 # ---------------------------------------------------------------------------
 
 
 def _input_hash(text: str) -> str:
-    """Stable SHA-256 of the LLM prompt; recorded on the agent_run row."""
+    """Stable SHA-256 used as the agent_run input_hash."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+async def _log_agent(
+    store: SignalStore,
+    ctx: ScanContext,
+    symbol: str,
+    role: AgentRole,
+    output: BaseModel,
+) -> None:
+    """Write one agent_run row carrying an agent's structured output.
+
+    Token/cost/latency are omitted for now (Langfuse provides per-call
+    observability when enabled); the reasoning itself is what FR-1.7 requires.
+    ``mode="json"`` makes UUIDs / datetimes / enums JSON-safe for the JSONB
+    column.
+    """
+    await store.log_agent_run(
+        scan_id=ctx.scan_id,
+        agent_role=role,
+        strategy=ctx.strategy,
+        input_hash=_input_hash(f"{ctx.scan_id}:{role.value}:{symbol}"),
+        output=output.model_dump(mode="json"),
+        latency_ms=0,
+    )
 
 
 async def _persist(
@@ -196,34 +170,29 @@ async def _persist(
     ctx: ScanContext,
     symbol: str,
     state: AgentState,
-    commentary_result: StructuredCompletionResult[MarketCommentary],
 ) -> None:
-    """Write the signal row and the commentary agent_run.
+    """Write the signal row and the per-agent reasoning chain (FR-1.7).
 
     The parent scan_runs row is created by the caller before the work starts
-    (FK ordering); this writes the two child rows.
+    (FK ordering); this writes the signal plus one agent_run per agent that
+    ran. On a skip only the analyzer ran, so only its row is written.
     """
     proposal = state.get("proposal")
     if proposal is None:
         raise RuntimeError("graph produced no proposal/skip; cannot persist")
 
     await store.create_signal(proposal)
+    await _log_agent(store, ctx, symbol, AgentRole.ANALYZER, proposal)
 
-    await store.log_agent_run(
-        scan_id=ctx.scan_id,
-        agent_role=AgentRole.ANALYZER,
-        strategy=ctx.strategy,
-        input_hash=_input_hash(_summarise_state_for_llm(symbol, state)),
-        output=commentary_result.output.model_dump(),
-        latency_ms=commentary_result.latency_ms,
-        token_usage={
-            "input_tokens": commentary_result.tokens_in,
-            "output_tokens": commentary_result.tokens_out,
-            "model": commentary_result.model,
-            "attempts": commentary_result.attempts,
-        },
-        cost_usd=commentary_result.cost_usd,
-    )
+    report = state.get("historian_report")
+    if report is not None:
+        await _log_agent(store, ctx, symbol, AgentRole.HISTORIAN, report)
+    objection = state.get("skeptic_objection")
+    if objection is not None:
+        await _log_agent(store, ctx, symbol, AgentRole.SKEPTIC, objection)
+    judge_decision = state.get("judge_decision")
+    if judge_decision is not None:
+        await _log_agent(store, ctx, symbol, AgentRole.JUDGE, judge_decision)
 
 
 # ---------------------------------------------------------------------------
@@ -231,22 +200,68 @@ async def _persist(
 # ---------------------------------------------------------------------------
 
 
-def compose_message(state: AgentState, commentary: MarketCommentary) -> str:
-    """Build the Telegram MarkdownV2 body for either outcome + the LLM note."""
-    proposal = state.get("proposal")
-    if isinstance(proposal, SignalProposal):
-        head = format_new_signal(proposal)
-    elif isinstance(proposal, SkipDecision):
-        head = format_skip(proposal)
-    else:  # pragma: no cover - guarded earlier
-        head = escape_markdown_v2("No analyzer result produced.")
+def _skeptic_fields(objection: object) -> tuple[str | None, str | None]:
+    """Pull (objection text, severity) for the alert from the Skeptic output."""
+    if isinstance(objection, SkepticObjection):
+        return objection.headline, objection.severity.value
+    if isinstance(objection, NoMacroData):
+        return (f"Macro context unavailable ({objection.reason}); confidence reduced.", None)
+    return (None, None)
 
-    note = (
-        "\n\n"
-        f"*Analyst note:* {escape_markdown_v2(commentary.commentary)}\n"
-        f"*Key risk:* {escape_markdown_v2(commentary.key_risk)}"
+
+def _format_judge_skip(state: AgentState) -> str:
+    """Operator note when the Judge vetoed a real proposal (decision == SKIP)."""
+    proposal = state.get("proposal")
+    judge_decision = state.get("judge_decision")
+    symbol = proposal.symbol if isinstance(proposal, SignalProposal) else "?"
+    reasoning = judge_decision.reasoning if judge_decision is not None else "Judge ruled SKIP."
+    return "\n".join(
+        [
+            "*\U0001f50e JUDGED SKIP*",
+            "",
+            f"*Symbol:* `{escape_markdown_v2(symbol)}`",
+            "",
+            f"*Why:* {escape_markdown_v2(reasoning)}",
+        ]
     )
-    return head + note
+
+
+def compose_message(state: AgentState) -> str:
+    """Build the Telegram MarkdownV2 body for the scan outcome.
+
+    Shape is chosen from the Judge's ruling:
+        PUBLISH / PUBLISH_WITH_CAVEAT -> the full signal (FR-5.2), enriched with
+            the Historian win rate, the Skeptic objection, and (with caveat) the
+            Judge's caveat line.
+        analyzer SkipDecision         -> a skip note.
+        Judge veto on a real proposal -> a "judged skip" note.
+    """
+    proposal = state.get("proposal")
+    decision = state.get("decision")
+    judge_decision = state.get("judge_decision")
+
+    if isinstance(proposal, SignalProposal) and decision in _PUBLISH_RULINGS:
+        report = state.get("historian_report")
+        skeptic_text, severity = _skeptic_fields(state.get("skeptic_objection"))
+        caveat = (
+            judge_decision.caveat
+            if judge_decision is not None and decision is JudgeRuling.PUBLISH_WITH_CAVEAT
+            else None
+        )
+        return format_new_signal(
+            proposal,
+            historian_win_rate=report.win_rate if report is not None else None,
+            historian_sample_size=report.sample_size if report is not None else None,
+            skeptic_objection=skeptic_text,
+            skeptic_severity=severity,
+            caveat=caveat,
+        )
+
+    if isinstance(proposal, SkipDecision):
+        return format_skip(proposal)
+
+    # A SignalProposal the Judge ruled SKIP (or any other non-publish outcome).
+    return _format_judge_skip(state)
 
 
 # ---------------------------------------------------------------------------
@@ -256,21 +271,19 @@ def compose_message(state: AgentState, commentary: MarketCommentary) -> str:
 
 async def run_one_symbol(
     *,
-    settings: Settings,
     symbol: str,
     provider: DataProvider,
     store: SignalStore,
+    graph: Any,
     notifier: Notifier | None,
-    anthropic_client: AsyncAnthropic | None = None,
 ) -> ScanContext:
-    """Run one full scan for one symbol; returns the ScanContext used.
+    """Run one full scan for one symbol through the pipeline; returns its ScanContext.
 
-    Lifecycle: start_scan -> fetch -> graph -> live LLM -> persist -> notify
-    -> complete_scan. Any exception flips the scan row to FAILED and re-raises
-    so the caller surfaces a non-zero exit.
-
-    Persistence is reached through the backend-neutral ``SignalStore`` (Step
-    1.17): the same code path serves local asyncpg and the cloud Data API.
+    Lifecycle: start_scan -> fetch -> pipeline graph -> persist -> notify ->
+    complete_scan. Any exception flips the scan row to FAILED and re-raises so
+    the caller surfaces a non-zero exit. The compiled ``graph`` (built once by
+    the caller) holds the Historian / Skeptic / Judge; persistence reaches the
+    backend-neutral ``SignalStore`` (Step 1.17) the graph's Historian also uses.
     """
     ctx = ScanContext(
         session=ScanSession.AD_HOC,
@@ -291,35 +304,15 @@ async def run_one_symbol(
         snapshot = await provider.fetch_market_snapshot(symbol, [Timeframe.H4], limit=CANDLE_LIMIT)
         logger.info("fetched %d 4H candles", len(snapshot.klines[Timeframe.H4]))
 
-        state = await run_scan(scan_context=ctx, snapshot=snapshot)
+        state = await graph.ainvoke(_initial_state(ctx, snapshot))
         decision = state.get("decision")
-        logger.info("analyzer decision: %s", decision.value if decision else "UNKNOWN")
+        logger.info("judge decision: %s", decision.value if decision else "UNKNOWN")
 
-        commentary_result = await generate_commentary(
-            settings=settings,
-            symbol=symbol,
-            state=state,
-            client=anthropic_client,
-        )
-        logger.info(
-            "LLM commentary: %d in / %d out tokens, cost=%s, %dms",
-            commentary_result.tokens_in,
-            commentary_result.tokens_out,
-            commentary_result.cost_usd,
-            commentary_result.latency_ms,
-        )
-
-        await _persist(
-            store=store,
-            ctx=ctx,
-            symbol=symbol,
-            state=state,
-            commentary_result=commentary_result,
-        )
-        logger.info("persisted signal + agent_run for scan %s", ctx.scan_id)
+        await _persist(store=store, ctx=ctx, symbol=symbol, state=state)
+        logger.info("persisted signal + reasoning chain for scan %s", ctx.scan_id)
 
         if notifier is not None:
-            await notifier.send(compose_message(state, commentary_result.output))
+            await notifier.send(compose_message(state))
             logger.info("telegram message sent")
 
         await store.complete_scan(scan_id=ctx.scan_id, completed_at=_utcnow())
@@ -351,17 +344,20 @@ async def _run_symbols(
     symbols: list[str],
     notify: bool,
 ) -> list[dict[str, Any]]:
-    """Run a scan for each symbol, sharing one store / provider / notifier.
+    """Run a scan for each symbol, sharing one store / provider / pipeline / notifier.
 
-    Each symbol is independent: a failure on one is captured in its result
-    entry and does not abort the others (``run_one_symbol`` has already flipped
-    that scan's row to FAILED before re-raising). The store backend is chosen
-    by ``settings.persistence_backend`` -- ``dataapi`` in the Lambda.
+    Each symbol is independent: a failure on one is captured in its result entry
+    and does not abort the others (``run_one_symbol`` has already flipped that
+    scan's row to FAILED before re-raising). The store backend is chosen by
+    ``settings.persistence_backend`` -- ``dataapi`` in the Lambda. The pipeline
+    graph + Anthropic client are built once and reused across symbols.
     """
     store = await create_store(settings)
     results: list[dict[str, Any]] = []
     try:
         provider = BinanceProvider()
+        client = AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
+        graph, macro_providers = build_pipeline(settings=settings, store=store, client=client)
         notifier: Notifier | None = (
             TelegramNotifier(
                 token=settings.telegram_bot_token.get_secret_value(),
@@ -374,10 +370,10 @@ async def _run_symbols(
             for symbol in symbols:
                 try:
                     ctx = await run_one_symbol(
-                        settings=settings,
                         symbol=symbol,
                         provider=provider,
                         store=store,
+                        graph=graph,
                         notifier=notifier,
                     )
                     results.append({"symbol": symbol, "scan_id": str(ctx.scan_id), "status": "ok"})
@@ -393,6 +389,9 @@ async def _run_symbols(
                     )
         finally:
             await provider.aclose()
+            for macro_provider in macro_providers:
+                await macro_provider.aclose()
+            await client.close()
             if notifier is not None:
                 await notifier.aclose()
     finally:
@@ -469,6 +468,8 @@ async def _amain(*, symbol: str | None, notify: bool) -> int:
     store = await create_store(settings)
     try:
         provider = BinanceProvider()
+        client = AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
+        graph, macro_providers = build_pipeline(settings=settings, store=store, client=client)
         notifier: Notifier | None = (
             TelegramNotifier(
                 token=settings.telegram_bot_token.get_secret_value(),
@@ -479,14 +480,17 @@ async def _amain(*, symbol: str | None, notify: bool) -> int:
         )
         try:
             await run_one_symbol(
-                settings=settings,
                 symbol=target_symbol,
                 provider=provider,
                 store=store,
+                graph=graph,
                 notifier=notifier,
             )
         finally:
             await provider.aclose()
+            for macro_provider in macro_providers:
+                await macro_provider.aclose()
+            await client.close()
             if notifier is not None:
                 await notifier.aclose()
     finally:
@@ -498,7 +502,7 @@ async def _amain(*, symbol: str | None, notify: bool) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="run_scan",
-        description="Run one end-to-end Slice 1 scan for a single symbol.",
+        description="Run one end-to-end scan for a single symbol through the full pipeline.",
     )
     parser.add_argument(
         "--symbol",

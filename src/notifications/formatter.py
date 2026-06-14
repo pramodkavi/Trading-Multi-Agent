@@ -96,12 +96,14 @@ def format_new_signal(
     historian_sample_size: int | None = None,
     skeptic_objection: str | None = None,
     skeptic_severity: str | None = None,
+    caveat: str | None = None,
 ) -> str:
     """Render a SignalProposal as a Telegram MarkdownV2 message.
 
-    Slice 1 always passes `None` for the historian/skeptic kwargs (those
-    agents don't exist yet). Slice 2 Step 2.6 wires real values once the
-    Judge has the report and objection in hand.
+    The historian/skeptic/caveat kwargs are populated by the Slice 2 pipeline
+    (Step 2.7 live adoption): the win rate + objection come from the Historian
+    and Skeptic, and `caveat` is the Judge's one-liner on a PUBLISH_WITH_CAVEAT
+    ruling. All default to None so a bare proposal still renders.
 
     Args:
         proposal: the published trade idea.
@@ -109,6 +111,7 @@ def format_new_signal(
         historian_sample_size: how many similar historical setups were used.
         skeptic_objection: the skeptic's strongest objection text.
         skeptic_severity: 'low' / 'medium' / 'high'.
+        caveat: the Judge's caveat shown on a PUBLISH_WITH_CAVEAT ruling.
 
     Returns:
         A Telegram-ready MarkdownV2 string. Always ends with the mandated
@@ -140,6 +143,11 @@ def format_new_signal(
             f"*Risk:* {risk_rendered} · *Lev:* {leverage_rendered}",
         ]
     )
+
+    # Judge caveat (PUBLISH_WITH_CAVEAT). Placed high so the warning is seen
+    # before the trade levels are acted on.
+    if caveat:
+        lines.extend(["", f"*⚠ Caveat:* {escape_markdown_v2(caveat)}"])
 
     # Historian section (Slice 2+).
     if historian_win_rate is not None:
