@@ -24,11 +24,13 @@ from scripts.run_scan import (
     compose_message,
     run_one_symbol,
 )
+from src.agents.forecaster import ForecasterUpdate
 from src.agents.historian import HistorianReport, HistorianRepository
 from src.agents.judge import Judge, JudgeDecision
 from src.agents.orchestration import build_pipeline_graph
 from src.agents.skeptic import Skeptic, SkepticObjection
 from src.common.models import (
+    ForecastStatus,
     JudgeConfidence,
     JudgeRuling,
     ObjectionSeverity,
@@ -592,6 +594,39 @@ class TestLambdaHandler:
         await _alambda({"symbol": "BTCUSDT", "notify": False}, _settings())
 
         deps["notifier_factory"].assert_not_called()
+
+    async def test_forecaster_mode_runs_forecaster(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        store = MagicMock()
+        store.aclose = AsyncMock()
+        provider = MagicMock()
+        provider.aclose = AsyncMock()
+        notifier = MagicMock()
+        notifier.aclose = AsyncMock()
+        client = MagicMock()
+        client.close = AsyncMock()
+        forecaster = MagicMock()
+        forecaster.run = AsyncMock(
+            return_value=[
+                ForecasterUpdate(status=ForecastStatus.STILL_VALID, reasoning="x" * 20),
+                ForecasterUpdate(status=ForecastStatus.AT_RISK, reasoning="y" * 20),
+            ]
+        )
+        monkeypatch.setattr(run_scan_module, "create_store", AsyncMock(return_value=store))
+        monkeypatch.setattr(run_scan_module, "BinanceProvider", MagicMock(return_value=provider))
+        monkeypatch.setattr(run_scan_module, "TelegramNotifier", MagicMock(return_value=notifier))
+        monkeypatch.setattr(run_scan_module, "AsyncAnthropic", MagicMock(return_value=client))
+        monkeypatch.setattr(run_scan_module, "Forecaster", MagicMock(return_value=forecaster))
+
+        result = await _alambda({"mode": "forecaster"}, _settings())
+
+        assert result["mode"] == "forecaster"
+        assert result["evaluated"] == 2
+        assert result["by_status"] == {"STILL_VALID": 1, "AT_RISK": 1}
+        forecaster.run.assert_awaited_once()
+        store.aclose.assert_awaited_once()
+        client.close.assert_awaited_once()
+        provider.aclose.assert_awaited_once()
+        notifier.aclose.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

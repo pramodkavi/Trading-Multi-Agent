@@ -380,9 +380,24 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > a schedule yet — that's Step 2.10 (a separate EventBridge rule → Lambda), so no live LLM cost from this
 > step.** 11 tests (schema validation, the 3 verdict paths via fake store/provider/notifier + mocked
 > client, orphan skip, per-setup failure isolation, formatter). Checkpoints green: ruff, ruff-format,
-> mypy --strict (58 files), pytest **536 passed** (23 deselected). Next: **Step 2.10 (Forecaster
-> scheduling — `5 8,13,15,22` cron + a forecaster Lambda)** — or **Step 2.11 (risk_gates) given the live
-> deploy still has no §1.6 enforcement**, user's call.
+> mypy --strict (58 files), pytest **536 passed** (23 deselected).
+> **Step 2.10 shipped — SCHEDULING (⚠️ REQUIRES MERGE + DEPLOY TO TAKE EFFECT):** `SchedulingStack`
+> completed — it previously had ONLY the London-open scan; now all four SPEC §5 scan windows (London
+> 08:03, NY 13:03, overlap 15:03, daily-wrap 22:03 → `cron(3 H * * ? *)`, scan mode) **plus** the
+> Forecaster sweep `cron(5 8,13,15,22 * * ? *)` which invokes the SAME scan Lambda with
+> `{"mode": "forecaster"}` (single-Lambda per CLAUDE.md — "clean separation" = dedicated schedule + event
+> flag, not a 2nd function). `scripts/run_scan.py`: `_alambda` dispatches `event["mode"]=="forecaster"`
+> → new `_run_forecaster` (builds store+provider+notifier+AsyncAnthropic, runs `Forecaster(...).run()`,
+> closes the client, returns `{"ok","mode":"forecaster","evaluated","by_status"}`); any other/absent mode
+> → the existing scan path. **VERIFIED the CDK via real `app.synth()`** (installed the pinned
+> `infrastructure/requirements.txt` — aws-cdk-lib 2.259.0 etc. — into `.venv` per its documented workflow):
+> synth emits 5 AWS::Scheduler::Schedule resources with the exact crons + the forecaster Input. +1 lambda
+> test (forecaster mode routes to the Forecaster + closes deps). Checkpoints green: ruff, py_compile,
+> mypy --strict (58 files), pytest **537 passed** (23 deselected). **⚠️ ON DEPLOY THIS GOES LIVE: scans
+> now fire at all 4 windows (more signals than London-only) AND the Forecaster runs 4×/day → extra LLM
+> cost scaling with open-setup count.** Requires the OIDC deploy role's existing Scheduler perms (no new
+> IAM). Next: **Step 2.11 (risk_gates §1.6) — strongly recommended before relying on the now-fuller live
+> schedule** — or 2.12 ops.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

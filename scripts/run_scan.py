@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from anthropic import AsyncAnthropic
 
+from src.agents.forecaster import Forecaster
 from src.agents.historian import HistorianRepository
 from src.agents.judge import Judge
 from src.agents.orchestration import build_pipeline_graph
@@ -404,6 +405,46 @@ async def _run_symbols(
     return results
 
 
+async def _run_forecaster(*, settings: Settings, notify: bool) -> dict[str, Any]:
+    """Re-evaluate every open setup once (Step 2.9 Forecaster, scheduled by 2.10).
+
+    Builds the same store / provider / notifier / Anthropic client as a scan and
+    runs the Forecaster loop. Returns a JSON-serialisable summary counting the
+    verdicts so the invocation surfaces activity to CloudWatch.
+    """
+    store = await create_store(settings)
+    updates: list[Any] = []
+    try:
+        provider = BinanceProvider()
+        client = AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
+        notifier: Notifier | None = (
+            TelegramNotifier(
+                token=settings.telegram_bot_token.get_secret_value(),
+                chat_id=settings.telegram_chat_id,
+            )
+            if notify
+            else None
+        )
+        try:
+            forecaster = Forecaster(
+                store=store, provider=provider, notifier=notifier, client=client
+            )
+            updates = await forecaster.run()
+        finally:
+            await provider.aclose()
+            await client.close()
+            if notifier is not None:
+                await notifier.aclose()
+    finally:
+        await store.aclose()
+
+    by_status: dict[str, int] = {}
+    for update in updates:
+        by_status[update.status.value] = by_status.get(update.status.value, 0) + 1
+    logger.info("forecaster run complete: %d setup(s), %s", len(updates), by_status)
+    return {"ok": True, "mode": "forecaster", "evaluated": len(updates), "by_status": by_status}
+
+
 def _symbols_from_event(event: dict[str, Any], settings: Settings) -> list[str]:
     """Resolve the symbols to scan: event override, else the watchlist.
 
@@ -426,8 +467,15 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
     Windows leaves an unclosed-loop ResourceWarning.
     """
     payload = event or {}
-    symbols = _symbols_from_event(payload, settings)
     notify = bool(payload.get("notify", True))
+
+    # Step 2.10: a separate EventBridge schedule invokes this same Lambda with
+    # {"mode": "forecaster"} a couple minutes after each scan, to re-evaluate
+    # open setups. Any other (or absent) mode runs the per-signal scan.
+    if payload.get("mode") == "forecaster":
+        return await _run_forecaster(settings=settings, notify=notify)
+
+    symbols = _symbols_from_event(payload, settings)
     logger.info("lambda scan starting for %s (notify=%s)", symbols, notify)
 
     results = await _run_symbols(settings=settings, symbols=symbols, notify=notify)
