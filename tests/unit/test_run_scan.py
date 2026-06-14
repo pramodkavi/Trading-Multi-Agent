@@ -172,6 +172,14 @@ def _publishing_graph() -> Any:
     )
 
 
+def _vetoing_graph() -> Any:
+    """Pipeline whose Judge rules SKIP on a real proposal (a veto)."""
+    return _pipeline_graph(
+        _client([_tool_response(_OBJECTION_PAYLOAD, tool_name="emit_objection")]),
+        _client([_tool_response(_ruling_payload("SKIP"), tool_name="emit_ruling")]),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Other mocks
 # ---------------------------------------------------------------------------
@@ -199,8 +207,9 @@ def _store() -> MagicMock:
     store.start_scan = AsyncMock()
     store.complete_scan = AsyncMock()
     store.fail_scan = AsyncMock()
-    store.create_signal = AsyncMock()
+    store.create_signal = AsyncMock(return_value=uuid4())
     store.log_agent_run = AsyncMock()
+    store.open_active_setup = AsyncMock(return_value=uuid4())
     store.aclose = AsyncMock()
     return store
 
@@ -379,6 +388,8 @@ class TestRunOneSymbol:
         store.create_signal.assert_awaited_once()
         # FR-1.7: analyzer + historian + skeptic + judge reasoning all journaled.
         assert store.log_agent_run.await_count == 4
+        # Step 2.8: a publish opens a tracked active setup.
+        store.open_active_setup.assert_awaited_once()
         notifier.send.assert_awaited_once()
         store.complete_scan.assert_awaited_once()
         store.fail_scan.assert_not_awaited()
@@ -401,8 +412,26 @@ class TestRunOneSymbol:
 
         store.create_signal.assert_awaited_once()
         assert store.log_agent_run.await_count == 1  # analyzer only
+        store.open_active_setup.assert_not_awaited()  # skips open no setup
         notifier.send.assert_awaited_once()
         store.complete_scan.assert_awaited_once()
+
+    async def test_judge_veto_opens_no_setup(self) -> None:
+        provider = _provider(_snapshot(_bullish_series()))
+        store = _store()
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=provider,
+            store=store,
+            graph=_vetoing_graph(),
+            notifier=_notifier(),
+        )
+
+        # A real proposal the Judge SKIPs is journaled (4 agents) but NOT tracked.
+        store.create_signal.assert_awaited_once()
+        assert store.log_agent_run.await_count == 4
+        store.open_active_setup.assert_not_awaited()
 
     async def test_no_notifier_skips_telegram(self) -> None:
         provider = _provider(_snapshot(_bullish_series()))

@@ -15,11 +15,13 @@ Public API:
     SignalStatus    -- persisted PUBLISHED / SKIPPED row status
     ScanSession     -- which scheduler window triggered the scan
     ScanStatus      -- persisted scan_runs row status (RUNNING/SUCCESS/FAILED)
+    ActiveSetupStatus -- OPEN + terminal lifecycle of an active_setups row
     AgentRole       -- the six agent roles referenced by agent_runs
     ScanContext     -- per-scan metadata propagated through every agent
 """
 
 from src.common.models.enums import (
+    ActiveSetupStatus,
     AgentRole,
     JudgeConfidence,
     JudgeRuling,
@@ -35,6 +37,7 @@ from src.common.models.signal_proposal import SignalProposal
 from src.common.models.skip_decision import SkipDecision, SkipReason
 
 __all__ = [
+    "ActiveSetupStatus",
     "AgentRole",
     "JudgeConfidence",
     "JudgeRuling",

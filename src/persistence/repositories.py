@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 from src.common.models import (
+    ActiveSetupStatus,
     AgentRole,
     ScanStatus,
     SignalDirection,
@@ -35,7 +36,12 @@ from src.common.models import (
     SignalStatus,
     SkipDecision,
 )
-from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
+from src.persistence.models import (
+    StoredActiveSetup,
+    StoredAgentRun,
+    StoredScanRun,
+    StoredSignal,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping, Sequence
@@ -516,3 +522,98 @@ class AgentRunRepository:
             # accepts a Decimal but mypy is happier with explicit coercion.
             data["cost_usd"] = float(data["cost_usd"])
         return StoredAgentRun.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# ActiveSetupRepository
+# ---------------------------------------------------------------------------
+
+_ACTIVE_SETUP_COLUMNS = "id, signal_id, opened_at, status, last_evaluated_at, latest_evaluation"
+
+
+class ActiveSetupRepository:
+    """CRUD for the `active_setups` table (Step 2.8).
+
+    A setup is opened (status OPEN) when the Judge publishes a signal. The
+    Forecaster (Step 2.9) lists the OPEN setups each scan, records its
+    evaluation, and updates the status to a terminal value when one resolves.
+    """
+
+    def __init__(self, conn: asyncpg.Connection[Any]) -> None:
+        self._conn = conn
+
+    async def open_setup(self, *, signal_id: UUID) -> UUID:
+        """Insert a new OPEN setup for ``signal_id``; returns the new id."""
+        setup_id = uuid4()
+        await self._conn.execute(
+            """
+            INSERT INTO active_setups (id, signal_id, status)
+            VALUES ($1, $2, $3)
+            """,
+            setup_id,
+            signal_id,
+            ActiveSetupStatus.OPEN.value,
+        )
+        return setup_id
+
+    async def list_open(self) -> list[StoredActiveSetup]:
+        """All OPEN setups, oldest first (the Forecaster's work queue)."""
+        rows = await self._conn.fetch(
+            f"""
+            SELECT {_ACTIVE_SETUP_COLUMNS}
+            FROM active_setups
+            WHERE status = $1
+            ORDER BY opened_at ASC
+            """,
+            ActiveSetupStatus.OPEN.value,
+        )
+        return [self._record_to_stored(r) for r in rows]
+
+    async def get_by_id(self, setup_id: UUID) -> StoredActiveSetup | None:
+        record = await self._conn.fetchrow(
+            f"""
+            SELECT {_ACTIVE_SETUP_COLUMNS}
+            FROM active_setups
+            WHERE id = $1
+            """,
+            setup_id,
+        )
+        if record is None:
+            return None
+        return self._record_to_stored(record)
+
+    async def update_status(
+        self,
+        *,
+        setup_id: UUID,
+        status: ActiveSetupStatus,
+        evaluation: Mapping[str, Any] | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> None:
+        """Update a setup's status + evaluation.
+
+        Used for both a non-terminal touch (status stays OPEN, e.g. STILL_VALID /
+        AT_RISK) and a close (a terminal status). ``evaluation`` is COALESCEd so
+        passing None preserves the previous evaluation; ``last_evaluated_at``
+        defaults to NOW() when not given.
+        """
+        await self._conn.execute(
+            """
+            UPDATE active_setups
+            SET status = $1,
+                latest_evaluation = COALESCE($2::jsonb, latest_evaluation),
+                last_evaluated_at = COALESCE($3, NOW())
+            WHERE id = $4
+            """,
+            status.value,
+            _to_jsonb(dict(evaluation)) if evaluation is not None else None,
+            evaluated_at,
+            setup_id,
+        )
+
+    @staticmethod
+    def _record_to_stored(record: asyncpg.Record) -> StoredActiveSetup:
+        data = _record_to_dict(record)
+        if data.get("latest_evaluation") is not None:
+            data["latest_evaluation"] = _parse_jsonb_field(data["latest_evaluation"])
+        return StoredActiveSetup.model_validate(data)

@@ -132,3 +132,37 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_role_created_at
 
 CREATE INDEX IF NOT EXISTS idx_agent_runs_created_at
     ON agent_runs (created_at DESC);
+
+
+-- ---------------------------------------------------------------------------
+-- Slice 2 Step 2.8 (active setups): one row per published signal the system is
+-- actively tracking. A row is inserted (status OPEN) on a Judge PUBLISH /
+-- PUBLISH_WITH_CAVEAT. The Forecaster (Step 2.9) re-evaluates OPEN rows each
+-- scan and moves them to a terminal status (mirroring SignalOutcome) when the
+-- setup resolves; latest_evaluation holds the Forecaster's most recent
+-- STILL_VALID / AT_RISK / INVALIDATED reasoning. signal_id cascades so a deleted
+-- signal removes its setup.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS active_setups (
+    id                  UUID        PRIMARY KEY,
+    signal_id           UUID        NOT NULL
+                                    REFERENCES signals(id) ON DELETE CASCADE,
+    opened_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status              TEXT        NOT NULL
+                                    CHECK (status IN (
+                                        'OPEN',
+                                        'WIN',
+                                        'LOSS',
+                                        'BREAKEVEN',
+                                        'INVALIDATED',
+                                        'EXPIRED'
+                                    )),
+    last_evaluated_at   TIMESTAMPTZ,
+    latest_evaluation   JSONB
+);
+
+CREATE INDEX IF NOT EXISTS idx_active_setups_status
+    ON active_setups (status);
+
+CREATE INDEX IF NOT EXISTS idx_active_setups_signal_id
+    ON active_setups (signal_id);

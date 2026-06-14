@@ -226,6 +226,13 @@ class TestSchemaContent:
         # Both child tables must cascade so test-cleanup doesn't leave orphans.
         assert sql.count("REFERENCES scan_runs(id) ON DELETE CASCADE") == 2
 
+    def test_active_setups_status_constrained(self) -> None:
+        sql = self._schema()
+        # active_setups.status carries the OPEN + terminal lifecycle (Step 2.8),
+        # and cascades from its parent signal.
+        assert "'OPEN'" in sql
+        assert "REFERENCES signals(id) ON DELETE CASCADE" in sql
+
     def test_pgvector_extension_enabled(self) -> None:
         # Slice 3 Step 3.4 adds a vector(1536) column; we want the extension
         # in place now so that migration ordering is clean.
@@ -238,9 +245,9 @@ class TestSchemaContent:
 
 
 class TestPersistenceConstants:
-    def test_expected_tables_match_slice_1_scope(self) -> None:
-        # Slice 1 ships exactly these three tables; later slices extend.
-        assert frozenset({"scan_runs", "signals", "agent_runs"}) == EXPECTED_TABLES
+    def test_expected_tables_match_schema_scope(self) -> None:
+        # Slice 1 shipped scan_runs/signals/agent_runs; Step 2.8 added active_setups.
+        assert frozenset({"scan_runs", "signals", "agent_runs", "active_setups"}) == EXPECTED_TABLES
 
     def test_schema_sql_path_resolves(self) -> None:
         assert SCHEMA_SQL_PATH.exists()

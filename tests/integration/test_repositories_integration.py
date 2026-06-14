@@ -30,6 +30,7 @@ import pytest
 
 from scripts.migrate import run_migration
 from src.common.models import (
+    ActiveSetupStatus,
     AgentRole,
     ScanStatus,
     SignalDirection,
@@ -39,6 +40,7 @@ from src.common.models import (
     SkipReason,
 )
 from src.persistence import (
+    ActiveSetupRepository,
     AgentRunRepository,
     ScanRunRepository,
     SignalRepository,
@@ -337,3 +339,56 @@ async def test_signals_cascade_delete_on_scan_run_removal(
 
     rows_after = await repo.list_recent(limit=10)
     assert len(rows_after) == 0
+
+
+# ---------------------------------------------------------------------------
+# ActiveSetupRepository (Step 2.8)
+# ---------------------------------------------------------------------------
+
+
+async def test_active_setup_open_list_update_lifecycle(
+    conn: asyncpg.Connection[asyncpg.Record],  # type: ignore[type-arg]
+) -> None:
+    scan_id = await _seed_scan(conn)
+    signal_id = await SignalRepository(conn).create_signal(_make_proposal(scan_id))
+
+    repo = ActiveSetupRepository(conn)
+    setup_id = await repo.open_setup(signal_id=signal_id)
+
+    open_setups = await repo.list_open()
+    assert len(open_setups) == 1
+    assert open_setups[0].id == setup_id
+    assert open_setups[0].signal_id == signal_id
+    assert open_setups[0].is_open
+    assert open_setups[0].last_evaluated_at is None
+
+    await repo.update_status(
+        setup_id=setup_id,
+        status=ActiveSetupStatus.INVALIDATED,
+        evaluation={"reason": "premise broke", "outcome": "INVALIDATED"},
+    )
+
+    # Resolved setups leave the open queue.
+    assert await repo.list_open() == []
+
+    stored = await repo.get_by_id(setup_id)
+    assert stored is not None
+    assert stored.status is ActiveSetupStatus.INVALIDATED
+    assert not stored.is_open
+    assert stored.latest_evaluation == {"reason": "premise broke", "outcome": "INVALIDATED"}
+    assert stored.last_evaluated_at is not None
+
+
+async def test_active_setup_cascades_on_signal_delete(
+    conn: asyncpg.Connection[asyncpg.Record],  # type: ignore[type-arg]
+) -> None:
+    """Deleting a signal cascades to its active_setups row (FK ON DELETE CASCADE)."""
+    scan_id = await _seed_scan(conn)
+    signal_id = await SignalRepository(conn).create_signal(_make_proposal(scan_id))
+    repo = ActiveSetupRepository(conn)
+    await repo.open_setup(signal_id=signal_id)
+    assert len(await repo.list_open()) == 1
+
+    await conn.execute("DELETE FROM signals WHERE id = $1", signal_id)
+
+    assert await repo.list_open() == []

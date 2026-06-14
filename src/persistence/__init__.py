@@ -28,8 +28,14 @@ from src.persistence.dataapi_migrate import (
     split_sql_statements,
 )
 from src.persistence.factory import create_store
-from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
+from src.persistence.models import (
+    StoredActiveSetup,
+    StoredAgentRun,
+    StoredScanRun,
+    StoredSignal,
+)
 from src.persistence.repositories import (
+    ActiveSetupRepository,
     AgentRunRepository,
     ScanRunRepository,
     SignalRepository,
@@ -42,19 +48,21 @@ from src.persistence.store import (
 
 SCHEMA_SQL_PATH: Path = Path(__file__).parent / "schema.sql"
 
-EXPECTED_TABLES: frozenset[str] = frozenset({"scan_runs", "signals", "agent_runs"})
+EXPECTED_TABLES: frozenset[str] = frozenset({"scan_runs", "signals", "agent_runs", "active_setups"})
 EXPECTED_EXTENSIONS: frozenset[str] = frozenset({"vector"})
 
 __all__ = [
     "EXPECTED_EXTENSIONS",
     "EXPECTED_TABLES",
     "SCHEMA_SQL_PATH",
+    "ActiveSetupRepository",
     "AgentRunRepository",
     "AsyncpgSignalStore",
     "DataApiSignalStore",
     "ScanRunRepository",
     "SignalRepository",
     "SignalStore",
+    "StoredActiveSetup",
     "StoredAgentRun",
     "StoredScanRun",
     "StoredSignal",

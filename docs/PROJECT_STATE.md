@@ -345,7 +345,28 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > **STILL DEFERRED (smaller follow-ups, not blockers):** local `AsyncPostgresSaver` checkpointer (Lambda
 > runs without one; needs `langgraph-checkpoint-postgres` + table setup); per-agent token/cost on
 > agent_runs rows; multi-TF/derivatives fetch (still H4-only); the scan `session` is hardcoded AD_HOC
-> (the EventBridge cron→session mapping is Step 2.10). Next: **Step 2.8 (active_setups + ActiveSetupRepository)**.
+> (the EventBridge cron→session mapping is Step 2.10).
+> **Step 2.8 shipped — ACTIVE SETUPS TRACKING:** new `active_setups` table (id, signal_id FK→signals
+> ON DELETE CASCADE, opened_at, status, last_evaluated_at, latest_evaluation JSONB) + 2 indexes, added
+> to schema.sql (idempotent; CD auto-migrates before deploy → the live DB gets it automatically). New
+> `ActiveSetupStatus` enum (OPEN + the SignalOutcome terminals WIN/LOSS/BREAKEVEN/INVALIDATED/EXPIRED —
+> status doubles as the lifecycle per the SPEC column list, no separate outcome column). `StoredActiveSetup`
+> read model (`is_open` property). `ActiveSetupRepository` (asyncpg) + matching methods on the
+> `SignalStore` Protocol / `DataApiSignalStore` (named params, `_utc_iso` timestamps, `_row_to_active_setup`)
+> / `AsyncpgSignalStore` forwards: `open_active_setup(signal_id)`, `list_open_active_setups()` (oldest
+> first — the Forecaster's queue), `get_active_setup(id)`, `update_active_setup(id, status, evaluation,
+> evaluated_at)` (COALESCE keeps prior eval when None; one method serves both a STILL_VALID/AT_RISK touch
+> and a terminal close — the Forecaster at 2.9 will also call `set_signal_outcome` alongside a terminal
+> update). **Wired into `run_scan._persist`:** captures the `create_signal` return id and, only on a Judge
+> PUBLISH/PUBLISH_WITH_CAVEAT (not skips, not vetoes), calls `open_active_setup`. `EXPECTED_TABLES` grew
+> to 4; Data-API migration statement-count pin 18→21 (1 table + 2 indexes); schema comment avoids the
+> literal "CREATE TABLE/INDEX" phrase (the idempotency-count test scans for it). Tests: StoredActiveSetup
+> model + ActiveSetupRepository (mocked conn) + DataApi methods (mocked rds-data) — SQL shape/params/parse
+> for BOTH backends + run_scan wiring (publish opens a setup; skip & veto don't) + opt-in asyncpg
+> integration (open→list→update lifecycle + signal-delete cascade; NOT run here — no Docker). Checkpoints
+> green: ruff, mypy --strict (55 files), pytest **525 passed** (23 deselected). Next: **Step 2.9 (the
+> Forecaster — consumes list_open_active_setups, STILL_VALID/AT_RISK/INVALIDATED, calls update_active_setup
+> + set_signal_outcome on close)**.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

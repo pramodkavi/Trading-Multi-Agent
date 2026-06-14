@@ -181,7 +181,7 @@ async def _persist(
     if proposal is None:
         raise RuntimeError("graph produced no proposal/skip; cannot persist")
 
-    await store.create_signal(proposal)
+    signal_id = await store.create_signal(proposal)
     await _log_agent(store, ctx, symbol, AgentRole.ANALYZER, proposal)
 
     report = state.get("historian_report")
@@ -193,6 +193,11 @@ async def _persist(
     judge_decision = state.get("judge_decision")
     if judge_decision is not None:
         await _log_agent(store, ctx, symbol, AgentRole.JUDGE, judge_decision)
+
+    # Step 2.8: a published signal becomes a tracked active setup the Forecaster
+    # will follow (only on PUBLISH / PUBLISH_WITH_CAVEAT; skips and vetoes don't).
+    if isinstance(proposal, SignalProposal) and state.get("decision") in _PUBLISH_RULINGS:
+        await store.open_active_setup(signal_id=signal_id)
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.common.models import (
+    ActiveSetupStatus,
     AgentRole,
     ScanStatus,
     SignalDirection,
@@ -183,4 +184,53 @@ class StoredAgentRun(BaseModel):
     def _must_be_aware(cls, v: datetime) -> datetime:
         if v.tzinfo is None:
             raise ValueError("created_at must be timezone-aware (use UTC)")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# StoredActiveSetup -- mirrors a row of `active_setups`
+# ---------------------------------------------------------------------------
+
+
+class StoredActiveSetup(BaseModel):
+    """Read-side projection of one row in the `active_setups` table (Step 2.8).
+
+    A setup is OPEN from publication until the Forecaster (Step 2.9) resolves it
+    to a terminal `status`. `latest_evaluation` is the raw JSONB of the
+    Forecaster's most recent evaluation (STILL_VALID / AT_RISK / INVALIDATED),
+    NULL until the first evaluation.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID = Field(description="Primary key (active_setups.id).")
+    signal_id: UUID = Field(description="FK to signals.id (the published signal).")
+    opened_at: datetime = Field(description="When the setup was opened (UTC).")
+    status: ActiveSetupStatus = Field(description="OPEN or a terminal outcome.")
+    last_evaluated_at: datetime | None = Field(
+        default=None,
+        description="When the Forecaster last evaluated this setup; NULL until first eval.",
+    )
+    latest_evaluation: dict[str, Any] | None = Field(
+        default=None,
+        description="Raw JSONB of the Forecaster's most recent evaluation.",
+    )
+
+    @property
+    def is_open(self) -> bool:
+        """True while the setup is live (not yet resolved to a terminal status)."""
+        return self.status is ActiveSetupStatus.OPEN
+
+    @field_validator("opened_at")
+    @classmethod
+    def _opened_must_be_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("opened_at must be timezone-aware (use UTC)")
+        return v
+
+    @field_validator("last_evaluated_at")
+    @classmethod
+    def _evaluated_must_be_aware(cls, v: datetime | None) -> datetime | None:
+        if v is not None and v.tzinfo is None:
+            raise ValueError("last_evaluated_at must be timezone-aware (use UTC)")
         return v
