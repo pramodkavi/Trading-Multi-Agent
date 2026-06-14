@@ -39,10 +39,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from src.common.models import SignalDirection, SignalProposal, SkipDecision
+from src.common.models import ForecastStatus, SignalDirection, SignalProposal, SkipDecision
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    pass
+    # Imported for typing only: the forecaster package imports this module, so a
+    # runtime import of its model here would create a cycle. Field access in the
+    # function body is duck-typed and needs no runtime import.
+    from src.agents.forecaster import ForecasterUpdate
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +190,35 @@ def format_new_signal(
 
     # Mandated footer.
     lines.extend(["", f"_{FOOTER}_"])
+    return "\n".join(lines)
+
+
+def format_forecaster_update(proposal: SignalProposal, update: ForecasterUpdate) -> str:
+    """Render a Forecaster verdict on an open setup (FR-2.1 / FR-5.3).
+
+    Distinguished from a NEW SIGNAL by its header so the operator can tell a
+    follow-up update apart at a glance. Sent on AT_RISK (a warning) and
+    INVALIDATED (a close, carrying the terminal outcome); STILL_VALID does not
+    normally reach Telegram.
+    """
+    status = update.status
+    if status is ForecastStatus.AT_RISK:
+        header = "*⚠️ SETUP AT RISK*"
+    elif status is ForecastStatus.INVALIDATED:
+        header = "*🔚 SETUP CLOSED*"
+    else:
+        header = "*🔄 SETUP UPDATE*"
+
+    lines: list[str] = [
+        header,
+        "",
+        f"*Symbol:* `{escape_markdown_v2(proposal.symbol)}`",
+        f"*Direction:* {escape_markdown_v2(proposal.direction.value)}",
+        f"*Status:* `{escape_markdown_v2(status.value)}`",
+    ]
+    if update.outcome is not None:
+        lines.append(f"*Outcome:* `{escape_markdown_v2(update.outcome.value)}`")
+    lines.extend(["", f"*Why:* {escape_markdown_v2(update.reasoning)}"])
     return "\n".join(lines)
 
 

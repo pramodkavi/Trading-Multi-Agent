@@ -364,9 +364,25 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > model + ActiveSetupRepository (mocked conn) + DataApi methods (mocked rds-data) — SQL shape/params/parse
 > for BOTH backends + run_scan wiring (publish opens a setup; skip & veto don't) + opt-in asyncpg
 > integration (open→list→update lifecycle + signal-delete cascade; NOT run here — no Docker). Checkpoints
-> green: ruff, mypy --strict (55 files), pytest **525 passed** (23 deselected). Next: **Step 2.9 (the
-> Forecaster — consumes list_open_active_setups, STILL_VALID/AT_RISK/INVALIDATED, calls update_active_setup
-> + set_signal_outcome on close)**.
+> green: ruff, mypy --strict (55 files), pytest **525 passed** (23 deselected).
+> **Step 2.9 shipped — THE FORECASTER:** new `src/agents/forecaster/` package — the background loop
+> (FR-2.1) that re-evaluates open setups. New `ForecastStatus` enum (STILL_VALID / AT_RISK / INVALIDATED)
+> + `ForecasterUpdate` model (status + reasoning + `outcome`; a model_validator requires `outcome` IFF
+> status is INVALIDATED). `Forecaster(store, provider, notifier, client, model)` — `run()` lists open
+> setups, and per setup: re-parses the proposal (`StoredSignal.as_proposal`), refetches an H4 snapshot,
+> asks Claude (`structured_completion`, tool `emit_forecast`) for a verdict, then acts: STILL_VALID →
+> record eval, stays OPEN; AT_RISK → record + Telegram warning; INVALIDATED → close
+> (`update_active_setup(status=ActiveSetupStatus(outcome.value))`) + `set_signal_outcome` (journals the
+> terminal result) + Telegram. Per-setup work is try/except-isolated (one bad/orphan setup never aborts
+> the run; missing/non-PUBLISHED signal is skipped with no LLM call). New `format_forecaster_update`
+> formatter (FR-5.3: distinct "⚠️ SETUP AT RISK" / "🔚 SETUP CLOSED" headers vs NEW SIGNAL) — typed via a
+> TYPE_CHECKING-only import of ForecasterUpdate to avoid a notifications↔forecaster cycle. **NOT wired to
+> a schedule yet — that's Step 2.10 (a separate EventBridge rule → Lambda), so no live LLM cost from this
+> step.** 11 tests (schema validation, the 3 verdict paths via fake store/provider/notifier + mocked
+> client, orphan skip, per-setup failure isolation, formatter). Checkpoints green: ruff, ruff-format,
+> mypy --strict (58 files), pytest **536 passed** (23 deselected). Next: **Step 2.10 (Forecaster
+> scheduling — `5 8,13,15,22` cron + a forecaster Lambda)** — or **Step 2.11 (risk_gates) given the live
+> deploy still has no §1.6 enforcement**, user's call.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

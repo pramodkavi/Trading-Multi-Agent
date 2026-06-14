@@ -137,6 +137,21 @@ class SignalOutcome(StrEnum):
     EXPIRED = "EXPIRED"  # never triggered within its validity window
 
 
+class ForecastStatus(StrEnum):
+    """The Forecaster's per-scan verdict on an open setup (SPEC §3.1.2 FR-2.1).
+
+    STILL_VALID -- on track; no action.
+    AT_RISK     -- premise threatened (price nearing invalidation, regime
+                   shifting); send the operator a Telegram warning.
+    INVALIDATED -- the setup resolved or its premise broke; close it and log a
+                   terminal `SignalOutcome` (WIN / LOSS / INVALIDATED / etc.).
+    """
+
+    STILL_VALID = "STILL_VALID"
+    AT_RISK = "AT_RISK"
+    INVALIDATED = "INVALIDATED"
+
+
 class ActiveSetupStatus(StrEnum):
     """Lifecycle status of a row in the `active_setups` table (Step 2.8).
 

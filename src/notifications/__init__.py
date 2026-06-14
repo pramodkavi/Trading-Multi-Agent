@@ -21,6 +21,7 @@ from src.notifications.base import (
 from src.notifications.formatter import (
     FOOTER,
     escape_markdown_v2,
+    format_forecaster_update,
     format_new_signal,
     format_skip,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "NotifierUnavailableError",
     "TelegramNotifier",
     "escape_markdown_v2",
+    "format_forecaster_update",
     "format_new_signal",
     "format_skip",
 ]

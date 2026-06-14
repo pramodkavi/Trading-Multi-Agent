@@ -23,6 +23,7 @@ Public API:
 from src.common.models.enums import (
     ActiveSetupStatus,
     AgentRole,
+    ForecastStatus,
     JudgeConfidence,
     JudgeRuling,
     ObjectionSeverity,
@@ -39,6 +40,7 @@ from src.common.models.skip_decision import SkipDecision, SkipReason
 __all__ = [
     "ActiveSetupStatus",
     "AgentRole",
+    "ForecastStatus",
     "JudgeConfidence",
     "JudgeRuling",
     "ObjectionSeverity",
