@@ -65,6 +65,22 @@ class Settings(BaseSettings):
         "Data API and leaves this unset.",
     )
 
+    # ---- Macro provider keys (optional; Skeptic, Step 2.5) ----------------
+    # Optional because the Skeptic degrades gracefully when macro is unavailable
+    # (FR-4.3): with neither key set, no macro provider is built and the Skeptic
+    # returns NoMacroData rather than failing startup. FRED is fully free; Twelve
+    # Data uses the free tier with SPY/VIXY ETF proxies (Step 2.3 cost decision).
+    fred_api_key: SecretStr | None = Field(
+        default=None,
+        description="FRED (St. Louis Fed) API key for DXY proxy / US10Y / Fed Funds. "
+        "Free key from fredaccount.stlouisfed.org/apikeys. None disables FRED.",
+    )
+    twelve_data_api_key: SecretStr | None = Field(
+        default=None,
+        description="Twelve Data API key for the S&P 500 / volatility ETF proxies "
+        "(SPY / VIXY on the free tier). None disables Twelve Data.",
+    )
+
     # ---- Required non-secret ---------------------------------------------
     telegram_chat_id: str = Field(
         min_length=1,

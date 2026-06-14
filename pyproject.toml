@@ -37,6 +37,13 @@ slice3-embeddings = [
     "pgvector>=0.3",  # Slice 3 Step 3.4: narrative embeddings in signals
 ]
 
+# Step 2.7: optional Langfuse node tracing. Off by default and a no-op until
+# LANGFUSE_* env vars are set (see src/common/tracing.py); install with
+# `pip install -e ".[tracing]"` to enable. Keeps the core install lean.
+tracing = [
+    "langfuse>=2",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
@@ -113,6 +120,13 @@ ignore_missing_imports = true
 # add more friction than they remove at this scale).
 [[tool.mypy.overrides]]
 module = ["boto3"]
+ignore_missing_imports = true
+
+# langfuse is an optional extra (the `tracing` group) -- not installed in CI or
+# the default dev env -- and src/common/tracing.py imports it lazily and
+# guarded. Treat it as missing-OK so --strict passes without the extra present.
+[[tool.mypy.overrides]]
+module = ["langfuse", "langfuse.*"]
 ignore_missing_imports = true
 
 # --- pytest configuration ---

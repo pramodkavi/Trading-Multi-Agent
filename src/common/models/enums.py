@@ -28,6 +28,41 @@ class JudgeRuling(StrEnum):
     SKIP = "SKIP"
 
 
+class ObjectionSeverity(StrEnum):
+    """How strongly the Skeptic's macro objection argues against a proposal.
+
+    Per SPEC §3.1.1 FR-1.5 the Skeptic emits a strongest-objection report with a
+    severity rating. The Judge (Step 2.6) weighs this against the proposal and
+    Historian evidence:
+
+    LOW     -- a minor / contextual concern; macro is broadly neutral. The
+               objection is the *best available*, not necessarily a real headwind.
+    MEDIUM  -- a genuine macro headwind worth a published caveat.
+    HIGH    -- macro strongly contradicts the setup; the Judge will likely SKIP.
+
+    Note: macro UNAVAILABILITY is NOT a severity -- it is a separate NoMacroData
+    result (FR-4.3) the Judge reads as "downgrade confidence to medium".
+    """
+
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
+class JudgeConfidence(StrEnum):
+    """The Judge's confidence in its own ruling (SPEC §3.1.1 FR-1.6 / FR-4.3).
+
+    Distinct from the ruling itself: the Judge can PUBLISH at LOW confidence
+    (with a caveat) or SKIP at HIGH confidence. Per FR-4.3, when the Skeptic
+    could not fetch macro context (NoMacroData) the Judge must cap confidence at
+    MEDIUM -- absence of macro data is a reason for caution, not an all-clear.
+    """
+
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+
+
 class ScanSession(StrEnum):
     """UTC trading session windows used by the scheduler and risk gates.
 

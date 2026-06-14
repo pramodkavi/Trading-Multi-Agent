@@ -1,50 +1,62 @@
-"""Unit tests for scripts.run_scan with all external services mocked.
+"""Unit tests for scripts.run_scan (Step 2.7 live pipeline) -- all services mocked.
 
-No network, no DB, no Telegram, no Anthropic. We inject:
-- a mock DataProvider returning a synthetic MarketSnapshot,
-- a mock AsyncAnthropic client returning a valid MarketCommentary tool call,
-- a mock asyncpg connection (execute is all the write path needs),
-- a mock Notifier.
-
-The genuine live run is exercised manually by invoking scripts/run_scan.py;
-there is no marked integration test because it would require real credentials.
+No network, no DB, no Telegram, no Anthropic. The full pipeline graph is built
+with mocked agents (a fake historian store, a fake macro provider, and mocked
+Anthropic clients for the Skeptic + Judge); the persistence store, data
+provider, and notifier are mocks. The genuine live run is exercised manually by
+invoking scripts/run_scan.py.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from uuid import uuid4
 
 import pytest
 
 import scripts.run_scan as run_scan_module
 from scripts.run_scan import (
-    MarketCommentary,
     _alambda,
     _load_settings,
     compose_message,
-    generate_commentary,
     run_one_symbol,
 )
+from src.agents.historian import HistorianReport, HistorianRepository
+from src.agents.judge import Judge, JudgeDecision
+from src.agents.orchestration import build_pipeline_graph
+from src.agents.skeptic import Skeptic, SkepticObjection
 from src.common.models import (
+    JudgeConfidence,
+    JudgeRuling,
+    ObjectionSeverity,
+    SignalDirection,
     SignalProposal,
     SkipDecision,
     SkipReason,
 )
 from src.config import Settings
-from src.providers import Kline, MarketSnapshot, Timeframe
+from src.providers import (
+    DataProvider,
+    Kline,
+    MacroContext,
+    MarketSnapshot,
+    NoMacroData,
+    Timeframe,
+)
 
 # ---------------------------------------------------------------------------
-# Synthetic market data (mirrors test_smc_analyzer factories)
+# Synthetic klines (verified publish / skip series under the 2.1e analyzer)
 # ---------------------------------------------------------------------------
 
 _ANCHOR = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
 
 
-def _kline(idx: int, *, open_: float, high: float, low: float, close: float) -> Kline:
+def _c(idx: int, *, open_: float, high: float, low: float, close: float) -> Kline:
     return Kline(
-        open_time=_ANCHOR + timedelta(minutes=idx * 240),
+        open_time=_ANCHOR + timedelta(hours=4 * idx),
         open=open_,
         high=high,
         low=low,
@@ -54,54 +66,114 @@ def _kline(idx: int, *, open_: float, high: float, low: float, close: float) -> 
 
 
 def _flat(idx: int, *, level: float) -> Kline:
-    return _kline(idx, open_=level, high=level + 0.1, low=level - 0.1, close=level)
-
-
-def _swing_high(idx: int, *, peak: float, base: float) -> Kline:
-    return _kline(idx, open_=base, high=peak, low=base - 0.1, close=base)
-
-
-def _swing_low(idx: int, *, trough: float, base: float) -> Kline:
-    return _kline(idx, open_=base, high=base + 0.1, low=trough, close=base)
+    return _c(idx, open_=level, high=level + 0.5, low=level - 0.5, close=level)
 
 
 def _bullish_series() -> list[Kline]:
-    candles: list[Kline] = [_flat(i, level=100.0) for i in range(5)]
-    candles.append(_swing_low(5, trough=99.0, base=100.0))
-    candles.extend(_flat(i, level=101.0) for i in range(6, 10))
-    candles.append(_swing_high(10, peak=103.0, base=101.5))
-    candles.extend(_flat(i, level=102.0) for i in range(11, 15))
-    candles.append(_swing_low(15, trough=101.0, base=102.0))
-    candles.extend(_flat(i, level=103.0) for i in range(16, 20))
-    candles.append(_swing_high(20, peak=106.0, base=103.5))
-    candles.extend(_flat(i, level=104.0) for i in range(21, 30))
-    return candles
+    """A full SMC LONG setup verified to publish under the 2.1e analyzer."""
+    s = [_flat(i, level=100.0) for i in range(10)]
+    s.append(_c(10, open_=100.0, high=105.0, low=99.5, close=100.0))
+    s += [_flat(11, level=100.0), _flat(12, level=100.0)]
+    s.append(_c(13, open_=101.0, high=101.5, low=98.5, close=99.0))
+    s.append(_c(14, open_=99.0, high=104.0, low=99.0, close=103.5))
+    s.append(_c(15, open_=103.5, high=108.0, low=103.0, close=107.0))
+    s.append(_c(16, open_=107.0, high=110.0, low=106.5, close=109.0))
+    s += [_flat(17, level=107.5), _flat(18, level=107.5)]
+    s.append(_c(19, open_=106.0, high=106.5, low=102.0, close=103.0))
+    s += [_flat(i, level=103.5) for i in range(20, 32)]
+    return s
 
 
 def _ranging_series() -> list[Kline]:
-    candles: list[Kline] = [_flat(i, level=100.0) for i in range(5)]
-    candles.append(_swing_low(5, trough=99.0, base=100.0))
-    candles.extend(_flat(i, level=100.5) for i in range(6, 10))
-    candles.append(_swing_high(10, peak=102.0, base=100.5))
-    candles.extend(_flat(i, level=100.0) for i in range(11, 15))
-    candles.append(_swing_low(15, trough=98.0, base=100.0))
-    candles.extend(_flat(i, level=101.0) for i in range(16, 20))
-    candles.append(_swing_high(20, peak=103.0, base=101.0))
-    candles.extend(_flat(i, level=101.0) for i in range(21, 30))
-    return candles
+    """Flat consolidation -> NO_CLEAR_BIAS skip."""
+    return [_flat(i, level=100.0) for i in range(30)]
 
 
 def _snapshot(candles: list[Kline], symbol: str = "BTCUSDT") -> MarketSnapshot:
     return MarketSnapshot(
         symbol=symbol,
         venue="binance",
-        fetched_at=datetime(2026, 5, 31, 0, 0, 0, tzinfo=UTC),
+        fetched_at=datetime(2026, 5, 26, 0, 0, 0, tzinfo=UTC),
         klines={Timeframe.H4: candles},
     )
 
 
 # ---------------------------------------------------------------------------
-# Mock builders
+# Mocked agents / pipeline graph
+# ---------------------------------------------------------------------------
+
+
+class _FakeHistorianStore:
+    async def find_similar_signals(self, **kwargs: Any) -> list[Any]:
+        return []
+
+
+class _FakeMacroProvider(DataProvider):
+    name = "fake"
+
+    async def fetch_market_snapshot(
+        self,
+        symbol: str,
+        timeframes: list[Timeframe],
+        *,
+        limit: int = 200,
+        include_derivatives: bool = False,
+    ) -> MarketSnapshot:
+        raise NotImplementedError
+
+    async def fetch_macro_context(self) -> MacroContext | NoMacroData:
+        return MacroContext(fetched_at=datetime(2026, 6, 1, 12, tzinfo=UTC), dxy=104.0, vix=18.0)
+
+
+def _tool_response(payload: dict[str, Any], *, tool_name: str) -> SimpleNamespace:
+    block = SimpleNamespace(type="tool_use", name=tool_name, id="toolu_r", input=payload)
+    return SimpleNamespace(
+        content=[block], usage=SimpleNamespace(input_tokens=100, output_tokens=40)
+    )
+
+
+def _client(responses: list[Any]) -> MagicMock:
+    client = MagicMock()
+    client.messages = MagicMock()
+    client.messages.create = AsyncMock(side_effect=responses)
+    return client
+
+
+_OBJECTION_PAYLOAD: dict[str, Any] = {
+    "severity": "LOW",
+    "recommends_against": False,
+    "headline": "Macro is broadly neutral for this setup.",
+    "reasoning": "No strong cross-asset headwind is evident in the supplied snapshot.",
+    "cited_macro": ["broad USD index 104.0"],
+}
+
+
+def _ruling_payload(ruling: str, *, caveat: str | None = None) -> dict[str, Any]:
+    return {
+        "ruling": ruling,
+        "confidence": "HIGH",
+        "reasoning": "Weighed structure, neutral macro, and a thin precedent set.",
+        "caveat": caveat,
+    }
+
+
+def _pipeline_graph(skeptic_client: MagicMock, judge_client: MagicMock) -> Any:
+    return build_pipeline_graph(
+        historian=HistorianRepository(_FakeHistorianStore()),
+        skeptic=Skeptic([_FakeMacroProvider()], client=skeptic_client),
+        judge=Judge(client=judge_client),
+    )
+
+
+def _publishing_graph() -> Any:
+    return _pipeline_graph(
+        _client([_tool_response(_OBJECTION_PAYLOAD, tool_name="emit_objection")]),
+        _client([_tool_response(_ruling_payload("PUBLISH"), tool_name="emit_ruling")]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Other mocks
 # ---------------------------------------------------------------------------
 
 
@@ -115,32 +187,6 @@ def _settings() -> Settings:
     )
 
 
-def _commentary_response(
-    *,
-    commentary: str = "Structure is constructive but unconfirmed on lower timeframes.",
-    key_risk: str = "A failure to hold the swing low invalidates the read.",
-    tokens_in: int = 120,
-    tokens_out: int = 60,
-) -> SimpleNamespace:
-    block = SimpleNamespace(
-        type="tool_use",
-        name="emit_structured_output",
-        id="toolu_x",
-        input={"commentary": commentary, "key_risk": key_risk},
-    )
-    return SimpleNamespace(
-        content=[block],
-        usage=SimpleNamespace(input_tokens=tokens_in, output_tokens=tokens_out),
-    )
-
-
-def _anthropic_client(response: SimpleNamespace | None = None) -> MagicMock:
-    client = MagicMock()
-    client.messages = MagicMock()
-    client.messages.create = AsyncMock(return_value=response or _commentary_response())
-    return client
-
-
 def _provider(snapshot: MarketSnapshot) -> MagicMock:
     provider = MagicMock()
     provider.fetch_market_snapshot = AsyncMock(return_value=snapshot)
@@ -149,7 +195,6 @@ def _provider(snapshot: MarketSnapshot) -> MagicMock:
 
 
 def _store() -> MagicMock:
-    """A mock SignalStore: every write method is an AsyncMock."""
     store = MagicMock()
     store.start_scan = AsyncMock()
     store.complete_scan = AsyncMock()
@@ -168,40 +213,73 @@ def _notifier() -> MagicMock:
 
 
 # ---------------------------------------------------------------------------
-# generate_commentary
+# Model builders for compose_message
 # ---------------------------------------------------------------------------
 
 
-class TestGenerateCommentary:
-    async def test_returns_validated_commentary(self) -> None:
-        state = {
-            "snapshot": _snapshot(_bullish_series()),
-            "proposal": None,
-            "decision": None,
-        }
-        # Build a real proposal-bearing state by running the graph path is
-        # unnecessary here; the summary handles missing proposal gracefully.
-        result = await generate_commentary(
-            settings=_settings(),
-            symbol="BTCUSDT",
-            state=state,  # type: ignore[arg-type]
-            client=_anthropic_client(),
-        )
-        assert isinstance(result.output, MarketCommentary)
-        assert result.tokens_in == 120
-        assert result.tokens_out == 60
+def _proposal() -> SignalProposal:
+    return SignalProposal(
+        scan_id=uuid4(),
+        strategy="smc",
+        symbol="BTCUSDT",
+        direction=SignalDirection.LONG,
+        entry_price=100.0,
+        stop_loss=95.0,
+        take_profit_1=115.0,
+        risk_reward_ratio=3.0,
+        leverage=5.0,
+        risk_percent=1.0,
+        confluence_narrative="Bullish OB tap with liquidity sweep below equal lows.",
+    )
 
-    async def test_prompt_includes_symbol_and_decision(self) -> None:
-        client = _anthropic_client()
-        state = {"snapshot": _snapshot(_bullish_series()), "proposal": None, "decision": None}
-        await generate_commentary(
-            settings=_settings(),
-            symbol="ETHUSDT",
-            state=state,  # type: ignore[arg-type]
-            client=client,
-        )
-        sent_user_msg = client.messages.create.await_args.kwargs["messages"][0]["content"]
-        assert "ETHUSDT" in sent_user_msg
+
+def _skip() -> SkipDecision:
+    return SkipDecision(
+        scan_id=uuid4(),
+        strategy="smc",
+        symbol="BTCUSDT",
+        reason=SkipReason.NO_CLEAR_BIAS,
+        details="Consolidation; no actionable bias.",
+    )
+
+
+def _report() -> HistorianReport:
+    return HistorianReport(
+        query_proposal_id=uuid4(),
+        strategy="smc",
+        direction=SignalDirection.LONG,
+        sample_size=8,
+        wins=5,
+        losses=2,
+        breakeven=1,
+        inconclusive=0,
+        win_rate=5 / 7,
+        summary="5W/2L over similar bullish OB setups.",
+    )
+
+
+def _objection(severity: ObjectionSeverity = ObjectionSeverity.MEDIUM) -> SkepticObjection:
+    return SkepticObjection(
+        severity=severity,
+        recommends_against=False,
+        headline="Mild dollar-strength headwind.",
+        reasoning="The broad USD level is somewhat elevated in the snapshot.",
+        cited_macro=["broad USD index 104.0"],
+    )
+
+
+def _ruling(
+    ruling: JudgeRuling,
+    *,
+    caveat: str | None = None,
+    confidence: JudgeConfidence = JudgeConfidence.HIGH,
+) -> JudgeDecision:
+    return JudgeDecision(
+        ruling=ruling,
+        confidence=confidence,
+        reasoning="Weighed structure, history, and macro objection.",
+        caveat=caveat,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -210,134 +288,134 @@ class TestGenerateCommentary:
 
 
 class TestComposeMessage:
-    def _proposal(self) -> SignalProposal:
-        from uuid import uuid4
-
-        return SignalProposal(
-            scan_id=uuid4(),
-            strategy="smc",
-            symbol="BTCUSDT",
-            direction="LONG",  # type: ignore[arg-type]
-            entry_price=100.0,
-            stop_loss=95.0,
-            take_profit_1=115.0,
-            risk_reward_ratio=3.0,
-            leverage=5.0,
-            risk_percent=1.0,
-            confluence_narrative="Bullish OB tap with liquidity sweep below equal lows.",
-        )
-
-    def _skip(self) -> SkipDecision:
-        from uuid import uuid4
-
-        return SkipDecision(
-            scan_id=uuid4(),
-            strategy="smc",
-            symbol="BTCUSDT",
-            reason=SkipReason.NO_CLEAR_BIAS,
-            details="Consolidation; no actionable bias.",
-        )
-
-    def test_proposal_message_includes_signal_and_note(self) -> None:
-        commentary = MarketCommentary(
-            commentary="Trend intact above the reclaimed level.",
-            key_risk="Macro headwinds could cap upside.",
-        )
-        state = {"proposal": self._proposal(), "decision": None, "snapshot": None}
-        msg = compose_message(state, commentary)  # type: ignore[arg-type]
+    def test_publish_includes_signal_historian_and_skeptic(self) -> None:
+        state = {
+            "proposal": _proposal(),
+            "decision": JudgeRuling.PUBLISH,
+            "historian_report": _report(),
+            "skeptic_objection": _objection(),
+            "judge_decision": _ruling(JudgeRuling.PUBLISH),
+        }
+        msg = compose_message(state)  # type: ignore[arg-type]
         assert "NEW SIGNAL" in msg
-        assert "Analyst note:" in msg
-        assert "Key risk:" in msg
+        assert "Historian win rate" in msg
+        assert "Skeptic objection" in msg
+        assert "manual execution required" in msg  # mandated footer
+        assert "Caveat" not in msg
 
-    def test_skip_message_includes_skip_and_note(self) -> None:
-        commentary = MarketCommentary(
-            commentary="No edge; price mid-range.",
-            key_risk="Chasing here risks a fakeout.",
-        )
-        state = {"proposal": self._skip(), "decision": None, "snapshot": None}
-        msg = compose_message(state, commentary)  # type: ignore[arg-type]
+    def test_publish_with_caveat_includes_caveat(self) -> None:
+        state = {
+            "proposal": _proposal(),
+            "decision": JudgeRuling.PUBLISH_WITH_CAVEAT,
+            "historian_report": _report(),
+            "skeptic_objection": _objection(),
+            "judge_decision": _ruling(
+                JudgeRuling.PUBLISH_WITH_CAVEAT, caveat="Reduce size: dollar strength."
+            ),
+        }
+        msg = compose_message(state)  # type: ignore[arg-type]
+        assert "Caveat" in msg
+        assert "Reduce size" in msg
+
+    def test_analyzer_skip_message(self) -> None:
+        state = {"proposal": _skip(), "decision": JudgeRuling.SKIP, "judge_decision": None}
+        msg = compose_message(state)  # type: ignore[arg-type]
         assert "SKIP" in msg
-        assert "Analyst note:" in msg
 
-    def test_commentary_is_markdown_escaped(self) -> None:
-        commentary = MarketCommentary(
-            commentary="Watch 1.0 support.",  # the '.' must be escaped
-            key_risk="Risk is real.",
-        )
-        state = {"proposal": self._skip(), "decision": None, "snapshot": None}
-        msg = compose_message(state, commentary)  # type: ignore[arg-type]
-        assert "1\\.0" in msg
+    def test_judge_veto_message(self) -> None:
+        state = {
+            "proposal": _proposal(),
+            "decision": JudgeRuling.SKIP,
+            "judge_decision": _ruling(JudgeRuling.SKIP),
+        }
+        msg = compose_message(state)  # type: ignore[arg-type]
+        assert "JUDGED SKIP" in msg
+
+    def test_nomacrodata_skeptic_renders_unavailable(self) -> None:
+        state = {
+            "proposal": _proposal(),
+            "decision": JudgeRuling.PUBLISH,
+            "historian_report": _report(),
+            "skeptic_objection": NoMacroData(provider="skeptic", reason="all providers down"),
+            "judge_decision": _ruling(JudgeRuling.PUBLISH),
+        }
+        msg = compose_message(state)  # type: ignore[arg-type]
+        assert "unavailable" in msg.lower()
+
+    def test_win_rate_is_markdown_escaped(self) -> None:
+        # 5/7 -> 71.4% ; the '.' must be escaped for MarkdownV2.
+        state = {
+            "proposal": _proposal(),
+            "decision": JudgeRuling.PUBLISH,
+            "historian_report": _report(),
+            "skeptic_objection": _objection(),
+            "judge_decision": _ruling(JudgeRuling.PUBLISH),
+        }
+        msg = compose_message(state)  # type: ignore[arg-type]
+        assert "71\\.4%" in msg
 
 
 # ---------------------------------------------------------------------------
-# run_one_symbol — full orchestration
+# run_one_symbol — full orchestration through the pipeline
 # ---------------------------------------------------------------------------
 
 
 class TestRunOneSymbol:
-    async def test_bullish_publishes_persists_and_notifies(self) -> None:
+    async def test_publish_persists_full_chain_and_notifies(self) -> None:
         provider = _provider(_snapshot(_bullish_series()))
         store = _store()
         notifier = _notifier()
-        client = _anthropic_client()
 
         ctx = await run_one_symbol(
-            settings=_settings(),
             symbol="BTCUSDT",
             provider=provider,
             store=store,
+            graph=_publishing_graph(),
             notifier=notifier,
-            anthropic_client=client,
         )
 
-        # Provider fetched the snapshot.
         provider.fetch_market_snapshot.assert_awaited_once()
-        # LLM was called.
-        client.messages.create.assert_awaited_once()
-        # Telegram sent.
-        notifier.send.assert_awaited_once()
-        # The full happy-path persistence sequence ran through the store.
         store.start_scan.assert_awaited_once()
         store.create_signal.assert_awaited_once()
-        store.log_agent_run.assert_awaited_once()
+        # FR-1.7: analyzer + historian + skeptic + judge reasoning all journaled.
+        assert store.log_agent_run.await_count == 4
+        notifier.send.assert_awaited_once()
         store.complete_scan.assert_awaited_once()
         store.fail_scan.assert_not_awaited()
         assert ctx.strategy == "smc"
 
-    async def test_ranging_skips_but_still_persists_and_notifies(self) -> None:
+    async def test_skip_persists_only_analyzer_and_notifies(self) -> None:
         provider = _provider(_snapshot(_ranging_series()))
         store = _store()
         notifier = _notifier()
-        client = _anthropic_client()
+        # Skeptic/Judge clients are never consumed (conditional edge short-circuits).
+        graph = _pipeline_graph(_client([]), _client([]))
 
         await run_one_symbol(
-            settings=_settings(),
             symbol="BTCUSDT",
             provider=provider,
             store=store,
+            graph=graph,
             notifier=notifier,
-            anthropic_client=client,
         )
-        # Even on a skip, the LLM is called, a row is written, and a message sent.
-        client.messages.create.assert_awaited_once()
+
         store.create_signal.assert_awaited_once()
+        assert store.log_agent_run.await_count == 1  # analyzer only
         notifier.send.assert_awaited_once()
+        store.complete_scan.assert_awaited_once()
 
     async def test_no_notifier_skips_telegram(self) -> None:
         provider = _provider(_snapshot(_bullish_series()))
         store = _store()
-        client = _anthropic_client()
 
         await run_one_symbol(
-            settings=_settings(),
             symbol="BTCUSDT",
             provider=provider,
             store=store,
+            graph=_publishing_graph(),
             notifier=None,
-            anthropic_client=client,
         )
-        # No notifier -> no send, but DB + LLM still happen.
-        client.messages.create.assert_awaited_once()
+
         store.create_signal.assert_awaited_once()
         store.complete_scan.assert_awaited_once()
 
@@ -349,14 +427,13 @@ class TestRunOneSymbol:
 
         with pytest.raises(RuntimeError, match="binance down"):
             await run_one_symbol(
-                settings=_settings(),
                 symbol="BTCUSDT",
                 provider=provider,
                 store=store,
+                graph=_publishing_graph(),
                 notifier=notifier,
-                anthropic_client=_anthropic_client(),
             )
-        # start_scan + fail_scan both ran; success path and notify did not.
+
         store.start_scan.assert_awaited_once()
         store.fail_scan.assert_awaited_once()
         store.complete_scan.assert_not_awaited()
@@ -369,17 +446,15 @@ class TestRunOneSymbol:
 
         with pytest.raises(RuntimeError):
             await run_one_symbol(
-                settings=_settings(),
                 symbol="BTCUSDT",
                 provider=provider,
                 store=store,
+                graph=_publishing_graph(),
                 notifier=None,
-                anthropic_client=_anthropic_client(),
             )
-        # fail_scan carries the exception detail for the FAILED row.
+
         store.fail_scan.assert_awaited_once()
-        error_message = store.fail_scan.await_args.kwargs["error_message"]
-        assert "boom" in error_message
+        assert "boom" in store.fail_scan.await_args.kwargs["error_message"]
 
 
 # ---------------------------------------------------------------------------
@@ -390,10 +465,10 @@ class TestRunOneSymbol:
 class TestLambdaHandler:
     """Exercises the async core (_alambda) under pytest's loop.
 
-    The thin sync lambda_handler wrapper is just ``asyncio.run(_alambda(...))``;
-    testing the core directly avoids spinning a fresh event loop per call, which
-    on Windows leaves an unclosed-loop ResourceWarning that filterwarnings=error
-    would fail on.
+    run_one_symbol is replaced (its behaviour is covered by TestRunOneSymbol);
+    here we test event parsing, dependency lifecycle, and result shaping. The
+    real pipeline build runs (with a mocked Anthropic client) but is never
+    invoked because run_one_symbol is mocked.
     """
 
     def _patch(
@@ -402,35 +477,31 @@ class TestLambdaHandler:
         *,
         run: AsyncMock,
     ) -> dict[str, MagicMock]:
-        """Patch every external dependency the handler reaches.
-
-        run_one_symbol itself is replaced (its own behaviour is covered by
-        TestRunOneSymbol); here we test event parsing, dependency lifecycle,
-        and result shaping in isolation.
-        """
         store = MagicMock()
         store.aclose = AsyncMock()
         provider = MagicMock()
         provider.aclose = AsyncMock()
         notifier = MagicMock()
         notifier.aclose = AsyncMock()
+        client = MagicMock()
+        client.close = AsyncMock()
         provider_factory = MagicMock(return_value=provider)
         notifier_factory = MagicMock(return_value=notifier)
 
         monkeypatch.setattr(run_scan_module, "create_store", AsyncMock(return_value=store))
         monkeypatch.setattr(run_scan_module, "BinanceProvider", provider_factory)
         monkeypatch.setattr(run_scan_module, "TelegramNotifier", notifier_factory)
+        monkeypatch.setattr(run_scan_module, "AsyncAnthropic", MagicMock(return_value=client))
         monkeypatch.setattr(run_scan_module, "run_one_symbol", run)
         return {
             "store": store,
             "provider": provider,
             "notifier_factory": notifier_factory,
+            "client": client,
         }
 
     @staticmethod
     def _ok_run() -> AsyncMock:
-        from uuid import uuid4
-
         return AsyncMock(side_effect=lambda **kw: SimpleNamespace(scan_id=uuid4()))
 
     async def test_event_symbols_list_runs_each(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -444,6 +515,7 @@ class TestLambdaHandler:
         assert all(s["status"] == "ok" for s in result["scans"])
         assert run.await_count == 2
         deps["store"].aclose.assert_awaited_once()
+        deps["client"].close.assert_awaited_once()
 
     async def test_event_single_symbol(self, monkeypatch: pytest.MonkeyPatch) -> None:
         run = self._ok_run()
@@ -462,15 +534,12 @@ class TestLambdaHandler:
 
         result = await _alambda(None, _settings())
 
-        # _settings() carries the default 4-symbol watchlist.
-        assert run.await_count == 4
+        assert run.await_count == 4  # default 4-symbol watchlist
         assert result["ok"] is True
 
     async def test_one_symbol_failure_marks_overall_not_ok(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from uuid import uuid4
-
         def _side_effect(**kwargs: object) -> SimpleNamespace:
             if kwargs["symbol"] == "ETHUSDT":
                 raise RuntimeError("boom")
@@ -521,5 +590,4 @@ class TestLoadSettings:
         result = _load_settings()
 
         assert result is settings
-        # Secrets must land in the env before the cached get_settings() runs.
         assert order == ["hydrate", "get_settings"]

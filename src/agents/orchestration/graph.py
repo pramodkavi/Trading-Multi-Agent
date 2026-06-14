@@ -21,18 +21,37 @@ Notes on departures from the SPEC §4 Step 1.7 wording:
 
 from __future__ import annotations
 
-from typing import Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
 
 from src.agents.analyzer import analyze
+
+# Runtime (not TYPE_CHECKING) imports: LangGraph resolves AgentState's annotations
+# via get_type_hints() at StateGraph construction, so every type referenced in
+# AgentState must exist at runtime. The historian / skeptic / judge packages
+# import AgentState only under TYPE_CHECKING, so this direction introduces no
+# cycle. The node factories are imported here too for build_pipeline_graph.
+from src.agents.historian import HistorianReport, make_historian_node
+from src.agents.judge import JudgeDecision, make_judge_node
+from src.agents.skeptic import SkepticObjection, make_skeptic_node
 from src.common.models import (
     JudgeRuling,
     ScanContext,
     SignalProposal,
     SkipDecision,
 )
-from src.providers import MarketSnapshot
+from src.common.tracing import trace_node
+from src.providers import MarketSnapshot, NoMacroData
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from collections.abc import Awaitable, Callable
+
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+
+    from src.agents.historian import HistorianRepository
+    from src.agents.judge import Judge
+    from src.agents.skeptic import Skeptic
 
 # ---------------------------------------------------------------------------
 # State
@@ -48,16 +67,33 @@ class AgentState(TypedDict, total=False):
     they extend it. Until then, only the four fields below are populated.
 
     Field lifecycle:
-        scan_context : seeded by the caller (scan runner); never mutated.
-        snapshot     : seeded by the caller after fetching market data.
-        proposal     : set by analyzer_node.
-        decision     : set by analyzer_node (stub) -> overwritten by judge_node
-                       in Slice 2 Step 2.6.
+        scan_context     : seeded by the caller (scan runner); never mutated.
+        snapshot         : seeded by the caller after fetching market data.
+        proposal         : set by analyzer_node.
+        historian_report : set by the historian node (Step 2.4b's
+                           make_historian_node); None for skips / when the
+                           node is not wired. The edge analyzer -> historian is
+                           added in Step 2.7.
+        skeptic_objection: set by the skeptic node (Step 2.5's
+                           make_skeptic_node): a SkepticObjection, or NoMacroData
+                           when macro is unavailable (FR-4.3 -> Judge downgrades
+                           confidence to medium), or None for skips / when the
+                           node is not wired. Edge added in Step 2.7.
+        judge_decision   : set by the judge node (Step 2.6's make_judge_node):
+                           the full JudgeDecision (ruling + confidence +
+                           reasoning + caveat), or None for skips / when the node
+                           is not wired. Edge added in Step 2.7.
+        decision         : set by analyzer_node (stub) -> overwritten by
+                           judge_node (Step 2.6) with judge_decision.ruling, so
+                           the existing dispatcher keeps consuming a JudgeRuling.
     """
 
     scan_context: ScanContext
     snapshot: MarketSnapshot
     proposal: SignalProposal | SkipDecision | None
+    historian_report: HistorianReport | None
+    skeptic_objection: SkepticObjection | NoMacroData | None
+    judge_decision: JudgeDecision | None
     decision: JudgeRuling | None
 
 
@@ -112,6 +148,79 @@ def build_graph() -> Any:
     graph.add_edge(START, "analyzer")
     graph.add_edge("analyzer", END)
     return graph.compile()
+
+
+# ---------------------------------------------------------------------------
+# Full Slice 2 pipeline graph (Step 2.7)
+# ---------------------------------------------------------------------------
+
+
+def _route_after_analyzer(state: AgentState) -> str:
+    """Conditional edge after the analyzer (SPEC Step 2.7).
+
+    Continue into historian -> skeptic -> judge only when the Analyzer produced
+    a real ``SignalProposal``. On a ``SkipDecision`` (or nothing) there is no
+    setup to retrieve precedents for, object to, or judge, so we short-circuit
+    to END -- the analyzer node already stamped a SKIP ``decision``.
+    """
+    return "continue" if isinstance(state.get("proposal"), SignalProposal) else "skip"
+
+
+def build_pipeline_graph(
+    *,
+    historian: HistorianRepository,
+    skeptic: Skeptic,
+    judge: Judge,
+    checkpointer: BaseCheckpointSaver[Any] | None = None,
+    tracer: Callable[[str, Any], Any] = trace_node,
+) -> Any:
+    """Compile the full per-signal pipeline: analyzer -> historian -> skeptic -> judge.
+
+    The three downstream agents are injected (their dependencies -- store,
+    macro providers, Anthropic client -- live in the agent objects, never in the
+    checkpointed state). A conditional edge after the analyzer short-circuits a
+    SkipDecision straight to END, so skips cost no LLM calls.
+
+    Args:
+        historian / skeptic / judge: the constructed agents to bind into the
+            historian / skeptic / judge nodes via their factories.
+        checkpointer: optional LangGraph checkpointer for crash-resume
+            (NFR-1.3). The local / asyncpg path supplies an AsyncPostgresSaver;
+            the Data API Lambda passes None (it has no direct Postgres socket --
+            see docs/PROJECT_STATE.md). None compiles a stateless graph.
+        tracer: wraps each node for observability; defaults to the env-gated
+            Langfuse ``trace_node`` (a transparent no-op until LANGFUSE_* is set).
+            Injectable so tests can assert every node is wrapped.
+
+    Returned graph is typed ``Any`` for the same reason as ``build_graph``: the
+    CompiledStateGraph generics differ between local mypy and the pre-commit
+    hook's isolated environment. Callers use the standard ``.ainvoke`` surface.
+
+    NOTE: this builder is not yet on the live scan path -- ``run_scan`` /
+    ``build_graph`` remain analyzer-only until the Step 2.7 follow-up wires the
+    pipeline into the scan runner (Telegram + per-agent persistence).
+    """
+    nodes: dict[str, Callable[[AgentState], Awaitable[AgentState]]] = {
+        "analyzer": analyzer_node,
+        "historian": make_historian_node(historian),
+        "skeptic": make_skeptic_node(skeptic),
+        "judge": make_judge_node(judge),
+    }
+
+    graph = StateGraph(AgentState)
+    for node_name, node_fn in nodes.items():
+        graph.add_node(node_name, tracer(node_name, node_fn))
+
+    graph.add_edge(START, "analyzer")
+    graph.add_conditional_edges(
+        "analyzer",
+        _route_after_analyzer,
+        {"continue": "historian", "skip": END},
+    )
+    graph.add_edge("historian", "skeptic")
+    graph.add_edge("skeptic", "judge")
+    graph.add_edge("judge", END)
+    return graph.compile(checkpointer=checkpointer)
 
 
 async def run_scan(*, scan_context: ScanContext, snapshot: MarketSnapshot) -> AgentState:

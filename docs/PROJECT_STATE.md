@@ -236,8 +236,9 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > populated with only the fields it owns, or a `NoMacroData` sentinel when it can serve none (graceful
 > degradation per FR-4.3; per-field best-effort otherwise). Market-snapshot is unsupported on macro
 > providers (raises). Unit tests via `httpx.MockTransport`; opt-in integration tests skip without keys.
-> NOTE: providers take `api_key` directly; wiring them to Settings/Secrets (FRED_API_KEY,
-> TWELVE_DATA_API_KEY) happens with the Skeptic (Step 2.5) / Step 2.12 ops.
+> NOTE: providers take `api_key` directly; Settings wiring (`fred_api_key` / `twelve_data_api_key`)
+> landed with the Skeptic (Step 2.5). Remaining: Secrets Manager ARN hydration for these keys in the
+> cloud Lambda is deferred to Step 2.12 ops (today they read from plain env / `.env`).
 > **Step 2.4a shipped (schema + persistence foundation):** `signals` gained first-class
 > `tags TEXT[]` / `features JSONB` / `outcome` (enum-checked) / `outcome_metadata JSONB` columns
 > (idempotent `ALTER ... ADD COLUMN IF NOT EXISTS` + GIN index on tags). `SignalOutcome` enum added.
@@ -246,9 +247,105 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > `StoredSignal`. Data-API migration statement count 12→18. **⚠️ MIGRATION ORDERING: apply the schema
 > (migrate.py) to the live DB BEFORE deploying this code — `create_signal` now INSERTs the new
 > columns, which must exist.** outcome/outcome_metadata stay NULL at creation (set by the Forecaster,
-> Step 2.9). Next: **Step 2.4b (the Historian itself — `HistorianRepository` 3-stage retrieval
-> [SQL hard filters → tag-overlap via PG array ops → numeric L2 distance], `historian_node` +
-> `HistorianReport`, ~50-signal synthetic seed fixture).**
+> Step 2.9).
+> **Step 2.4b shipped — THE HISTORIAN:** new `src/agents/historian/` package. `HistorianRepository`
+> does the three-stage retrieval (SPEC FR-1.4): stage 1 = SQL hard filters (direction, session via a
+> `scan_runs` JOIN, `primary_poi_type`, PUBLISHED + known-outcome); stage 2 = tag-overlap ranking via
+> PG array ops (`cardinality(... INTERSECT ...)`); stage 3 = L2 distance over a *scale-free* numeric
+> vector (`L2_FEATURE_KEYS` = confluence_score, ob_confluence_count — price-scale features
+> deliberately excluded) via a `sqrt/power` SQL expression. Produces a `HistorianReport` (empirical
+> win rate = wins/(wins+losses), with `sample_size` + outcome breakdown + a Telegram/Judge summary;
+> win_rate is `None` when no decisive outcomes — never faked). `make_historian_node` is a node FACTORY
+> (store injected via closure, never in checkpointed state); wired into the graph at **Step 2.7** (the
+> edge is NOT added yet — `AgentState` gained `historian_report` but the live scan path stays
+> analyzer→END). The 3-stage SQL lives in both store backends (`find_similar_signals` on
+> DataApiSignalStore + SignalRepository); `set_signal_outcome` added to both (Forecaster write-side,
+> used now by the seed). Analyzer gained one feature: `primary_poi_type="order_block"`. Seed fixture
+> `scripts/seed_signals.py` (`build_synthetic_signals` + dual-backend CLI) makes 50 outcome-bearing
+> synthetic signals. Tests: report/helpers/node (fake store) + find_similar SQL-shape & parse for BOTH
+> backends (mocked) + opt-in asyncpg integration (real ranking). Checkpoints green: ruff, mypy --strict
+> (48 files), pytest **465 passed**.
+> **Step 2.5 shipped — THE SKEPTIC:** new `src/agents/skeptic/` package. `Skeptic.gather_macro()`
+> fetches every injected macro provider in parallel (`asyncio.gather(return_exceptions=True)`) and
+> merges the partial `MacroContext` snapshots (FRED owns DXY/US10Y/FedFunds; Twelve Data owns SPX/VIX)
+> into one; if no provider serves data it returns the provider-level `NoMacroData` sentinel (FR-4.3
+> graceful degradation — Judge reads it as "downgrade confidence to medium", NOT "no objection").
+> `Skeptic.evaluate()` then calls Claude via `structured_completion` with the new `SkepticObjection`
+> schema (severity LOW/MEDIUM/HIGH + recommends_against + headline + reasoning + cited_macro) — and
+> short-circuits to NoMacroData (no LLM call) when macro is unavailable. The system prompt enforces:
+> reason only from supplied data, snapshots (no trend invention), treat SPX/VIX as possibly-proxy
+> regime cues (never absolute thresholds), forbidden indicators (RSI/MACD/…), honest severity
+> calibration. `make_skeptic_node` is a node FACTORY (providers + Anthropic client injected via
+> closure); `AgentState` gained `skeptic_objection: SkepticObjection | NoMacroData | None` (runtime
+> import in graph.py — the LangGraph get_type_hints gotcha) but the edge is wired at **Step 2.7** (live
+> path stays analyzer→END). `build_macro_providers(settings)` constructs FRED + Twelve Data (with the
+> SPY/VIXY free-tier ETF proxies, Step 2.3 cost decision) for whichever keys are set, else []. Settings
+> gained optional `fred_api_key` / `twelve_data_api_key` (SecretStr) + `.env.example` entries. Tests:
+> merge/gather (success/all-unavailable/exception-tolerant) + evaluate (mocked Anthropic client; macro
+> short-circuit) + node (skip/objection/NoMacroData) + prompt + build_macro_providers. Checkpoints
+> green: ruff, mypy --strict (51 files), pytest **483 passed**.
+> **Step 2.6 shipped — THE JUDGE:** new `src/agents/judge/` package — the final arbiter (FR-1.6).
+> `Judge.evaluate(proposal, historian_report, skeptic_objection)` weighs the three already-gathered
+> inputs (it fetches nothing) and calls Claude via `structured_completion` with the new `JudgeDecision`
+> schema (ruling PUBLISH / PUBLISH_WITH_CAVEAT / SKIP + `confidence` LOW/MEDIUM/HIGH + written
+> `reasoning` + optional `caveat`). A model validator requires a non-empty caveat exactly when the
+> ruling is PUBLISH_WITH_CAVEAT (malformed → structured-output retry). **FR-4.3 is enforced
+> DETERMINISTICALLY**: when the Skeptic returned `NoMacroData`, `evaluate` clamps confidence HIGH→MEDIUM
+> after the LLM call (the system prompt also asks for it, but the clamp guarantees it). System prompt
+> bakes in the signal-only precision-over-recall asymmetry ("a missed signal costs nothing; a bad
+> published signal costs real money"), how to weight each input (historian win rate by SAMPLE SIZE;
+> win_rate=None = absence of evidence, treat neutrally; skeptic severity → SKIP/caveat/minor), the
+> three calibration shapes, forbidden indicators, and "hard numeric risk rules are enforced by code
+> (risk_gates), not you". `make_judge_node` is a node FACTORY; the node SKIPs non-proposals without an
+> LLM call and, for proposals, sets BOTH `judge_decision` (full object) and `decision` (the ruling enum
+> the existing dispatcher/scan-runner already consume via `state["decision"].value`). New
+> `JudgeConfidence` enum in common/models/enums.py + exported. `AgentState` gained `judge_decision:
+> JudgeDecision | None` (runtime import in graph.py — same get_type_hints gotcha). **Edge still NOT
+> wired — Step 2.7** (live path stays analyzer→END). 15 tests: schema/caveat validation, the three SPEC
+> scenarios (ruling plumbs through + prompt encodes the facts), FR-4.3 cap (+ no-cap when macro
+> available), node skip/proposal/missing-inputs, prompt rendering of None/NoMacroData. Checkpoints
+> green: ruff, ruff-format, mypy --strict (54 files), pytest **498 passed**.
+> **Step 2.7 shipped (graph-only scope, user-confirmed) — FULL PIPELINE WIRED:** new
+> `build_pipeline_graph(*, historian, skeptic, judge, checkpointer=None, tracer=trace_node)` in
+> `graph.py` compiles `analyzer → historian → skeptic → judge → END` with a **conditional edge after the
+> analyzer** (`_route_after_analyzer`: a real `SignalProposal` → "continue" into historian; a
+> SkipDecision/None → "skip" → END, so skips cost ZERO LLM calls). The three agents are injected
+> (deps live in the agent objects, never in checkpointed state). New `src/common/tracing.py`:
+> `trace_node(name, fn)` is an env-gated (LANGFUSE_PUBLIC_KEY+SECRET_KEY) Langfuse wrapper that is a
+> transparent NO-OP by default (returns the same fn object) and degrades gracefully if the optional
+> `langfuse` extra isn't installed — every node is wrapped via the injected `tracer`. Checkpointer is an
+> optional param compiled in (`.compile(checkpointer=...)`); proven in tests with the bundled
+> `InMemorySaver` (no new dep). `langfuse` added as the optional `[tracing]` extra + a mypy
+> ignore_missing_imports override; **NO new runtime deps**. **Decisions (user-chosen via AskUserQuestion):
+> Langfuse optional/no-op until configured; Postgres checkpointer LOCAL/asyncpg-only (the Data API Lambda
+> has no direct Postgres socket → passes None, relies on cron/EventBridge re-runs); scope = graph +
+> integration test only.** `build_graph`/`run_scan` stay analyzer-only — **the pipeline is NOT on the live
+> scan path yet.** 8 tests (offline, all agents mocked): publish-through-all-nodes, skip short-circuits
+> (historian/skeptic/judge never called), checkpointer persists state, tracer wraps every node + tracing
+> seam unit tests. Checkpoints green: ruff, mypy --strict (55 files), pytest **506 passed**.
+> **Step 2.7 LIVE ADOPTION shipped (user-confirmed) — THE PIPELINE IS NOW THE LIVE SCAN PATH:**
+> `scripts/run_scan.py` rewritten. `build_pipeline(settings, store, client)` constructs the graph ONCE
+> per process (Historian over the store + Skeptic with `build_macro_providers(settings)` + Judge, all on
+> one `AsyncAnthropic` client) and `run_one_symbol` now runs `build_pipeline_graph(...).ainvoke(...)`
+> instead of the analyzer-only graph. **The Slice-1 `generate_commentary` / `MarketCommentary` stand-in
+> is DELETED — the Skeptic + Judge nodes make the live Claude calls now.** ⚠️ **DEPLOYING THIS CHANGES
+> LIVE BEHAVIOUR + INTRODUCES ONGOING LLM COST (~$3-5/mo at the ≤5-signal/day cap; skips cost nothing —
+> the conditional edge short-circuits).** FR-1.7: `_persist` writes `create_signal` + one `agent_run` per
+> agent that ran (analyzer always; historian/skeptic/judge only on a publish path) via `model_dump(mode=
+> "json")`; latency/token/cost omitted for now (Langfuse covers that when enabled). FR-5.2:
+> `compose_message` branches on the Judge ruling — PUBLISH/PUBLISH_WITH_CAVEAT → `format_new_signal` (now
+> takes a `caveat` kwarg) enriched with historian win-rate + skeptic objection (+ caveat); analyzer skip →
+> `format_skip`; Judge veto on a real proposal → a "JUDGED SKIP" note. `run_one_symbol` signature changed:
+> drops `settings`/`anthropic_client`, takes the prebuilt `graph` (+ provider/store/notifier). The
+> `AsyncAnthropic` client is created in `_run_symbols`/`_amain` and **closed** in finally (`await
+> client.close()` — confirmed `close`, not `aclose`) to avoid a ResourceWarning under
+> `filterwarnings=error`. `test_run_scan.py` fully rewritten (mocked pipeline graph + clients): publish
+> persists 4 agent_runs, skip persists 1, compose_message variants, lambda lifecycle (now also patches
+> `AsyncAnthropic`). Checkpoints green: ruff, mypy --strict (55 files), pytest **507 passed**.
+> **STILL DEFERRED (smaller follow-ups, not blockers):** local `AsyncPostgresSaver` checkpointer (Lambda
+> runs without one; needs `langgraph-checkpoint-postgres` + table setup); per-agent token/cost on
+> agent_runs rows; multi-TF/derivatives fetch (still H4-only); the scan `session` is hardcoded AD_HOC
+> (the EventBridge cron→session mapping is Step 2.10). Next: **Step 2.8 (active_setups + ActiveSetupRepository)**.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
