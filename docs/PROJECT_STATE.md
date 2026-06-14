@@ -129,9 +129,15 @@ export JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION=1                  # silence N
 cdk deploy --all --require-approval never
 #   ^ if an ECR push hits "TLS handshake timeout", just re-run — the image is cached.
 
-# DB migration over the Data API (idempotent)
-.\.venv\Scripts\python.exe scripts\migrate.py --backend dataapi \
+# DB migration over the Data API (idempotent).
+#   NOTE: as of Slice 2 the CD workflows run this AUTOMATICALLY before `cdk deploy`
+#   (discovering the ARNs from the CryptoSignals-Data stack outputs), so a normal
+#   push-to-main deploy needs no manual migration. The command below is for LOCAL
+#   dev DBs and break-glass / out-of-band schema applies only.
+.\.venv\Scripts\python.exe -m scripts.migrate --backend dataapi `
   --cluster-arn <cluster-arn> --secret-arn <db-secret-arn> --db-name signals
+#   ARNs for the live cluster are in §3. If the first call throws
+#   DatabaseResumingException (Aurora waking from scale-to-zero), just re-run it.
 
 # Manually invoke the scan Lambda
 aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat out.json
@@ -184,8 +190,9 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | Priority | Item |
 |---|---|
 | 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. After rotating, update Secrets Manager: `aws secretsmanager update-secret --secret-id crypto-signals/anthropic-api-key --secret-string '<key>'` and `... telegram-bot-token --secret-string '{"bot_token":"<t>","chat_id":"8300889332"}'`. Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. |
-| 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. |
-| 🟡 Hardening | Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily scan survives Aurora waking. |
+| 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. **(done for dev — OIDC live.)** |
+| 🟠 Infra/CD | **Auto-migration IAM (Slice 2):** the deploy workflows now run the DB migration before `cdk deploy` using the OIDC deploy role. That role must allow `cloudformation:DescribeStacks` (already has it), `rds-data:ExecuteStatement` on the cluster, and `secretsmanager:GetSecretValue` on the DB secret. If the role is admin-ish this is already covered; if it's scoped, attach the policy in §4 / the deploy notes or the migration step fails with `AccessDenied`. |
+| 🟡 Hardening | Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking. (The CD migration step already retries; this item is the separate runtime/scan path.) |
 
 ---
 
