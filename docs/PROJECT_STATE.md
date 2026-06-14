@@ -304,8 +304,32 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > wired — Step 2.7** (live path stays analyzer→END). 15 tests: schema/caveat validation, the three SPEC
 > scenarios (ruling plumbs through + prompt encodes the facts), FR-4.3 cap (+ no-cap when macro
 > available), node skip/proposal/missing-inputs, prompt rendering of None/NoMacroData. Checkpoints
-> green: ruff, ruff-format, mypy --strict (54 files), pytest **498 passed**. Next: **Step 2.7 (wire the
-> full LangGraph pipeline + Langfuse + Postgres checkpointer)**.
+> green: ruff, ruff-format, mypy --strict (54 files), pytest **498 passed**.
+> **Step 2.7 shipped (graph-only scope, user-confirmed) — FULL PIPELINE WIRED:** new
+> `build_pipeline_graph(*, historian, skeptic, judge, checkpointer=None, tracer=trace_node)` in
+> `graph.py` compiles `analyzer → historian → skeptic → judge → END` with a **conditional edge after the
+> analyzer** (`_route_after_analyzer`: a real `SignalProposal` → "continue" into historian; a
+> SkipDecision/None → "skip" → END, so skips cost ZERO LLM calls). The three agents are injected
+> (deps live in the agent objects, never in checkpointed state). New `src/common/tracing.py`:
+> `trace_node(name, fn)` is an env-gated (LANGFUSE_PUBLIC_KEY+SECRET_KEY) Langfuse wrapper that is a
+> transparent NO-OP by default (returns the same fn object) and degrades gracefully if the optional
+> `langfuse` extra isn't installed — every node is wrapped via the injected `tracer`. Checkpointer is an
+> optional param compiled in (`.compile(checkpointer=...)`); proven in tests with the bundled
+> `InMemorySaver` (no new dep). `langfuse` added as the optional `[tracing]` extra + a mypy
+> ignore_missing_imports override; **NO new runtime deps**. **Decisions (user-chosen via AskUserQuestion):
+> Langfuse optional/no-op until configured; Postgres checkpointer LOCAL/asyncpg-only (the Data API Lambda
+> has no direct Postgres socket → passes None, relies on cron/EventBridge re-runs); scope = graph +
+> integration test only.** `build_graph`/`run_scan` stay analyzer-only — **the pipeline is NOT on the live
+> scan path yet.** 8 tests (offline, all agents mocked): publish-through-all-nodes, skip short-circuits
+> (historian/skeptic/judge never called), checkpointer persists state, tracer wraps every node + tracing
+> seam unit tests. Checkpoints green: ruff, mypy --strict (55 files), pytest **506 passed**. **OPEN
+> FOLLOW-UP (the deferred "live adoption" half of 2.7):** rewire `run_scan`/`lambda_handler` to use
+> `build_pipeline_graph` (construct store + macro providers via `build_macro_providers` + Anthropic
+> client; → live LLM cost ~$3-5/mo on deploy), persist each agent's reasoning to `agent_runs` (FR-1.7),
+> enrich the Telegram message with historian win-rate + skeptic objection + judge ruling (FR-5.2), and
+> construct an `AsyncPostgresSaver` (needs the `langgraph-checkpoint-postgres` dep) for the local path.
+> Next: **Step 2.8 (active_setups table + ActiveSetupRepository)** — or the 2.7 live-adoption follow-up
+> first, user's call.
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
