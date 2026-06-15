@@ -115,6 +115,7 @@ def build_pipeline(
     """
     macro_providers = build_macro_providers(settings)
     graph = build_pipeline_graph(
+        store=store,
         historian=HistorianRepository(store),
         skeptic=Skeptic(macro_providers, client=client),
         judge=Judge(client=client),
@@ -182,8 +183,14 @@ async def _persist(
     if proposal is None:
         raise RuntimeError("graph produced no proposal/skip; cannot persist")
 
+    # `proposal` is the signal row we write (a forced SkipDecision when the risk
+    # gate rejected the setup -> a SKIPPED row, FR-1.3). The ANALYZER agent_run,
+    # though, must record what the Analyzer actually produced: on a gate skip
+    # that is `rejected_proposal` (the original SignalProposal); otherwise it is
+    # `proposal` itself (a published proposal, or the Analyzer's own skip).
     signal_id = await store.create_signal(proposal)
-    await _log_agent(store, ctx, symbol, AgentRole.ANALYZER, proposal)
+    analyzer_output = state.get("rejected_proposal") or proposal
+    await _log_agent(store, ctx, symbol, AgentRole.ANALYZER, analyzer_output)
 
     report = state.get("historian_report")
     if report is not None:

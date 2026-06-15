@@ -398,6 +398,30 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > cost scaling with open-setup count.** Requires the OIDC deploy role's existing Scheduler perms (no new
 > IAM). Next: **Step 2.11 (risk_gates §1.6) — strongly recommended before relying on the now-fuller live
 > schedule** — or 2.12 ops.
+> **Step 2.11 shipped — HARD RISK GATES (§1.6, FR-1.3):** new
+> `src/agents/orchestration/risk_gates.py` — the programmatic, non-overrideable enforcement of all ten
+> §1.6 rules as **pure functions** returning `RiskCheckResult`: (1) ≤1% risk, (2) ≥1:3 R:R, (3)
+> premium/discount, (4) ≤3 concurrent, (5) ≤5/24h, (6) 3-loss→24h pause, (7) Asian/Cooldown block, (8)
+> ≤10x leverage, (9) correlated same-direction BTC/ETH, (10) funding-cost-vs-reward heuristic. The pure
+> rules take pre-fetched primitives; the SINGLE IO seam `gather_risk_context(store, snapshot, now)` reads
+> the journal (open setups → per-setup `get_signal` for symbol/direction; `list_recent_signals` for the
+> 24h count + leading-LOSS streak) into a frozen `RiskContext`. `evaluate_risk_gates` runs all ten;
+> `make_risk_gate_node(store)` is the LangGraph node — on a violation it overwrites `proposal` with a
+> forced `SkipDecision` (reason+`violated_rule` from the first violation, details enumerate all),
+> stamps `decision=SKIP`, and preserves the original under `rejected_proposal` (FR-1.7). Wired into
+> `build_pipeline_graph` (now takes `store=`) between analyzer and historian: `analyzer
+> --continue--> risk_gate --pass--> historian … --fail--> END`; the Skeptic/Judge therefore NEVER see a
+> hard-rule violation. `run_scan._persist` logs the ANALYZER agent_run from `rejected_proposal` when a
+> gate skipped (the journal still records what the Analyzer proposed) while the signals row is the
+> SKIPPED forced-skip. **Schema-vs-policy split realised:** the analyzer has no R:R floor and DID emit
+> sub-1:3 setups (e.g. the test fixture's RR 2.55) — rules 1/2 are FIRST enforced here, so the publish
+> fixtures were nudged (candle-16 high 110→113 → RR 3.45) to represent genuinely valid setups. Rule 10
+> is a no-op on the live path until Step 2.2-style derivatives populate `snapshot.funding_rate`. 44 new
+> tests (every rule pass+fail, helpers, aggregate, forced-skip, node pass/skip; +pipeline force-skip
+> short-circuit; +run_scan force-skip persistence). Checkpoints green: ruff, ruff format, mypy --strict
+> (59 files), pytest **581 passed** (23 deselected). **Pure code — safe to merge; activates on the same
+> deploy as 2.10.** Next: **Step 2.12 (prod secrets + CloudWatch alarms + ops runbook + credential
+> rotation)**, then 2.13 (multi-symbol asyncio parallelism), 2.14 (1-week live validation).
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
