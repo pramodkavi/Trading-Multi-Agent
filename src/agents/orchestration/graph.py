@@ -34,6 +34,7 @@ from src.agents.analyzer import analyze
 # cycle. The node factories are imported here too for build_pipeline_graph.
 from src.agents.historian import HistorianReport, make_historian_node
 from src.agents.judge import JudgeDecision, make_judge_node
+from src.agents.orchestration.risk_gates import RiskGateReport, make_risk_gate_node
 from src.agents.skeptic import SkepticObjection, make_skeptic_node
 from src.common.models import (
     JudgeRuling,
@@ -52,6 +53,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from src.agents.historian import HistorianRepository
     from src.agents.judge import Judge
     from src.agents.skeptic import Skeptic
+    from src.persistence import SignalStore
 
 # ---------------------------------------------------------------------------
 # State
@@ -83,8 +85,19 @@ class AgentState(TypedDict, total=False):
                            the full JudgeDecision (ruling + confidence +
                            reasoning + caveat), or None for skips / when the node
                            is not wired. Edge added in Step 2.7.
-        decision         : set by analyzer_node (stub) -> overwritten by
-                           judge_node (Step 2.6) with judge_decision.ruling, so
+        risk_gate_report : set by the risk-gate node (Step 2.11's
+                           make_risk_gate_node): the full RiskGateReport (one
+                           entry per SPEC §1.6 hard rule). None for analyzer
+                           skips (the gate never runs) / when the node is not
+                           wired. Set on both pass and forced-skip.
+        rejected_proposal: set by the risk-gate node ONLY when a hard rule forced
+                           a skip: the original SignalProposal the Analyzer
+                           produced, preserved so the journal still records what
+                           the Analyzer proposed (FR-1.7) even though `proposal`
+                           is overwritten with the forced SkipDecision.
+        decision         : set by analyzer_node (stub) -> overwritten by the
+                           risk-gate node (Step 2.11, to SKIP on a violation) and
+                           by judge_node (Step 2.6) with judge_decision.ruling, so
                            the existing dispatcher keeps consuming a JudgeRuling.
     """
 
@@ -94,6 +107,8 @@ class AgentState(TypedDict, total=False):
     historian_report: HistorianReport | None
     skeptic_objection: SkepticObjection | NoMacroData | None
     judge_decision: JudgeDecision | None
+    risk_gate_report: RiskGateReport | None
+    rejected_proposal: SignalProposal | None
     decision: JudgeRuling | None
 
 
@@ -158,30 +173,52 @@ def build_graph() -> Any:
 def _route_after_analyzer(state: AgentState) -> str:
     """Conditional edge after the analyzer (SPEC Step 2.7).
 
-    Continue into historian -> skeptic -> judge only when the Analyzer produced
-    a real ``SignalProposal``. On a ``SkipDecision`` (or nothing) there is no
-    setup to retrieve precedents for, object to, or judge, so we short-circuit
-    to END -- the analyzer node already stamped a SKIP ``decision``.
+    Continue into the risk gate (then historian -> skeptic -> judge) only when
+    the Analyzer produced a real ``SignalProposal``. On a ``SkipDecision`` (or
+    nothing) there is no setup to gate, retrieve precedents for, object to, or
+    judge, so we short-circuit to END -- the analyzer node already stamped a SKIP
+    ``decision``.
     """
     return "continue" if isinstance(state.get("proposal"), SignalProposal) else "skip"
 
 
+def _route_after_risk_gate(state: AgentState) -> str:
+    """Conditional edge after the risk gate (SPEC §4 Step 2.11).
+
+    The gate replaces ``proposal`` with a forced ``SkipDecision`` when any SPEC
+    §1.6 hard rule is violated (FR-1.3), so a proposal that is still a
+    ``SignalProposal`` cleared every gate and proceeds to the Historian. A
+    rejected proposal short-circuits to END -- the Skeptic and Judge never see a
+    hard-rule violation, and the forced skip is journaled like any other.
+    """
+    return "pass" if isinstance(state.get("proposal"), SignalProposal) else "fail"
+
+
 def build_pipeline_graph(
     *,
+    store: SignalStore,
     historian: HistorianRepository,
     skeptic: Skeptic,
     judge: Judge,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     tracer: Callable[[str, Any], Any] = trace_node,
 ) -> Any:
-    """Compile the full per-signal pipeline: analyzer -> historian -> skeptic -> judge.
+    """Compile the full per-signal pipeline.
 
-    The three downstream agents are injected (their dependencies -- store,
-    macro providers, Anthropic client -- live in the agent objects, never in the
-    checkpointed state). A conditional edge after the analyzer short-circuits a
-    SkipDecision straight to END, so skips cost no LLM calls.
+    analyzer -> risk_gate -> historian -> skeptic -> judge, with two conditional
+    edges: the analyzer short-circuits a SkipDecision straight to END (skips cost
+    no LLM calls), and the risk gate short-circuits a hard-rule-violating
+    proposal to END as a forced skip (SPEC §1.6 / FR-1.3).
+
+    The downstream agents are injected (their dependencies -- store, macro
+    providers, Anthropic client -- live in the agent objects, never in the
+    checkpointed state).
 
     Args:
+        store: the backend-neutral SignalStore the risk gate reads (open setups,
+            recent signals) to enforce the stateful rules (max concurrent, daily
+            cap, loss-streak pause, correlated exposure). In production this is
+            the same store the Historian and persistence layer use.
         historian / skeptic / judge: the constructed agents to bind into the
             historian / skeptic / judge nodes via their factories.
         checkpointer: optional LangGraph checkpointer for crash-resume
@@ -195,13 +232,10 @@ def build_pipeline_graph(
     Returned graph is typed ``Any`` for the same reason as ``build_graph``: the
     CompiledStateGraph generics differ between local mypy and the pre-commit
     hook's isolated environment. Callers use the standard ``.ainvoke`` surface.
-
-    NOTE: this builder is not yet on the live scan path -- ``run_scan`` /
-    ``build_graph`` remain analyzer-only until the Step 2.7 follow-up wires the
-    pipeline into the scan runner (Telegram + per-agent persistence).
     """
     nodes: dict[str, Callable[[AgentState], Awaitable[AgentState]]] = {
         "analyzer": analyzer_node,
+        "risk_gate": make_risk_gate_node(store),
         "historian": make_historian_node(historian),
         "skeptic": make_skeptic_node(skeptic),
         "judge": make_judge_node(judge),
@@ -215,7 +249,12 @@ def build_pipeline_graph(
     graph.add_conditional_edges(
         "analyzer",
         _route_after_analyzer,
-        {"continue": "historian", "skip": END},
+        {"continue": "risk_gate", "skip": END},
+    )
+    graph.add_conditional_edges(
+        "risk_gate",
+        _route_after_risk_gate,
+        {"pass": "historian", "fail": END},
     )
     graph.add_edge("historian", "skeptic")
     graph.add_edge("skeptic", "judge")

@@ -2,9 +2,9 @@
 
 Per SPEC §4 Step 1.11 and §3.3.3 NFR-3.1, all configuration is loaded from
 environment variables. Locally those come from a gitignored `.env` file; in
-production they are injected from AWS Secrets Manager into the Fargate task
-environment (Step 1.16+). The code path is identical -- only the source of
-the env vars differs.
+production the Lambda resolves them at startup from SSM Parameter Store (the API
+keys) and Secrets Manager (the DB credential) into the same env vars (Step 1.16+,
+SSM since Step 2.12). The code path is identical -- only the source differs.
 
 Security posture:
 - Secrets (Anthropic API key, Telegram bot token, database URL) are typed as
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
 
     # ---- Secrets (required) ----------------------------------------------
     anthropic_api_key: SecretStr = Field(
-        description="Anthropic API key (Claude Sonnet 4.5). From Secrets Manager in prod.",
+        description="Anthropic API key (Claude Sonnet 4.5). From SSM Parameter Store in prod.",
     )
     telegram_bot_token: SecretStr = Field(
         description="Telegram bot token from @BotFather. Treated as a secret.",

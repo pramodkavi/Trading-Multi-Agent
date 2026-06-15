@@ -76,7 +76,7 @@ liquidity/OTE/premium-discount) is **Slice 2 Step 2.1**.
 | **DB name** | `signals` |
 | **Lambda log group** | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-YGmufZcOKKgE` |
 | **Schedule** | EventBridge Scheduler `cron(3 8 * * ? *)` Etc/UTC, **ENABLED** (London open). NY/overlap/wrap/Critic windows added in later steps. |
-| **App secrets** | `crypto-signals/anthropic-api-key` (plain key string) and `crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). |
+| **App secrets** | **Step 2.12 (code; activates on next deploy):** moved to **SSM Parameter Store SecureString** — `/crypto-signals/anthropic-api-key` (plain key string) and `/crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). Created out-of-band via `aws ssm put-parameter --type SecureString` (CFN can't create SecureString) — see `docs/operations.md §1`. Pre-2.12 these were Secrets Manager secrets (no leading slash); the 2.12 deploy removes them. The Aurora DB credential stays in Secrets Manager. |
 | **Estimated cost** | ~$5–9/month (Aurora scales to zero when idle). |
 | **CDK bootstrap** | Done in ap-south-1 (and us-east-1, now unused). |
 | **us-east-1** | All 4 app stacks **torn down** (only the harmless CDKToolkit bootstrap stack remains). |
@@ -189,7 +189,7 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 
 | Priority | Item |
 |---|---|
-| 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. After rotating, update Secrets Manager: `aws secretsmanager update-secret --secret-id crypto-signals/anthropic-api-key --secret-string '<key>'` and `... telegram-bot-token --secret-string '{"bot_token":"<t>","chat_id":"8300889332"}'`. Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. |
+| 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. As of Step 2.12 these live in **SSM Parameter Store**: `aws ssm put-parameter --overwrite --type SecureString --name /crypto-signals/anthropic-api-key --value '<key>'` and `... --name /crypto-signals/telegram-bot-token --value '{"bot_token":"<t>","chat_id":"8300889332"}'` (region ap-south-1). Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. Full procedure: `docs/operations.md §1.2`. |
 | 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. **(done for dev — OIDC live.)** |
 | 🟠 Infra/CD | **Auto-migration IAM (Slice 2):** the deploy workflows now run the DB migration before `cdk deploy` using the OIDC deploy role. That role must allow `cloudformation:DescribeStacks` (already has it), `rds-data:ExecuteStatement` on the cluster, and `secretsmanager:GetSecretValue` on the DB secret. If the role is admin-ish this is already covered; if it's scoped, attach the policy in §4 / the deploy notes or the migration step fails with `AccessDenied`. |
 | 🟡 Hardening | Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking. (The CD migration step already retries; this item is the separate runtime/scan path.) |
@@ -345,7 +345,108 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > **STILL DEFERRED (smaller follow-ups, not blockers):** local `AsyncPostgresSaver` checkpointer (Lambda
 > runs without one; needs `langgraph-checkpoint-postgres` + table setup); per-agent token/cost on
 > agent_runs rows; multi-TF/derivatives fetch (still H4-only); the scan `session` is hardcoded AD_HOC
-> (the EventBridge cron→session mapping is Step 2.10). Next: **Step 2.8 (active_setups + ActiveSetupRepository)**.
+> (the EventBridge cron→session mapping is Step 2.10).
+> **Step 2.8 shipped — ACTIVE SETUPS TRACKING:** new `active_setups` table (id, signal_id FK→signals
+> ON DELETE CASCADE, opened_at, status, last_evaluated_at, latest_evaluation JSONB) + 2 indexes, added
+> to schema.sql (idempotent; CD auto-migrates before deploy → the live DB gets it automatically). New
+> `ActiveSetupStatus` enum (OPEN + the SignalOutcome terminals WIN/LOSS/BREAKEVEN/INVALIDATED/EXPIRED —
+> status doubles as the lifecycle per the SPEC column list, no separate outcome column). `StoredActiveSetup`
+> read model (`is_open` property). `ActiveSetupRepository` (asyncpg) + matching methods on the
+> `SignalStore` Protocol / `DataApiSignalStore` (named params, `_utc_iso` timestamps, `_row_to_active_setup`)
+> / `AsyncpgSignalStore` forwards: `open_active_setup(signal_id)`, `list_open_active_setups()` (oldest
+> first — the Forecaster's queue), `get_active_setup(id)`, `update_active_setup(id, status, evaluation,
+> evaluated_at)` (COALESCE keeps prior eval when None; one method serves both a STILL_VALID/AT_RISK touch
+> and a terminal close — the Forecaster at 2.9 will also call `set_signal_outcome` alongside a terminal
+> update). **Wired into `run_scan._persist`:** captures the `create_signal` return id and, only on a Judge
+> PUBLISH/PUBLISH_WITH_CAVEAT (not skips, not vetoes), calls `open_active_setup`. `EXPECTED_TABLES` grew
+> to 4; Data-API migration statement-count pin 18→21 (1 table + 2 indexes); schema comment avoids the
+> literal "CREATE TABLE/INDEX" phrase (the idempotency-count test scans for it). Tests: StoredActiveSetup
+> model + ActiveSetupRepository (mocked conn) + DataApi methods (mocked rds-data) — SQL shape/params/parse
+> for BOTH backends + run_scan wiring (publish opens a setup; skip & veto don't) + opt-in asyncpg
+> integration (open→list→update lifecycle + signal-delete cascade; NOT run here — no Docker). Checkpoints
+> green: ruff, mypy --strict (55 files), pytest **525 passed** (23 deselected).
+> **Step 2.9 shipped — THE FORECASTER:** new `src/agents/forecaster/` package — the background loop
+> (FR-2.1) that re-evaluates open setups. New `ForecastStatus` enum (STILL_VALID / AT_RISK / INVALIDATED)
+> + `ForecasterUpdate` model (status + reasoning + `outcome`; a model_validator requires `outcome` IFF
+> status is INVALIDATED). `Forecaster(store, provider, notifier, client, model)` — `run()` lists open
+> setups, and per setup: re-parses the proposal (`StoredSignal.as_proposal`), refetches an H4 snapshot,
+> asks Claude (`structured_completion`, tool `emit_forecast`) for a verdict, then acts: STILL_VALID →
+> record eval, stays OPEN; AT_RISK → record + Telegram warning; INVALIDATED → close
+> (`update_active_setup(status=ActiveSetupStatus(outcome.value))`) + `set_signal_outcome` (journals the
+> terminal result) + Telegram. Per-setup work is try/except-isolated (one bad/orphan setup never aborts
+> the run; missing/non-PUBLISHED signal is skipped with no LLM call). New `format_forecaster_update`
+> formatter (FR-5.3: distinct "⚠️ SETUP AT RISK" / "🔚 SETUP CLOSED" headers vs NEW SIGNAL) — typed via a
+> TYPE_CHECKING-only import of ForecasterUpdate to avoid a notifications↔forecaster cycle. **NOT wired to
+> a schedule yet — that's Step 2.10 (a separate EventBridge rule → Lambda), so no live LLM cost from this
+> step.** 11 tests (schema validation, the 3 verdict paths via fake store/provider/notifier + mocked
+> client, orphan skip, per-setup failure isolation, formatter). Checkpoints green: ruff, ruff-format,
+> mypy --strict (58 files), pytest **536 passed** (23 deselected).
+> **Step 2.10 shipped — SCHEDULING (⚠️ REQUIRES MERGE + DEPLOY TO TAKE EFFECT):** `SchedulingStack`
+> completed — it previously had ONLY the London-open scan; now all four SPEC §5 scan windows (London
+> 08:03, NY 13:03, overlap 15:03, daily-wrap 22:03 → `cron(3 H * * ? *)`, scan mode) **plus** the
+> Forecaster sweep `cron(5 8,13,15,22 * * ? *)` which invokes the SAME scan Lambda with
+> `{"mode": "forecaster"}` (single-Lambda per CLAUDE.md — "clean separation" = dedicated schedule + event
+> flag, not a 2nd function). `scripts/run_scan.py`: `_alambda` dispatches `event["mode"]=="forecaster"`
+> → new `_run_forecaster` (builds store+provider+notifier+AsyncAnthropic, runs `Forecaster(...).run()`,
+> closes the client, returns `{"ok","mode":"forecaster","evaluated","by_status"}`); any other/absent mode
+> → the existing scan path. **VERIFIED the CDK via real `app.synth()`** (installed the pinned
+> `infrastructure/requirements.txt` — aws-cdk-lib 2.259.0 etc. — into `.venv` per its documented workflow):
+> synth emits 5 AWS::Scheduler::Schedule resources with the exact crons + the forecaster Input. +1 lambda
+> test (forecaster mode routes to the Forecaster + closes deps). Checkpoints green: ruff, py_compile,
+> mypy --strict (58 files), pytest **537 passed** (23 deselected). **⚠️ ON DEPLOY THIS GOES LIVE: scans
+> now fire at all 4 windows (more signals than London-only) AND the Forecaster runs 4×/day → extra LLM
+> cost scaling with open-setup count.** Requires the OIDC deploy role's existing Scheduler perms (no new
+> IAM). Next: **Step 2.11 (risk_gates §1.6) — strongly recommended before relying on the now-fuller live
+> schedule** — or 2.12 ops.
+> **Step 2.11 shipped — HARD RISK GATES (§1.6, FR-1.3):** new
+> `src/agents/orchestration/risk_gates.py` — the programmatic, non-overrideable enforcement of all ten
+> §1.6 rules as **pure functions** returning `RiskCheckResult`: (1) ≤1% risk, (2) ≥1:3 R:R, (3)
+> premium/discount, (4) ≤3 concurrent, (5) ≤5/24h, (6) 3-loss→24h pause, (7) Asian/Cooldown block, (8)
+> ≤10x leverage, (9) correlated same-direction BTC/ETH, (10) funding-cost-vs-reward heuristic. The pure
+> rules take pre-fetched primitives; the SINGLE IO seam `gather_risk_context(store, snapshot, now)` reads
+> the journal (open setups → per-setup `get_signal` for symbol/direction; `list_recent_signals` for the
+> 24h count + leading-LOSS streak) into a frozen `RiskContext`. `evaluate_risk_gates` runs all ten;
+> `make_risk_gate_node(store)` is the LangGraph node — on a violation it overwrites `proposal` with a
+> forced `SkipDecision` (reason+`violated_rule` from the first violation, details enumerate all),
+> stamps `decision=SKIP`, and preserves the original under `rejected_proposal` (FR-1.7). Wired into
+> `build_pipeline_graph` (now takes `store=`) between analyzer and historian: `analyzer
+> --continue--> risk_gate --pass--> historian … --fail--> END`; the Skeptic/Judge therefore NEVER see a
+> hard-rule violation. `run_scan._persist` logs the ANALYZER agent_run from `rejected_proposal` when a
+> gate skipped (the journal still records what the Analyzer proposed) while the signals row is the
+> SKIPPED forced-skip. **Schema-vs-policy split realised:** the analyzer has no R:R floor and DID emit
+> sub-1:3 setups (e.g. the test fixture's RR 2.55) — rules 1/2 are FIRST enforced here, so the publish
+> fixtures were nudged (candle-16 high 110→113 → RR 3.45) to represent genuinely valid setups. Rule 10
+> is a no-op on the live path until Step 2.2-style derivatives populate `snapshot.funding_rate`. 44 new
+> tests (every rule pass+fail, helpers, aggregate, forced-skip, node pass/skip; +pipeline force-skip
+> short-circuit; +run_scan force-skip persistence). Checkpoints green: ruff, ruff format, mypy --strict
+> (59 files), pytest **581 passed** (23 deselected). **Pure code — safe to merge; activates on the same
+> deploy as 2.10.** Next: **Step 2.12 (prod secrets + CloudWatch alarms + ops runbook + credential
+> rotation)**, then 2.13 (multi-symbol asyncio parallelism), 2.14 (1-week live validation).
+
+> **Step 2.12 shipped — PROD SECRETS (→ SSM) + ALARMS + OPS RUNBOOK (⚠️ REQUIRES DEPLOY + ONE MANUAL
+> SSM STEP):** Per the operator's cost decision, the third-party API keys moved off **Secrets Manager**
+> onto **SSM Parameter Store SecureString** (free standard tier vs ~$0.40/secret/mo). `infrastructure/
+> stacks/parameters.py` holds the shared names (`/crypto-signals/{anthropic-api-key,telegram-bot-token,
+> fred-api-key,twelve-data-api-key}`). `DataStack` no longer creates the API-key SM placeholders (the
+> 2.12 deploy DELETES them); the Aurora DB credential stays in SM. `ComputeStack` grants `ssm:GetParameter`
+> on the two exact param ARNs (the default `aws/ssm` KMS key needs no explicit `kms:Decrypt`) and injects
+> param *names* as env (`ANTHROPIC_PARAM_NAME`/`TELEGRAM_PARAM_NAME`); it now exposes `log_group`.
+> `src/config/secrets.py` reads SSM (`get_parameter(WithDecryption=True)`), same pure-resolve/thin-hydrate
+> shape and JSON-or-plain payload support. ⚠️ **CFN cannot create SecureString** → operator runs `aws ssm
+> put-parameter --type SecureString` once before the post-deploy scan (commands in `docs/operations.md
+> §1.1`). **Alarms (NFR-2.2):** `MonitoringStack` (was empty) now has 4 alarms — scan-failure-rate
+> (Lambda Errors/Invocations 24h), latency p95>2min (Duration), Aurora CPU>80%, and provider-errors as a
+> COUNT alarm (≥3/1h) via a Logs **metric filter** on a new `PROVIDER_ERROR` marker logged by
+> `run_scan.run_one_symbol`. All route to **Telegram**: alarm → SNS topic (enforce_ssl) → a small
+> **notifier Lambda** (`scripts/alarm_notifier.py`, reuses the scan image w/ CMD override, reads the
+> Telegram param from SSM) — no manual SNS subscription. **First infra tests:** `tests/infra/` synth-asserts
+> the stacks (jsii→Node; CI now `pip install -r infrastructure/requirements.txt`). cdk-nag clean (SNS2
+> suppressed: alarm metadata only, KMS CMK cost-prohibitive; enforce_ssl satisfies SNS3). Checkpoints
+> green: ruff, ruff format (only pre-existing test_migrate skew), mypy --strict (60 files), **pytest 600
+> passed** (23 deselected; +19: secrets rewrite, alarm_notifier, infra synth), local `cdk synth` exit 0
+> no nag findings. **Requires a deploy to take effect AND the one-time SSM put-parameter; safe to stack
+> with 2.10/2.11.** Open: rotate the exposed Anthropic+Telegram creds (now via SSM, §7 / ops §1.2). Next:
+> Step 2.13 (multi-symbol asyncio parallelism).
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

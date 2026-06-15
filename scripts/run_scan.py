@@ -3,7 +3,7 @@
 Wires the full per-signal pipeline into one pass and proves the production
 stack works against real external services:
 
-    config (Step 1.11)        -> load Settings from .env / Secrets Manager
+    config (Step 1.11)        -> load Settings from .env / SSM Parameter Store
     Binance (Step 2.2)        -> fetch 4H klines for one symbol
     LangGraph (Step 2.7)      -> run the full pipeline graph:
                                  analyzer -> historian -> skeptic -> judge
@@ -49,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 
 from anthropic import AsyncAnthropic
 
+from src.agents.forecaster import Forecaster
 from src.agents.historian import HistorianRepository
 from src.agents.judge import Judge
 from src.agents.orchestration import build_pipeline_graph
@@ -69,7 +70,7 @@ from src.notifications import (
     format_skip,
 )
 from src.persistence import create_store
-from src.providers import BinanceProvider, NoMacroData, Timeframe
+from src.providers import BinanceProvider, NoMacroData, ProviderError, Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Sequence
@@ -114,6 +115,7 @@ def build_pipeline(
     """
     macro_providers = build_macro_providers(settings)
     graph = build_pipeline_graph(
+        store=store,
         historian=HistorianRepository(store),
         skeptic=Skeptic(macro_providers, client=client),
         judge=Judge(client=client),
@@ -181,8 +183,14 @@ async def _persist(
     if proposal is None:
         raise RuntimeError("graph produced no proposal/skip; cannot persist")
 
-    await store.create_signal(proposal)
-    await _log_agent(store, ctx, symbol, AgentRole.ANALYZER, proposal)
+    # `proposal` is the signal row we write (a forced SkipDecision when the risk
+    # gate rejected the setup -> a SKIPPED row, FR-1.3). The ANALYZER agent_run,
+    # though, must record what the Analyzer actually produced: on a gate skip
+    # that is `rejected_proposal` (the original SignalProposal); otherwise it is
+    # `proposal` itself (a published proposal, or the Analyzer's own skip).
+    signal_id = await store.create_signal(proposal)
+    analyzer_output = state.get("rejected_proposal") or proposal
+    await _log_agent(store, ctx, symbol, AgentRole.ANALYZER, analyzer_output)
 
     report = state.get("historian_report")
     if report is not None:
@@ -193,6 +201,11 @@ async def _persist(
     judge_decision = state.get("judge_decision")
     if judge_decision is not None:
         await _log_agent(store, ctx, symbol, AgentRole.JUDGE, judge_decision)
+
+    # Step 2.8: a published signal becomes a tracked active setup the Forecaster
+    # will follow (only on PUBLISH / PUBLISH_WITH_CAVEAT; skips and vetoes don't).
+    if isinstance(proposal, SignalProposal) and state.get("decision") in _PUBLISH_RULINGS:
+        await store.open_active_setup(signal_id=signal_id)
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +314,22 @@ async def run_one_symbol(
     logger.info("scan %s started for %s", ctx.scan_id, symbol)
 
     try:
-        snapshot = await provider.fetch_market_snapshot(symbol, [Timeframe.H4], limit=CANDLE_LIMIT)
+        try:
+            snapshot = await provider.fetch_market_snapshot(
+                symbol, [Timeframe.H4], limit=CANDLE_LIMIT
+            )
+        except ProviderError as exc:
+            # Emit the PROVIDER_ERROR marker the MonitoringStack metric filter
+            # counts (-> ProviderErrors metric -> provider-error alarm, NFR-2.2),
+            # then re-raise so the scan still flips to FAILED and surfaces normally.
+            logger.warning(
+                "PROVIDER_ERROR provider=%s symbol=%s error=%s: %s",
+                type(provider).__name__,
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
+            raise
         logger.info("fetched %d 4H candles", len(snapshot.klines[Timeframe.H4]))
 
         state = await graph.ainvoke(_initial_state(ctx, snapshot))
@@ -399,6 +427,46 @@ async def _run_symbols(
     return results
 
 
+async def _run_forecaster(*, settings: Settings, notify: bool) -> dict[str, Any]:
+    """Re-evaluate every open setup once (Step 2.9 Forecaster, scheduled by 2.10).
+
+    Builds the same store / provider / notifier / Anthropic client as a scan and
+    runs the Forecaster loop. Returns a JSON-serialisable summary counting the
+    verdicts so the invocation surfaces activity to CloudWatch.
+    """
+    store = await create_store(settings)
+    updates: list[Any] = []
+    try:
+        provider = BinanceProvider()
+        client = AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
+        notifier: Notifier | None = (
+            TelegramNotifier(
+                token=settings.telegram_bot_token.get_secret_value(),
+                chat_id=settings.telegram_chat_id,
+            )
+            if notify
+            else None
+        )
+        try:
+            forecaster = Forecaster(
+                store=store, provider=provider, notifier=notifier, client=client
+            )
+            updates = await forecaster.run()
+        finally:
+            await provider.aclose()
+            await client.close()
+            if notifier is not None:
+                await notifier.aclose()
+    finally:
+        await store.aclose()
+
+    by_status: dict[str, int] = {}
+    for update in updates:
+        by_status[update.status.value] = by_status.get(update.status.value, 0) + 1
+    logger.info("forecaster run complete: %d setup(s), %s", len(updates), by_status)
+    return {"ok": True, "mode": "forecaster", "evaluated": len(updates), "by_status": by_status}
+
+
 def _symbols_from_event(event: dict[str, Any], settings: Settings) -> list[str]:
     """Resolve the symbols to scan: event override, else the watchlist.
 
@@ -421,8 +489,15 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
     Windows leaves an unclosed-loop ResourceWarning.
     """
     payload = event or {}
-    symbols = _symbols_from_event(payload, settings)
     notify = bool(payload.get("notify", True))
+
+    # Step 2.10: a separate EventBridge schedule invokes this same Lambda with
+    # {"mode": "forecaster"} a couple minutes after each scan, to re-evaluate
+    # open setups. Any other (or absent) mode runs the per-signal scan.
+    if payload.get("mode") == "forecaster":
+        return await _run_forecaster(settings=settings, notify=notify)
+
+    symbols = _symbols_from_event(payload, settings)
     logger.info("lambda scan starting for %s (notify=%s)", symbols, notify)
 
     results = await _run_symbols(settings=settings, symbols=symbols, notify=notify)
@@ -431,12 +506,12 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
 
 
 def _load_settings() -> Settings:
-    """Hydrate secrets from Secrets Manager, then build the cached Settings.
+    """Hydrate secrets from SSM Parameter Store, then build the cached Settings.
 
     Order matters: ``get_settings`` is ``lru_cache``d, so the secret values must
     be in the environment before its first call -- otherwise the cache locks in
     a Settings validated against a half-empty environment. Locally this is a
-    no-op (no secret ARNs set) and Settings reads straight from ``.env``.
+    no-op (no parameter names set) and Settings reads straight from ``.env``.
     """
     hydrate_secrets_env()
     return get_settings()
@@ -446,8 +521,8 @@ def lambda_handler(event: dict[str, Any] | None, context: object) -> dict[str, A
     """AWS Lambda entry point: run the scan and return a structured result.
 
     Triggered by EventBridge Scheduler (Step 1.19). Resolves secret values from
-    Secrets Manager (the LambdaStack injects only the secret ARNs, never the
-    values), loads configuration, runs the scan for the configured symbol(s),
+    SSM Parameter Store (the ComputeStack injects only the parameter names, never
+    the values), loads configuration, runs the scan for the configured symbol(s),
     and returns a JSON-serialisable summary. ``ok`` is False if any symbol
     errored, so the invocation surfaces failures to CloudWatch without losing
     the successful scans.

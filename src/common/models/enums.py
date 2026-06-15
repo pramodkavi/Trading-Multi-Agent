@@ -135,3 +135,35 @@ class SignalOutcome(StrEnum):
     BREAKEVEN = "BREAKEVEN"  # closed at/near entry
     INVALIDATED = "INVALIDATED"  # setup premise broke before triggering
     EXPIRED = "EXPIRED"  # never triggered within its validity window
+
+
+class ForecastStatus(StrEnum):
+    """The Forecaster's per-scan verdict on an open setup (SPEC §3.1.2 FR-2.1).
+
+    STILL_VALID -- on track; no action.
+    AT_RISK     -- premise threatened (price nearing invalidation, regime
+                   shifting); send the operator a Telegram warning.
+    INVALIDATED -- the setup resolved or its premise broke; close it and log a
+                   terminal `SignalOutcome` (WIN / LOSS / INVALIDATED / etc.).
+    """
+
+    STILL_VALID = "STILL_VALID"
+    AT_RISK = "AT_RISK"
+    INVALIDATED = "INVALIDATED"
+
+
+class ActiveSetupStatus(StrEnum):
+    """Lifecycle status of a row in the `active_setups` table (Step 2.8).
+
+    A setup is OPEN from the moment the Judge publishes it. The Forecaster
+    (Step 2.9) re-evaluates OPEN setups every scan and, when one resolves, moves
+    it to a terminal status mirroring `SignalOutcome` (and stamps the same value
+    on `signals.outcome`). Mirrors the CHECK constraint in schema.sql.
+    """
+
+    OPEN = "OPEN"  # live; the Forecaster is tracking it
+    WIN = "WIN"
+    LOSS = "LOSS"
+    BREAKEVEN = "BREAKEVEN"
+    INVALIDATED = "INVALIDATED"
+    EXPIRED = "EXPIRED"

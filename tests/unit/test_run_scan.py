@@ -24,11 +24,13 @@ from scripts.run_scan import (
     compose_message,
     run_one_symbol,
 )
+from src.agents.forecaster import ForecasterUpdate
 from src.agents.historian import HistorianReport, HistorianRepository
 from src.agents.judge import Judge, JudgeDecision
 from src.agents.orchestration import build_pipeline_graph
 from src.agents.skeptic import Skeptic, SkepticObjection
 from src.common.models import (
+    ForecastStatus,
     JudgeConfidence,
     JudgeRuling,
     ObjectionSeverity,
@@ -70,14 +72,18 @@ def _flat(idx: int, *, level: float) -> Kline:
 
 
 def _bullish_series() -> list[Kline]:
-    """A full SMC LONG setup verified to publish under the 2.1e analyzer."""
+    """A full SMC LONG setup verified to publish AND clear the hard gates.
+
+    Candle 16's high is 113 (not 110) so R:R is 3.45, clearing the 1:3 minimum
+    the Step 2.11 risk gate enforces; confluence and DISCOUNT zone are unchanged.
+    """
     s = [_flat(i, level=100.0) for i in range(10)]
     s.append(_c(10, open_=100.0, high=105.0, low=99.5, close=100.0))
     s += [_flat(11, level=100.0), _flat(12, level=100.0)]
     s.append(_c(13, open_=101.0, high=101.5, low=98.5, close=99.0))
     s.append(_c(14, open_=99.0, high=104.0, low=99.0, close=103.5))
     s.append(_c(15, open_=103.5, high=108.0, low=103.0, close=107.0))
-    s.append(_c(16, open_=107.0, high=110.0, low=106.5, close=109.0))
+    s.append(_c(16, open_=107.0, high=113.0, low=106.5, close=109.0))
     s += [_flat(17, level=107.5), _flat(18, level=107.5)]
     s.append(_c(19, open_=106.0, high=106.5, low=102.0, close=103.0))
     s += [_flat(i, level=103.5) for i in range(20, 32)]
@@ -104,7 +110,25 @@ def _snapshot(candles: list[Kline], symbol: str = "BTCUSDT") -> MarketSnapshot:
 
 
 class _FakeHistorianStore:
+    """Fake graph-side store: serves the Historian and the Step 2.11 risk gate.
+
+    ``open_setups`` lets a test simulate concurrent setups so the risk gate's
+    max-concurrent rule (4) trips; default empty so every stateful gate passes.
+    """
+
+    def __init__(self, *, open_setups: list[Any] | None = None) -> None:
+        self._open = open_setups or []
+
     async def find_similar_signals(self, **kwargs: Any) -> list[Any]:
+        return []
+
+    async def list_open_active_setups(self) -> list[Any]:
+        return list(self._open)
+
+    async def get_signal(self, signal_id: Any) -> Any:
+        return None
+
+    async def list_recent_signals(self, **kwargs: Any) -> list[Any]:
         return []
 
 
@@ -157,9 +181,16 @@ def _ruling_payload(ruling: str, *, caveat: str | None = None) -> dict[str, Any]
     }
 
 
-def _pipeline_graph(skeptic_client: MagicMock, judge_client: MagicMock) -> Any:
+def _pipeline_graph(
+    skeptic_client: MagicMock,
+    judge_client: MagicMock,
+    *,
+    store: _FakeHistorianStore | None = None,
+) -> Any:
+    fake_store = store or _FakeHistorianStore()
     return build_pipeline_graph(
-        historian=HistorianRepository(_FakeHistorianStore()),
+        store=fake_store,
+        historian=HistorianRepository(fake_store),
         skeptic=Skeptic([_FakeMacroProvider()], client=skeptic_client),
         judge=Judge(client=judge_client),
     )
@@ -169,6 +200,14 @@ def _publishing_graph() -> Any:
     return _pipeline_graph(
         _client([_tool_response(_OBJECTION_PAYLOAD, tool_name="emit_objection")]),
         _client([_tool_response(_ruling_payload("PUBLISH"), tool_name="emit_ruling")]),
+    )
+
+
+def _vetoing_graph() -> Any:
+    """Pipeline whose Judge rules SKIP on a real proposal (a veto)."""
+    return _pipeline_graph(
+        _client([_tool_response(_OBJECTION_PAYLOAD, tool_name="emit_objection")]),
+        _client([_tool_response(_ruling_payload("SKIP"), tool_name="emit_ruling")]),
     )
 
 
@@ -199,8 +238,9 @@ def _store() -> MagicMock:
     store.start_scan = AsyncMock()
     store.complete_scan = AsyncMock()
     store.fail_scan = AsyncMock()
-    store.create_signal = AsyncMock()
+    store.create_signal = AsyncMock(return_value=uuid4())
     store.log_agent_run = AsyncMock()
+    store.open_active_setup = AsyncMock(return_value=uuid4())
     store.aclose = AsyncMock()
     return store
 
@@ -379,6 +419,8 @@ class TestRunOneSymbol:
         store.create_signal.assert_awaited_once()
         # FR-1.7: analyzer + historian + skeptic + judge reasoning all journaled.
         assert store.log_agent_run.await_count == 4
+        # Step 2.8: a publish opens a tracked active setup.
+        store.open_active_setup.assert_awaited_once()
         notifier.send.assert_awaited_once()
         store.complete_scan.assert_awaited_once()
         store.fail_scan.assert_not_awaited()
@@ -401,8 +443,58 @@ class TestRunOneSymbol:
 
         store.create_signal.assert_awaited_once()
         assert store.log_agent_run.await_count == 1  # analyzer only
+        store.open_active_setup.assert_not_awaited()  # skips open no setup
         notifier.send.assert_awaited_once()
         store.complete_scan.assert_awaited_once()
+
+    async def test_risk_gate_force_skip_persists_skip_and_preserves_proposal(self) -> None:
+        # Three open setups trip the max-concurrent hard rule (4): the analyzer's
+        # real proposal is force-skipped before the historian/skeptic/judge run.
+        provider = _provider(_snapshot(_bullish_series()))
+        store = _store()
+        notifier = _notifier()
+        gate_store = _FakeHistorianStore(
+            open_setups=[SimpleNamespace(signal_id=uuid4()) for _ in range(3)]
+        )
+        graph = _pipeline_graph(_client([]), _client([]), store=gate_store)
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=provider,
+            store=store,
+            graph=graph,
+            notifier=notifier,
+        )
+
+        # A SKIPPED row is written (FR-1.3) and only the analyzer was journaled.
+        store.create_signal.assert_awaited_once()
+        persisted = store.create_signal.call_args.args[0]
+        assert isinstance(persisted, SkipDecision)
+        assert persisted.violated_rule == "RULE_4_MAX_CONCURRENT"
+        assert store.log_agent_run.await_count == 1  # analyzer only (gate short-circuits)
+        # The analyzer agent_run preserves the ORIGINAL proposal (FR-1.7), not the skip.
+        logged = store.log_agent_run.call_args.kwargs["output"]
+        assert logged["risk_reward_ratio"] >= 3.0
+        store.open_active_setup.assert_not_awaited()  # a force-skip opens no setup
+        notifier.send.assert_awaited_once()
+        store.complete_scan.assert_awaited_once()
+
+    async def test_judge_veto_opens_no_setup(self) -> None:
+        provider = _provider(_snapshot(_bullish_series()))
+        store = _store()
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=provider,
+            store=store,
+            graph=_vetoing_graph(),
+            notifier=_notifier(),
+        )
+
+        # A real proposal the Judge SKIPs is journaled (4 agents) but NOT tracked.
+        store.create_signal.assert_awaited_once()
+        assert store.log_agent_run.await_count == 4
+        store.open_active_setup.assert_not_awaited()
 
     async def test_no_notifier_skips_telegram(self) -> None:
         provider = _provider(_snapshot(_bullish_series()))
@@ -563,6 +655,39 @@ class TestLambdaHandler:
         await _alambda({"symbol": "BTCUSDT", "notify": False}, _settings())
 
         deps["notifier_factory"].assert_not_called()
+
+    async def test_forecaster_mode_runs_forecaster(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        store = MagicMock()
+        store.aclose = AsyncMock()
+        provider = MagicMock()
+        provider.aclose = AsyncMock()
+        notifier = MagicMock()
+        notifier.aclose = AsyncMock()
+        client = MagicMock()
+        client.close = AsyncMock()
+        forecaster = MagicMock()
+        forecaster.run = AsyncMock(
+            return_value=[
+                ForecasterUpdate(status=ForecastStatus.STILL_VALID, reasoning="x" * 20),
+                ForecasterUpdate(status=ForecastStatus.AT_RISK, reasoning="y" * 20),
+            ]
+        )
+        monkeypatch.setattr(run_scan_module, "create_store", AsyncMock(return_value=store))
+        monkeypatch.setattr(run_scan_module, "BinanceProvider", MagicMock(return_value=provider))
+        monkeypatch.setattr(run_scan_module, "TelegramNotifier", MagicMock(return_value=notifier))
+        monkeypatch.setattr(run_scan_module, "AsyncAnthropic", MagicMock(return_value=client))
+        monkeypatch.setattr(run_scan_module, "Forecaster", MagicMock(return_value=forecaster))
+
+        result = await _alambda({"mode": "forecaster"}, _settings())
+
+        assert result["mode"] == "forecaster"
+        assert result["evaluated"] == 2
+        assert result["by_status"] == {"STILL_VALID": 1, "AT_RISK": 1}
+        forecaster.run.assert_awaited_once()
+        store.aclose.assert_awaited_once()
+        client.close.assert_awaited_once()
+        provider.aclose.assert_awaited_once()
+        notifier.aclose.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

@@ -16,10 +16,11 @@ import pytest
 from src.persistence import SCHEMA_SQL_PATH
 from src.persistence import dataapi_migrate as migrate
 
-# scan_runs/signals/agent_runs + their indexes + the vector extension.
-# Pinned so a future schema.sql change that breaks the simple splitter (e.g.
-# a function body with embedded semicolons) fails loudly here.
-EXPECTED_STATEMENT_COUNT = 18
+# scan_runs/signals/agent_runs/active_setups + their indexes + the vector
+# extension. Pinned so a future schema.sql change that breaks the simple
+# splitter (e.g. a function body with embedded semicolons) fails loudly here.
+# Step 2.8 added active_setups (1 table + 2 indexes): 18 -> 21.
+EXPECTED_STATEMENT_COUNT = 21
 
 CLUSTER_ARN = "arn:aws:rds:us-east-1:123456789012:cluster:crypto"
 SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:crypto-signals/db"

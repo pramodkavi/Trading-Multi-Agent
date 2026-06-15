@@ -1,17 +1,21 @@
-"""DataStack: Aurora Serverless v2 (Data API), S3, and Secrets Manager.
+"""DataStack: Aurora Serverless v2 (Data API) and the S3 audit bucket.
 
 Implemented in Step 1.16 for the serverless architecture (SPEC §2.2 / §2.4):
 
 - **Aurora Serverless v2 PostgreSQL 16** in the NetworkStack isolated subnets,
   with the **RDS Data API enabled** (the Lambda queries it over HTTPS, no VPC
   attachment) and **scale-to-zero** (min 0 ACU auto-pause) for cost. The
-  cluster's generated secret IS the Data API credential.
+  cluster's generated secret (the one Secrets Manager secret this system keeps)
+  IS the Data API credential.
 - **S3 bucket** for audit blobs: versioned, Glacier after 90 days, public
   access blocked, SSL enforced, encrypted.
-- **Secrets Manager placeholders** for the third-party API keys (Anthropic /
-  Telegram / FRED / Twelve Data). They are created empty here and populated
-  after deploy (Step 2.12); the cluster's own credentials secret is created by
-  the Aurora construct.
+
+Third-party API keys (Anthropic / Telegram / FRED / Twelve Data) are **not**
+created here. As of Step 2.12 they live in **SSM Parameter Store SecureString**
+parameters (free standard tier vs. Secrets Manager's per-secret monthly charge --
+see ``stacks/parameters.py``). CloudFormation cannot create SecureString
+parameters, so they are provisioned out-of-band (``docs/operations.md``); the
+ComputeStack/MonitoringStack only reference them for the IAM grants.
 
 Dev removal policy: the cluster and bucket are `DESTROY` (no final snapshot,
 auto-empty the bucket) for easy teardown. Production must override these to
@@ -32,23 +36,14 @@ from aws_cdk import (
 from aws_cdk import aws_ec2 as ec2
 from aws_cdk import aws_rds as rds
 from aws_cdk import aws_s3 as s3
-from aws_cdk import aws_secretsmanager as secretsmanager
 from cdk_nag import NagSuppressions
 from constructs import Construct
 
 DATABASE_NAME = "signals"
 
-# Third-party API keys to provision as empty placeholders (populated post-deploy).
-API_SECRET_NAMES: dict[str, str] = {
-    "Anthropic": "crypto-signals/anthropic-api-key",
-    "Telegram": "crypto-signals/telegram-bot-token",
-    "Fred": "crypto-signals/fred-api-key",
-    "TwelveData": "crypto-signals/twelve-data-api-key",
-}
-
 
 class DataStack(Stack):
-    """Aurora Serverless v2 (Data API) + S3 + Secrets Manager."""
+    """Aurora Serverless v2 (Data API) + the S3 audit bucket."""
 
     def __init__(
         self,
@@ -110,16 +105,10 @@ class DataStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # ---- Placeholder secrets for third-party API keys ----------------
-        self.api_secrets: dict[str, secretsmanager.Secret] = {}
-        for logical_id, secret_name in API_SECRET_NAMES.items():
-            self.api_secrets[logical_id] = secretsmanager.Secret(
-                self,
-                f"{logical_id}Secret",
-                secret_name=secret_name,
-                description=f"{logical_id} API key/token (placeholder; populate post-deploy).",
-                removal_policy=RemovalPolicy.DESTROY,
-            )
+        # Third-party API keys are NOT created here -- they are SSM Parameter
+        # Store SecureString parameters provisioned out-of-band (Step 2.12,
+        # docs/operations.md), because CloudFormation cannot create SecureString
+        # parameters. See stacks/parameters.py for the names.
 
         # ---- Outputs -----------------------------------------------------
         CfnOutput(self, "ClusterArn", value=self.cluster.cluster_arn)
@@ -178,17 +167,3 @@ class DataStack(Stack):
                 }
             ],
         )
-        for secret in self.api_secrets.values():
-            NagSuppressions.add_resource_suppressions(
-                secret,
-                [
-                    {
-                        "id": "AwsSolutions-SMG4",
-                        "reason": (
-                            "Third-party API keys (Anthropic/Telegram/FRED/Twelve Data) "
-                            "cannot be auto-rotated by AWS; they are rotated manually at "
-                            "the provider and re-pasted into the secret."
-                        ),
-                    }
-                ],
-            )

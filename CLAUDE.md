@@ -57,7 +57,7 @@ Risk gates live in `src/agents/orchestration/risk_gates.py` as pure functions in
 | Storage | S3 (versioning on, Glacier after 90 days) |
 | Compute | **AWS Lambda** (container image, outside VPC) for the agent pipeline — revised from ECS Fargate, see SPEC §2.4. Dashboard (Slice 4) is a separate long-running Fargate/App Runner service. |
 | Scheduling | EventBridge Scheduler → Lambda |
-| Secrets | AWS Secrets Manager |
+| Secrets | SSM Parameter Store (SecureString) for API keys; AWS Secrets Manager for the Aurora DB credential (Step 2.12) |
 | IaC | AWS CDK (Python) + cdk-nag + `aws-cdk@aws-skills` plugin |
 | Local dev | LocalStack + docker-compose |
 | Dashboard | FastAPI + WebSocket + Postgres LISTEN/NOTIFY; React + TS + TradingView Lightweight Charts |

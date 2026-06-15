@@ -46,13 +46,26 @@ from src.providers import (
 
 
 class FakeStore:
-    """Records find_similar_signals calls; returns no precedents."""
+    """Records find_similar_signals calls; returns no precedents.
+
+    Also serves the risk gate's reads (Step 2.11): no open setups and no recent
+    signals, so every stateful hard rule passes by default.
+    """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
     async def find_similar_signals(self, **kwargs: Any) -> list[Any]:
         self.calls.append(kwargs)
+        return []
+
+    async def list_open_active_setups(self) -> list[Any]:
+        return []
+
+    async def get_signal(self, signal_id: Any) -> Any:
+        return None
+
+    async def list_recent_signals(self, **kwargs: Any) -> list[Any]:
         return []
 
 
@@ -114,6 +127,7 @@ def _build(
     **kwargs: Any,
 ) -> Any:
     return build_pipeline_graph(
+        store=store,
         historian=HistorianRepository(store),
         skeptic=_skeptic(skeptic_client),
         judge=Judge(client=judge_client),
@@ -144,14 +158,19 @@ def _flat(idx: int, *, level: float) -> Kline:
 
 
 def _bullish_series() -> list[Kline]:
-    """A full SMC LONG setup verified to publish under the 2.1e analyzer."""
+    """A full SMC LONG setup verified to publish AND clear the hard gates.
+
+    Candle 16's high is 113 (not 110) so the nearest-BSL target yields R:R 3.45,
+    clearing the 1:3 minimum (SPEC §1.6 rule 2) the risk gate now enforces; the
+    confluence and DISCOUNT zone are unchanged.
+    """
     s = [_flat(i, level=100.0) for i in range(10)]
     s.append(_c(10, open_=100.0, high=105.0, low=99.5, close=100.0))
     s += [_flat(11, level=100.0), _flat(12, level=100.0)]
     s.append(_c(13, open_=101.0, high=101.5, low=98.5, close=99.0))
     s.append(_c(14, open_=99.0, high=104.0, low=99.0, close=103.5))
     s.append(_c(15, open_=103.5, high=108.0, low=103.0, close=107.0))
-    s.append(_c(16, open_=107.0, high=110.0, low=106.5, close=109.0))
+    s.append(_c(16, open_=107.0, high=113.0, low=106.5, close=109.0))
     s += [_flat(17, level=107.5), _flat(18, level=107.5)]
     s.append(_c(19, open_=106.0, high=106.5, low=102.0, close=103.0))
     s += [_flat(i, level=103.5) for i in range(20, 32)]
@@ -163,11 +182,9 @@ def _ranging_series() -> list[Kline]:
     return [_flat(i, level=100.0) for i in range(30)]
 
 
-def _initial(candles: list[Kline]) -> AgentState:
+def _initial(candles: list[Kline], *, session: ScanSession = ScanSession.LONDON) -> AgentState:
     return {
-        "scan_context": ScanContext(
-            session=ScanSession.LONDON, symbols=["BTCUSDT"], strategy="smc"
-        ),
+        "scan_context": ScanContext(session=session, symbols=["BTCUSDT"], strategy="smc"),
         "snapshot": MarketSnapshot(
             symbol="BTCUSDT",
             venue="binance",
@@ -220,6 +237,28 @@ async def test_pipeline_skip_short_circuits_remaining_agents() -> None:
     judge_client.messages.create.assert_not_awaited()
 
 
+async def test_pipeline_risk_gate_force_skips_and_short_circuits() -> None:
+    # A valid publishing setup, but the ASIAN session is hard-blocked (rule 7),
+    # so the risk gate force-skips it BEFORE the historian/skeptic/judge run.
+    store = FakeStore()
+    skeptic_client = _mock_client([])
+    judge_client = _mock_client([])
+    graph = _build(store, skeptic_client, judge_client)
+
+    final = await graph.ainvoke(_initial(_bullish_series(), session=ScanSession.ASIAN))
+
+    assert isinstance(final["proposal"], SkipDecision)
+    assert final["proposal"].violated_rule == "RULE_7_SESSION_BLOCK"
+    assert final["decision"] is JudgeRuling.SKIP
+    # The Analyzer's original proposal is preserved for the journal (FR-1.7).
+    assert isinstance(final["rejected_proposal"], SignalProposal)
+    assert not final["risk_gate_report"].passed
+    # Downstream agents never ran.
+    assert store.calls == []
+    skeptic_client.messages.create.assert_not_awaited()
+    judge_client.messages.create.assert_not_awaited()
+
+
 async def test_pipeline_with_checkpointer_persists_state() -> None:
     from langgraph.checkpoint.memory import InMemorySaver
 
@@ -246,4 +285,4 @@ def test_tracer_wraps_every_node() -> None:
 
     _build(FakeStore(), _mock_client([]), _mock_client([]), tracer=recording_tracer)
 
-    assert sorted(recorded) == ["analyzer", "historian", "judge", "skeptic"]
+    assert sorted(recorded) == ["analyzer", "historian", "judge", "risk_gate", "skeptic"]

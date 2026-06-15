@@ -117,7 +117,7 @@ Minutes set to `:03` deliberately to avoid clock jitter on `:00` minutes.
 | DB access (local dev) | asyncpg → Docker Postgres + pgvector | Fast local iteration loop preserved; the persistence layer carries **dual backends** (asyncpg local / Data API cloud) behind one repository interface |
 | Vector extension | pgvector | Native vector similarity inside Postgres; no separate vector DB |
 | Blob storage | Amazon S3 (versioning enabled) | Audit retention, large reasoning logs (>1MB), cold data |
-| Secrets | AWS Secrets Manager | Anthropic API key, Telegram bot token, FRED/Twelve Data keys, DB credentials |
+| Secrets | SSM Parameter Store (SecureString) for API keys; AWS Secrets Manager for the Aurora DB credential | API keys (Anthropic, Telegram, FRED, Twelve Data) in SSM (free standard tier, Step 2.12); DB credential in Secrets Manager (Aurora-managed, used by the Data API) |
 
 ### 2.3 Data Acquisition Layer
 
@@ -278,9 +278,9 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 #### 3.3.3 Security
 
-**NFR-3.1** All secrets (Anthropic API key, Telegram bot token, FRED/Twelve Data keys, database credentials) shall live in AWS Secrets Manager. No secret shall be committed to the repository.
+**NFR-3.1** All secrets shall live in AWS-managed secret storage, never the repository: the third-party API keys (Anthropic API key, Telegram bot token, FRED/Twelve Data keys) in **SSM Parameter Store SecureString** parameters (free standard tier — chosen Step 2.12 over Secrets Manager's per-secret monthly charge for this cost-sensitive single-tenant system), and the **database credential** in **AWS Secrets Manager** (generated and managed by the Aurora cluster, used by the RDS Data API). No secret shall be committed to the repository.
 
-**NFR-3.2** The IAM execution role for the Lambda function shall follow least-privilege: `rds-data` (Data API) access to the one Aurora cluster only, read-only Secrets Manager access for the required secrets only, read-write to specific S3 prefixes only, and CloudWatch Logs write — no broader AWS access.
+**NFR-3.2** The IAM execution role for the Lambda function shall follow least-privilege: `rds-data` (Data API) access to the one Aurora cluster only (including read of its credential secret), read-only `ssm:GetParameter` on the required SSM parameters only, read-write to specific S3 prefixes only, and CloudWatch Logs write — no broader AWS access.
 
 **NFR-3.3** Aurora shall run in isolated (private) subnets with no public IP. It is reached only via the IAM-authenticated RDS Data API (HTTPS) or from within the VPC — never via a direct public database connection.
 
@@ -487,8 +487,10 @@ The build is organized into **four vertical slices**. Each slice goes through th
   with **the RDS Data API enabled** and **scale-to-zero (auto-pause)** configured
 - Enable the `pgvector` extension (via the migration, run through the Data API)
 - Define S3 bucket with versioning + lifecycle policy (Glacier after 90 days)
-- Define Secrets Manager entries (the DB cluster's managed secret, plus
-  placeholders for Anthropic / Telegram / FRED / Twelve Data — populated after deploy)
+- The DB cluster's managed Secrets Manager secret is the Data API credential.
+  (Updated Step 2.12: the third-party API keys — Anthropic / Telegram / FRED /
+  Twelve Data — moved to SSM Parameter Store SecureString, free standard tier;
+  they are created out-of-band since CloudFormation cannot create SecureString.)
 - Output: cluster ARN, Data API secret ARN, database name, S3 bucket name
 - Deploy and verify
 
@@ -514,11 +516,12 @@ The build is organized into **four vertical slices**. Each slice goes through th
   using the AWS base image / runtime interface client) pushed to **ECR**
 - Lambda runs **outside any VPC** (free internet egress to Binance/Anthropic/Telegram)
 - Least-privilege execution role (NFR-3.2): `rds-data` to the one cluster,
-  read-only Secrets Manager for the required secrets, read-write to the S3
-  prefix, CloudWatch Logs write
+  read of the Aurora DB credential secret, `ssm:GetParameter` on the required
+  SSM parameters (Step 2.12), read-write to the S3 prefix, CloudWatch Logs write
 - Inject config via environment (`PERSISTENCE_BACKEND=dataapi`, cluster ARN,
-  secret ARN, DB name, S3 bucket) — secret *values* are read from Secrets Manager
-  at runtime, not baked in
+  DB secret ARN, DB name, S3 bucket, and the SSM parameter *names*) — secret
+  *values* are read at runtime (DB secret from Secrets Manager; API keys from
+  SSM Parameter Store, Step 2.12), not baked in
 - Output: Lambda function ARN
 - Deploy and verify the function exists
 
@@ -659,8 +662,8 @@ The build is organized into **four vertical slices**. Each slice goes through th
 
 #### Step 2.12: Production secrets and operations
 
-- Populate Secrets Manager with real values: Anthropic API key, Telegram bot token, FRED API key, Twelve Data API key
-- Add CloudWatch alarms per NFR-2.2
+- Store the third-party API keys (Anthropic, Telegram, FRED, Twelve Data) as **SSM Parameter Store SecureString** parameters and populate with real values — created out-of-band (CloudFormation cannot create SecureString); the DB credential stays in Secrets Manager
+- Add CloudWatch alarms per NFR-2.2, routed to the operator's Telegram bot via SNS → a notifier Lambda
 - Test alarm firing with a deliberate failure
 - Document the operations runbook in `docs/operations.md`
 

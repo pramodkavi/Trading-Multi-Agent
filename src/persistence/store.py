@@ -41,6 +41,7 @@ from uuid import UUID, uuid4
 import asyncpg
 
 from src.common.models import (
+    ActiveSetupStatus,
     AgentRole,
     SignalDirection,
     SignalOutcome,
@@ -48,8 +49,14 @@ from src.common.models import (
     SignalStatus,
     SkipDecision,
 )
-from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
+from src.persistence.models import (
+    StoredActiveSetup,
+    StoredAgentRun,
+    StoredScanRun,
+    StoredSignal,
+)
 from src.persistence.repositories import (
+    ActiveSetupRepository,
     AgentRunRepository,
     ScanRunRepository,
     SignalRepository,
@@ -240,6 +247,27 @@ class SignalStore(Protocol):
     ) -> UUID: ...
 
     async def get_agent_run(self, run_id: UUID) -> StoredAgentRun | None: ...
+
+    async def open_active_setup(self, *, signal_id: UUID) -> UUID:
+        """Open a tracked setup for a published signal (Step 2.8). Returns its id."""
+        ...
+
+    async def list_open_active_setups(self) -> list[StoredActiveSetup]:
+        """All OPEN setups, oldest first -- the Forecaster's per-scan work queue."""
+        ...
+
+    async def get_active_setup(self, setup_id: UUID) -> StoredActiveSetup | None: ...
+
+    async def update_active_setup(
+        self,
+        *,
+        setup_id: UUID,
+        status: ActiveSetupStatus,
+        evaluation: Mapping[str, Any] | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> None:
+        """Record an evaluation + status on a setup (keeps OPEN, or closes it)."""
+        ...
 
     async def aclose(self) -> None: ...
 
@@ -711,6 +739,89 @@ class DataApiSignalStore:
         row["token_usage"] = _parse_jsonb_field(row["token_usage"])
         return StoredAgentRun.model_validate(row)
 
+    # ---- active_setups ----------------------------------------------------
+
+    async def open_active_setup(self, *, signal_id: UUID) -> UUID:
+        setup_id = uuid4()
+        await self._execute(
+            """
+            INSERT INTO active_setups (id, signal_id, status)
+            VALUES (:id::uuid, :signal_id::uuid, :status)
+            """,
+            [
+                _str_param("id", str(setup_id)),
+                _str_param("signal_id", str(signal_id)),
+                _str_param("status", ActiveSetupStatus.OPEN.value),
+            ],
+        )
+        return setup_id
+
+    def _select_active_setups(self, where: str) -> str:
+        return f"""
+            SELECT id::text AS id, signal_id::text AS signal_id,
+                   {_utc_iso("opened_at", alias="opened_at")},
+                   status,
+                   {_utc_iso("last_evaluated_at", alias="last_evaluated_at")},
+                   latest_evaluation::text AS latest_evaluation
+            FROM active_setups
+            {where}
+        """
+
+    async def list_open_active_setups(self) -> list[StoredActiveSetup]:
+        response = await self._execute(
+            self._select_active_setups("WHERE status = :status ORDER BY opened_at ASC"),
+            [_str_param("status", ActiveSetupStatus.OPEN.value)],
+            with_metadata=True,
+        )
+        return [self._row_to_active_setup(row) for row in _parse_records(response)]
+
+    async def get_active_setup(self, setup_id: UUID) -> StoredActiveSetup | None:
+        response = await self._execute(
+            self._select_active_setups("WHERE id = :id::uuid"),
+            [_str_param("id", str(setup_id))],
+            with_metadata=True,
+        )
+        rows = _parse_records(response)
+        if not rows:
+            return None
+        return self._row_to_active_setup(rows[0])
+
+    async def update_active_setup(
+        self,
+        *,
+        setup_id: UUID,
+        status: ActiveSetupStatus,
+        evaluation: Mapping[str, Any] | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> None:
+        await self._execute(
+            """
+            UPDATE active_setups
+            SET status = :status,
+                latest_evaluation = COALESCE(:latest_evaluation::jsonb, latest_evaluation),
+                last_evaluated_at = COALESCE(:evaluated_at::timestamptz, NOW())
+            WHERE id = :id::uuid
+            """,
+            [
+                _str_param("status", status.value),
+                _str_param(
+                    "latest_evaluation",
+                    _to_jsonb(dict(evaluation)) if evaluation is not None else None,
+                ),
+                _str_param(
+                    "evaluated_at",
+                    evaluated_at.isoformat() if evaluated_at is not None else None,
+                ),
+                _str_param("id", str(setup_id)),
+            ],
+        )
+
+    @staticmethod
+    def _row_to_active_setup(row: dict[str, Any]) -> StoredActiveSetup:
+        if row.get("latest_evaluation") is not None:
+            row["latest_evaluation"] = _parse_jsonb_field(row["latest_evaluation"])
+        return StoredActiveSetup.model_validate(row)
+
     # ---- lifecycle --------------------------------------------------------
 
     async def aclose(self) -> None:
@@ -747,6 +858,7 @@ class AsyncpgSignalStore:
         self._scans = ScanRunRepository(conn)
         self._signals = SignalRepository(conn)
         self._agent_runs = AgentRunRepository(conn)
+        self._active_setups = ActiveSetupRepository(conn)
 
     @classmethod
     async def connect(cls, dsn: str) -> AsyncpgSignalStore:
@@ -864,6 +976,32 @@ class AsyncpgSignalStore:
 
     async def get_agent_run(self, run_id: UUID) -> StoredAgentRun | None:
         return await self._agent_runs.get_by_id(run_id)
+
+    # ---- active_setups ----------------------------------------------------
+
+    async def open_active_setup(self, *, signal_id: UUID) -> UUID:
+        return await self._active_setups.open_setup(signal_id=signal_id)
+
+    async def list_open_active_setups(self) -> list[StoredActiveSetup]:
+        return await self._active_setups.list_open()
+
+    async def get_active_setup(self, setup_id: UUID) -> StoredActiveSetup | None:
+        return await self._active_setups.get_by_id(setup_id)
+
+    async def update_active_setup(
+        self,
+        *,
+        setup_id: UUID,
+        status: ActiveSetupStatus,
+        evaluation: Mapping[str, Any] | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> None:
+        await self._active_setups.update_status(
+            setup_id=setup_id,
+            status=status,
+            evaluation=evaluation,
+            evaluated_at=evaluated_at,
+        )
 
     # ---- lifecycle --------------------------------------------------------
 
