@@ -3,7 +3,7 @@
 Wires the full per-signal pipeline into one pass and proves the production
 stack works against real external services:
 
-    config (Step 1.11)        -> load Settings from .env / Secrets Manager
+    config (Step 1.11)        -> load Settings from .env / SSM Parameter Store
     Binance (Step 2.2)        -> fetch 4H klines for one symbol
     LangGraph (Step 2.7)      -> run the full pipeline graph:
                                  analyzer -> historian -> skeptic -> judge
@@ -70,7 +70,7 @@ from src.notifications import (
     format_skip,
 )
 from src.persistence import create_store
-from src.providers import BinanceProvider, NoMacroData, Timeframe
+from src.providers import BinanceProvider, NoMacroData, ProviderError, Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Sequence
@@ -314,7 +314,22 @@ async def run_one_symbol(
     logger.info("scan %s started for %s", ctx.scan_id, symbol)
 
     try:
-        snapshot = await provider.fetch_market_snapshot(symbol, [Timeframe.H4], limit=CANDLE_LIMIT)
+        try:
+            snapshot = await provider.fetch_market_snapshot(
+                symbol, [Timeframe.H4], limit=CANDLE_LIMIT
+            )
+        except ProviderError as exc:
+            # Emit the PROVIDER_ERROR marker the MonitoringStack metric filter
+            # counts (-> ProviderErrors metric -> provider-error alarm, NFR-2.2),
+            # then re-raise so the scan still flips to FAILED and surfaces normally.
+            logger.warning(
+                "PROVIDER_ERROR provider=%s symbol=%s error=%s: %s",
+                type(provider).__name__,
+                symbol,
+                type(exc).__name__,
+                exc,
+            )
+            raise
         logger.info("fetched %d 4H candles", len(snapshot.klines[Timeframe.H4]))
 
         state = await graph.ainvoke(_initial_state(ctx, snapshot))
@@ -491,12 +506,12 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
 
 
 def _load_settings() -> Settings:
-    """Hydrate secrets from Secrets Manager, then build the cached Settings.
+    """Hydrate secrets from SSM Parameter Store, then build the cached Settings.
 
     Order matters: ``get_settings`` is ``lru_cache``d, so the secret values must
     be in the environment before its first call -- otherwise the cache locks in
     a Settings validated against a half-empty environment. Locally this is a
-    no-op (no secret ARNs set) and Settings reads straight from ``.env``.
+    no-op (no parameter names set) and Settings reads straight from ``.env``.
     """
     hydrate_secrets_env()
     return get_settings()
@@ -506,8 +521,8 @@ def lambda_handler(event: dict[str, Any] | None, context: object) -> dict[str, A
     """AWS Lambda entry point: run the scan and return a structured result.
 
     Triggered by EventBridge Scheduler (Step 1.19). Resolves secret values from
-    Secrets Manager (the LambdaStack injects only the secret ARNs, never the
-    values), loads configuration, runs the scan for the configured symbol(s),
+    SSM Parameter Store (the ComputeStack injects only the parameter names, never
+    the values), loads configuration, runs the scan for the configured symbol(s),
     and returns a JSON-serialisable summary. ``ok`` is False if any symbol
     errored, so the invocation surfaces failures to CloudWatch without losing
     the successful scans.

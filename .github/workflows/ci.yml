@@ -40,6 +40,12 @@ jobs:
       - name: Install project + dev tools
         run: pip install -e ".[dev]"
 
+      - name: Install CDK app deps (for the infra synth tests)
+        # tests/infra/ synthesizes the CDK stacks with aws-cdk-lib (jsii -> Node,
+        # preinstalled on the runner). These deps are infra-only, kept out of
+        # pyproject; without them pytest cannot collect tests/infra.
+        run: pip install -r infrastructure/requirements.txt
+
       - name: Cache pre-commit environments
         uses: actions/cache@v4
         with:

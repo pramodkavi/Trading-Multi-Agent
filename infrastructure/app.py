@@ -57,7 +57,6 @@ compute = ComputeStack(
     env=env,
     cluster=data.cluster,
     bucket=data.bucket,
-    api_secrets=data.api_secrets,
 )
 SchedulingStack(
     app,
@@ -65,7 +64,14 @@ SchedulingStack(
     env=env,
     scan_function=compute.function,
 )
-MonitoringStack(app, "CryptoSignals-Monitoring", env=env)
+MonitoringStack(
+    app,
+    "CryptoSignals-Monitoring",
+    env=env,
+    scan_function=compute.function,
+    scan_log_group=compute.log_group,
+    cluster=data.cluster,
+)
 
 # cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a
 # stack adds a resource, any insecure default is flagged immediately.

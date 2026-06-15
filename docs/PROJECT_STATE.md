@@ -76,7 +76,7 @@ liquidity/OTE/premium-discount) is **Slice 2 Step 2.1**.
 | **DB name** | `signals` |
 | **Lambda log group** | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-YGmufZcOKKgE` |
 | **Schedule** | EventBridge Scheduler `cron(3 8 * * ? *)` Etc/UTC, **ENABLED** (London open). NY/overlap/wrap/Critic windows added in later steps. |
-| **App secrets** | `crypto-signals/anthropic-api-key` (plain key string) and `crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). |
+| **App secrets** | **Step 2.12 (code; activates on next deploy):** moved to **SSM Parameter Store SecureString** — `/crypto-signals/anthropic-api-key` (plain key string) and `/crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). Created out-of-band via `aws ssm put-parameter --type SecureString` (CFN can't create SecureString) — see `docs/operations.md §1`. Pre-2.12 these were Secrets Manager secrets (no leading slash); the 2.12 deploy removes them. The Aurora DB credential stays in Secrets Manager. |
 | **Estimated cost** | ~$5–9/month (Aurora scales to zero when idle). |
 | **CDK bootstrap** | Done in ap-south-1 (and us-east-1, now unused). |
 | **us-east-1** | All 4 app stacks **torn down** (only the harmless CDKToolkit bootstrap stack remains). |
@@ -189,7 +189,7 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 
 | Priority | Item |
 |---|---|
-| 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. After rotating, update Secrets Manager: `aws secretsmanager update-secret --secret-id crypto-signals/anthropic-api-key --secret-string '<key>'` and `... telegram-bot-token --secret-string '{"bot_token":"<t>","chat_id":"8300889332"}'`. Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. |
+| 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. As of Step 2.12 these live in **SSM Parameter Store**: `aws ssm put-parameter --overwrite --type SecureString --name /crypto-signals/anthropic-api-key --value '<key>'` and `... --name /crypto-signals/telegram-bot-token --value '{"bot_token":"<t>","chat_id":"8300889332"}'` (region ap-south-1). Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. Full procedure: `docs/operations.md §1.2`. |
 | 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. **(done for dev — OIDC live.)** |
 | 🟠 Infra/CD | **Auto-migration IAM (Slice 2):** the deploy workflows now run the DB migration before `cdk deploy` using the OIDC deploy role. That role must allow `cloudformation:DescribeStacks` (already has it), `rds-data:ExecuteStatement` on the cluster, and `secretsmanager:GetSecretValue` on the DB secret. If the role is admin-ish this is already covered; if it's scoped, attach the policy in §4 / the deploy notes or the migration step fails with `AccessDenied`. |
 | 🟡 Hardening | Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking. (The CD migration step already retries; this item is the separate runtime/scan path.) |
@@ -422,6 +422,31 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > (59 files), pytest **581 passed** (23 deselected). **Pure code — safe to merge; activates on the same
 > deploy as 2.10.** Next: **Step 2.12 (prod secrets + CloudWatch alarms + ops runbook + credential
 > rotation)**, then 2.13 (multi-symbol asyncio parallelism), 2.14 (1-week live validation).
+
+> **Step 2.12 shipped — PROD SECRETS (→ SSM) + ALARMS + OPS RUNBOOK (⚠️ REQUIRES DEPLOY + ONE MANUAL
+> SSM STEP):** Per the operator's cost decision, the third-party API keys moved off **Secrets Manager**
+> onto **SSM Parameter Store SecureString** (free standard tier vs ~$0.40/secret/mo). `infrastructure/
+> stacks/parameters.py` holds the shared names (`/crypto-signals/{anthropic-api-key,telegram-bot-token,
+> fred-api-key,twelve-data-api-key}`). `DataStack` no longer creates the API-key SM placeholders (the
+> 2.12 deploy DELETES them); the Aurora DB credential stays in SM. `ComputeStack` grants `ssm:GetParameter`
+> on the two exact param ARNs (the default `aws/ssm` KMS key needs no explicit `kms:Decrypt`) and injects
+> param *names* as env (`ANTHROPIC_PARAM_NAME`/`TELEGRAM_PARAM_NAME`); it now exposes `log_group`.
+> `src/config/secrets.py` reads SSM (`get_parameter(WithDecryption=True)`), same pure-resolve/thin-hydrate
+> shape and JSON-or-plain payload support. ⚠️ **CFN cannot create SecureString** → operator runs `aws ssm
+> put-parameter --type SecureString` once before the post-deploy scan (commands in `docs/operations.md
+> §1.1`). **Alarms (NFR-2.2):** `MonitoringStack` (was empty) now has 4 alarms — scan-failure-rate
+> (Lambda Errors/Invocations 24h), latency p95>2min (Duration), Aurora CPU>80%, and provider-errors as a
+> COUNT alarm (≥3/1h) via a Logs **metric filter** on a new `PROVIDER_ERROR` marker logged by
+> `run_scan.run_one_symbol`. All route to **Telegram**: alarm → SNS topic (enforce_ssl) → a small
+> **notifier Lambda** (`scripts/alarm_notifier.py`, reuses the scan image w/ CMD override, reads the
+> Telegram param from SSM) — no manual SNS subscription. **First infra tests:** `tests/infra/` synth-asserts
+> the stacks (jsii→Node; CI now `pip install -r infrastructure/requirements.txt`). cdk-nag clean (SNS2
+> suppressed: alarm metadata only, KMS CMK cost-prohibitive; enforce_ssl satisfies SNS3). Checkpoints
+> green: ruff, ruff format (only pre-existing test_migrate skew), mypy --strict (60 files), **pytest 600
+> passed** (23 deselected; +19: secrets rewrite, alarm_notifier, infra synth), local `cdk synth` exit 0
+> no nag findings. **Requires a deploy to take effect AND the one-time SSM put-parameter; safe to stack
+> with 2.10/2.11.** Open: rotate the exposed Anthropic+Telegram creds (now via SSM, §7 / ops §1.2). Next:
+> Step 2.13 (multi-symbol asyncio parallelism).
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 
