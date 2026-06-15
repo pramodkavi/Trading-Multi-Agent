@@ -124,14 +124,22 @@ jobs:
           # still imported, and `cdk deploy --all` updates the producer (Data)
           # BEFORE the consumer (Compute) -- so a plain `--all` fails with
           # "Export ... cannot be deleted as it is in use by CryptoSignals-Compute".
-          # Fix: if Compute already exists, update IT first (dropping the imports)
-          # so the subsequent `--all` lets Data drop the now-unused exports. The
-          # existence guard keeps a first-ever (fresh) deploy working, where Compute
-          # cannot deploy before Data exists. TRANSITIONAL: revert to a plain
-          # `cdk deploy --all` once dev is on 2.12 (a permanent Compute-first would
-          # break any FUTURE new Data->Compute cross-stack reference).
-          if aws cloudformation describe-stacks --stack-name CryptoSignals-Compute >/dev/null 2>&1; then
-            echo "::notice::CryptoSignals-Compute exists -> deploying it first to release cross-stack imports."
-            cdk deploy CryptoSignals-Compute --exclusively --require-approval never
+          # Fix: deploy Compute FIRST (dropping the imports) so the subsequent
+          # `--all` lets Data drop the now-unused exports.
+          #
+          # Run Compute-first UNCONDITIONALLY and tolerate failure: `cdk` deploys to
+          # the region PINNED in app.py (ap-south-1) no matter the CLI default
+          # region, so we must not gate on `aws cloudformation describe-stacks` --
+          # that queries the CLI default region (vars.AWS_REGION) and silently skips
+          # the step when that differs from the pinned deploy region (which is what
+          # made the first attempt at this fix a no-op). On a first-ever (fresh)
+          # deploy Compute cannot precede Data, so the command fails harmlessly and
+          # we fall through to `--all`, which creates everything.
+          # TRANSITIONAL: revert to a plain `cdk deploy --all` once dev is on 2.12
+          # (a permanent Compute-first would break a FUTURE new Data->Compute ref).
+          if cdk deploy CryptoSignals-Compute --exclusively --require-approval never; then
+            echo "::notice::Deployed CryptoSignals-Compute first; cross-stack secret imports released."
+          else
+            echo "::warning::Compute-first deploy did not succeed (fresh environment, or see the error above) -- continuing with --all."
           fi
           cdk deploy --all --require-approval never
