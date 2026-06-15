@@ -115,4 +115,23 @@ jobs:
 
       - name: Deploy all stacks
         working-directory: infrastructure
-        run: cdk deploy --all --require-approval never
+        run: |
+          set -euo pipefail
+          # One-time cross-stack export transition (Step 2.12). Step 2.12 moved the
+          # Anthropic/Telegram API keys from Secrets Manager to SSM, which removed
+          # the secret-ARN CloudFormation *exports* DataStack published and
+          # ComputeStack imported. CloudFormation cannot delete an export that is
+          # still imported, and `cdk deploy --all` updates the producer (Data)
+          # BEFORE the consumer (Compute) -- so a plain `--all` fails with
+          # "Export ... cannot be deleted as it is in use by CryptoSignals-Compute".
+          # Fix: if Compute already exists, update IT first (dropping the imports)
+          # so the subsequent `--all` lets Data drop the now-unused exports. The
+          # existence guard keeps a first-ever (fresh) deploy working, where Compute
+          # cannot deploy before Data exists. TRANSITIONAL: revert to a plain
+          # `cdk deploy --all` once dev is on 2.12 (a permanent Compute-first would
+          # break any FUTURE new Data->Compute cross-stack reference).
+          if aws cloudformation describe-stacks --stack-name CryptoSignals-Compute >/dev/null 2>&1; then
+            echo "::notice::CryptoSignals-Compute exists -> deploying it first to release cross-stack imports."
+            cdk deploy CryptoSignals-Compute --exclusively --require-approval never
+          fi
+          cdk deploy --all --require-approval never
