@@ -17,6 +17,10 @@ Public API:
     gather_risk_context  -- the single IO seam (reads the journal into RiskContext)
     to_skip_decision     -- build the forced SkipDecision for a violation
     RiskGateReport / RiskCheckResult / RiskContext -- result + input models
+
+    Step 2.13 (multi-symbol parallelism):
+    ScanReservationLedger -- per-batch in-process ledger that keeps the §1.6
+        stateful caps exact when the watchlist is scanned concurrently
 """
 
 from src.agents.orchestration.graph import (
@@ -26,6 +30,7 @@ from src.agents.orchestration.graph import (
     build_pipeline_graph,
     run_scan,
 )
+from src.agents.orchestration.reservations import ScanReservationLedger
 from src.agents.orchestration.risk_gates import (
     RiskCheckResult,
     RiskContext,
@@ -41,6 +46,7 @@ __all__ = [
     "RiskCheckResult",
     "RiskContext",
     "RiskGateReport",
+    "ScanReservationLedger",
     "analyzer_node",
     "build_graph",
     "build_pipeline_graph",

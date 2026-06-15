@@ -447,6 +447,24 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > no nag findings. **Requires a deploy to take effect AND the one-time SSM put-parameter; safe to stack
 > with 2.10/2.11.** Open: rotate the exposed Anthropic+Telegram creds (now via SSM, §7 / ops §1.2). Next:
 > Step 2.13 (multi-symbol asyncio parallelism).
+>
+> **Step 2.13 shipped — MULTI-SYMBOL PARALLELISM (§1.6 caps stay exact):** `scripts/run_scan._run_symbols`
+> now scans the whole watchlist concurrently under one `asyncio.gather` (Skeptic + Judge LLM calls overlap
+> across symbols — keeps the scan inside the NFR latency budget), each symbol behind `_scan_symbol_isolated`
+> so one failure is captured as an `error` result and can't abort the others. The headline risk: the gate
+> reads portfolio state at the *start* but reserves (`open_active_setup`) at the *end*, so concurrent
+> symbols could over-publish past a §1.6 cap by one. Closed by a new per-batch **`ScanReservationLedger`**
+> (`src/agents/orchestration/reservations.py`, in-process, `asyncio.Lock`): the risk-gate node (now takes an
+> optional `reservations=`) serialises read → evaluate → reserve and folds sibling symbols' pending publishes
+> into the counts (`augment`); `run_one_symbol` releases a reservation only if the symbol doesn't publish
+> (Judge veto / error), so the count can only ever err *strict*, never over the cap. **`AsyncpgSignalStore`
+> is now pool-aware** (`asyncpg.create_pool`, acquire-per-call) — a single connection can't serve concurrent
+> ops; the cloud Data API store is already stateless/safe. Single-symbol CLI + unit paths pass no ledger →
+> gate behaves exactly as Step 2.11. Checkpoints green: ruff, ruff format (only pre-existing test_migrate
+> skew), mypy --strict (61 files), **pytest 611 passed** (23 deselected; +11: reservation ledger arithmetic,
+> parallel-overlap proof, the cap-holds-across-simultaneous-publishes test, pool wiring). Pure-Python step —
+> **no infra/deploy change**; activates as soon as it's merged + the existing scan Lambda redeploys. Next:
+> Step 2.14 (1-week autonomous production validation) — or remaining Slice-2 hardening (Aurora resume retry).
 
 Slice 2 turns the single-agent stub into the full pipeline. Expected scope:
 

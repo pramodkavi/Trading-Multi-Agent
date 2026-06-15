@@ -1,16 +1,18 @@
 """Unit tests for AsyncpgSignalStore (the local SignalStore facade).
 
-The facade's job is narrow: own a connection's lifetime and forward each
-backend-neutral method to the matching Step 1.9 repository (renaming
-``get_by_id`` -> ``get_scan_run`` etc.). The repositories themselves are
-covered by test_repositories.py, so here we only assert the wiring: that calls
-reach the connection and that ``aclose`` closes it. A MagicMock connection
-stands in for asyncpg -- no database required.
+The facade's job is narrow: own a connection *pool*'s lifetime (Step 2.13) and
+forward each backend-neutral method to the matching Step 1.9 repository (renaming
+``get_by_id`` -> ``get_scan_run`` etc.) on a connection acquired from the pool.
+The repositories themselves are covered by test_repositories.py, so here we only
+assert the wiring: that calls reach a pooled connection and that ``aclose``
+closes the pool. A MagicMock pool + connection stand in for asyncpg -- no
+database required.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import TracebackType
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -18,18 +20,47 @@ from src.common.models import AgentRole
 from src.persistence.store import AsyncpgSignalStore
 
 
+class _AcquireCtx:
+    """Async context manager standing in for ``pool.acquire()``.
+
+    ``AsyncpgSignalStore._acquire`` does ``async with self._pool.acquire() as
+    conn``; this yields the shared mock connection so per-call assertions on it
+    still work.
+    """
+
+    def __init__(self, conn: MagicMock) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> MagicMock:
+        return self._conn
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        return False
+
+
 def _conn() -> MagicMock:
     conn = MagicMock()
     conn.execute = AsyncMock()
     conn.fetchrow = AsyncMock(return_value=None)
     conn.fetch = AsyncMock(return_value=[])
-    conn.close = AsyncMock()
     return conn
+
+
+def _pool(conn: MagicMock) -> MagicMock:
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=_AcquireCtx(conn))
+    pool.close = AsyncMock()
+    return pool
 
 
 def _store() -> tuple[AsyncpgSignalStore, MagicMock]:
     conn = _conn()
-    return AsyncpgSignalStore(conn), conn
+    return AsyncpgSignalStore(_pool(conn)), conn
 
 
 async def test_start_scan_executes_insert() -> None:
@@ -114,7 +145,9 @@ async def test_get_agent_run_returns_none_when_absent() -> None:
     conn.fetchrow.assert_awaited_once()
 
 
-async def test_aclose_closes_connection() -> None:
-    store, conn = _store()
+async def test_aclose_closes_pool() -> None:
+    conn = _conn()
+    pool = _pool(conn)
+    store = AsyncpgSignalStore(pool)
     await store.aclose()
-    conn.close.assert_awaited_once()
+    pool.close.assert_awaited_once()

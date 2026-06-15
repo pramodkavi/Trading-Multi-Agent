@@ -36,7 +36,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Protocol
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -68,7 +69,7 @@ from src.persistence.repositories import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Mapping, Sequence
+    from collections.abc import AsyncIterator, Mapping, Sequence
     from datetime import datetime
 
 # A boto3 ``rds-data`` client. botocore ships no usable static types under
@@ -884,32 +885,54 @@ class DataApiSignalStore:
 
 
 class AsyncpgSignalStore:
-    """``SignalStore`` backed by a single asyncpg connection (local dev / tests).
+    """``SignalStore`` backed by an asyncpg connection **pool** (local dev / tests).
 
-    Thin facade over the Step 1.9 repositories: it owns the connection's
-    lifetime (``aclose`` closes it) and forwards each call to the matching
-    repository method. The only adaptation is naming -- the repositories expose
+    Thin facade over the Step 1.9 repositories: it owns the pool's lifetime
+    (``aclose`` closes it) and forwards each call to the matching repository
+    method. The only adaptation is naming -- the repositories expose
     ``get_by_id`` / ``list_recent`` / ``log_run``; the store renames them to the
     backend-neutral ``get_scan_run`` / ``get_signal`` / ``list_recent_signals``
     / ``log_agent_run`` so both backends present one identical surface.
 
-    Scope (Slice 1): one connection, no pool. The pool-aware variant arrives in
-    Slice 2 Step 2.13 with multi-symbol parallelism; the ``SignalStore``
-    interface stays the same, so callers are unaffected.
+    Why a pool (Step 2.13): multi-symbol scans run the per-symbol pipelines
+    concurrently (``scripts.run_scan._run_symbols``), and a *single* asyncpg
+    connection cannot serve concurrent operations -- it raises "another operation
+    is in progress". Each method therefore acquires a fresh connection from the
+    pool for the duration of the call, so concurrent symbol tasks never share a
+    connection. The cloud runtime uses the stateless Data API backend instead;
+    this pool path is the local-dev / integration one.
     """
 
-    def __init__(self, conn: asyncpg.Connection[Any]) -> None:
-        self._conn = conn
-        self._scans = ScanRunRepository(conn)
-        self._signals = SignalRepository(conn)
-        self._agent_runs = AgentRunRepository(conn)
-        self._active_setups = ActiveSetupRepository(conn)
+    def __init__(self, pool: asyncpg.Pool[Any]) -> None:
+        self._pool = pool
 
     @classmethod
-    async def connect(cls, dsn: str) -> AsyncpgSignalStore:
-        """Open a connection to ``dsn`` and wrap it in a store."""
-        conn: asyncpg.Connection[Any] = await asyncpg.connect(dsn)
-        return cls(conn)
+    async def connect(
+        cls, dsn: str, *, min_size: int = 1, max_size: int = 10
+    ) -> AsyncpgSignalStore:
+        """Open a connection pool to ``dsn`` and wrap it in a store.
+
+        ``max_size`` (default 10) comfortably covers the 4-symbol watchlist run
+        concurrently -- each symbol's pipeline holds at most one connection at a
+        time (acquire-per-call), with headroom for the gate + historian overlap.
+        ``min_size`` defaults to 1 so a test / single scan does not eagerly open
+        ten sockets.
+        """
+        pool: asyncpg.Pool[Any] = await asyncpg.create_pool(
+            dsn, min_size=min_size, max_size=max_size
+        )
+        return cls(pool)
+
+    @asynccontextmanager
+    async def _acquire(self) -> AsyncIterator[asyncpg.Connection[Any]]:
+        """Yield a pooled connection for one operation, then return it to the pool.
+
+        ``pool.acquire()`` yields a ``PoolConnectionProxy`` that forwards every
+        ``Connection`` method; the cast tells the type checker so (the proxy is
+        not a ``Connection`` subclass in the stubs).
+        """
+        async with self._pool.acquire() as conn:
+            yield cast("asyncpg.Connection[Any]", conn)
 
     # ---- scan_runs --------------------------------------------------------
 
@@ -922,39 +945,46 @@ class AsyncpgSignalStore:
         strategy: str | None = None,
         symbols: list[str] | None = None,
     ) -> None:
-        await self._scans.start_scan(
-            scan_id=scan_id,
-            started_at=started_at,
-            session=session,
-            strategy=strategy,
-            symbols=symbols,
-        )
+        async with self._acquire() as conn:
+            await ScanRunRepository(conn).start_scan(
+                scan_id=scan_id,
+                started_at=started_at,
+                session=session,
+                strategy=strategy,
+                symbols=symbols,
+            )
 
     async def complete_scan(self, *, scan_id: UUID, completed_at: datetime) -> None:
-        await self._scans.complete_scan(scan_id=scan_id, completed_at=completed_at)
+        async with self._acquire() as conn:
+            await ScanRunRepository(conn).complete_scan(scan_id=scan_id, completed_at=completed_at)
 
     async def fail_scan(self, *, scan_id: UUID, completed_at: datetime, error_message: str) -> None:
-        await self._scans.fail_scan(
-            scan_id=scan_id,
-            completed_at=completed_at,
-            error_message=error_message,
-        )
+        async with self._acquire() as conn:
+            await ScanRunRepository(conn).fail_scan(
+                scan_id=scan_id,
+                completed_at=completed_at,
+                error_message=error_message,
+            )
 
     async def get_scan_run(self, scan_id: UUID) -> StoredScanRun | None:
-        return await self._scans.get_by_id(scan_id)
+        async with self._acquire() as conn:
+            return await ScanRunRepository(conn).get_by_id(scan_id)
 
     # ---- signals ----------------------------------------------------------
 
     async def create_signal(self, payload: SignalProposal | SkipDecision) -> UUID:
-        return await self._signals.create_signal(payload)
+        async with self._acquire() as conn:
+            return await SignalRepository(conn).create_signal(payload)
 
     async def get_signal(self, signal_id: UUID) -> StoredSignal | None:
-        return await self._signals.get_by_id(signal_id)
+        async with self._acquire() as conn:
+            return await SignalRepository(conn).get_by_id(signal_id)
 
     async def list_recent_signals(
         self, *, limit: int = 50, symbol: str | None = None
     ) -> list[StoredSignal]:
-        return await self._signals.list_recent(limit=limit, symbol=symbol)
+        async with self._acquire() as conn:
+            return await SignalRepository(conn).list_recent(limit=limit, symbol=symbol)
 
     async def set_signal_outcome(
         self,
@@ -963,11 +993,12 @@ class AsyncpgSignalStore:
         outcome: SignalOutcome,
         outcome_metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        await self._signals.set_outcome(
-            signal_id=signal_id,
-            outcome=outcome,
-            outcome_metadata=outcome_metadata,
-        )
+        async with self._acquire() as conn:
+            await SignalRepository(conn).set_outcome(
+                signal_id=signal_id,
+                outcome=outcome,
+                outcome_metadata=outcome_metadata,
+            )
 
     async def find_similar_signals(
         self,
@@ -981,16 +1012,17 @@ class AsyncpgSignalStore:
         tag_pool: int = 50,
         exclude_signal_id: UUID | None = None,
     ) -> list[StoredSignal]:
-        return await self._signals.find_similar(
-            direction=direction,
-            session=session,
-            primary_poi_type=primary_poi_type,
-            query_tags=query_tags,
-            l2_features=l2_features,
-            limit=limit,
-            tag_pool=tag_pool,
-            exclude_signal_id=exclude_signal_id,
-        )
+        async with self._acquire() as conn:
+            return await SignalRepository(conn).find_similar(
+                direction=direction,
+                session=session,
+                primary_poi_type=primary_poi_type,
+                query_tags=query_tags,
+                l2_features=l2_features,
+                limit=limit,
+                tag_pool=tag_pool,
+                exclude_signal_id=exclude_signal_id,
+            )
 
     # ---- agent_runs -------------------------------------------------------
 
@@ -1007,31 +1039,36 @@ class AsyncpgSignalStore:
         cost_usd: float | None = None,
         created_at: datetime | None = None,
     ) -> UUID:
-        return await self._agent_runs.log_run(
-            scan_id=scan_id,
-            agent_role=agent_role,
-            strategy=strategy,
-            input_hash=input_hash,
-            output=output,
-            latency_ms=latency_ms,
-            token_usage=token_usage,
-            cost_usd=cost_usd,
-            created_at=created_at,
-        )
+        async with self._acquire() as conn:
+            return await AgentRunRepository(conn).log_run(
+                scan_id=scan_id,
+                agent_role=agent_role,
+                strategy=strategy,
+                input_hash=input_hash,
+                output=output,
+                latency_ms=latency_ms,
+                token_usage=token_usage,
+                cost_usd=cost_usd,
+                created_at=created_at,
+            )
 
     async def get_agent_run(self, run_id: UUID) -> StoredAgentRun | None:
-        return await self._agent_runs.get_by_id(run_id)
+        async with self._acquire() as conn:
+            return await AgentRunRepository(conn).get_by_id(run_id)
 
     # ---- active_setups ----------------------------------------------------
 
     async def open_active_setup(self, *, signal_id: UUID) -> UUID:
-        return await self._active_setups.open_setup(signal_id=signal_id)
+        async with self._acquire() as conn:
+            return await ActiveSetupRepository(conn).open_setup(signal_id=signal_id)
 
     async def list_open_active_setups(self) -> list[StoredActiveSetup]:
-        return await self._active_setups.list_open()
+        async with self._acquire() as conn:
+            return await ActiveSetupRepository(conn).list_open()
 
     async def get_active_setup(self, setup_id: UUID) -> StoredActiveSetup | None:
-        return await self._active_setups.get_by_id(setup_id)
+        async with self._acquire() as conn:
+            return await ActiveSetupRepository(conn).get_by_id(setup_id)
 
     async def update_active_setup(
         self,
@@ -1041,15 +1078,16 @@ class AsyncpgSignalStore:
         evaluation: Mapping[str, Any] | None = None,
         evaluated_at: datetime | None = None,
     ) -> None:
-        await self._active_setups.update_status(
-            setup_id=setup_id,
-            status=status,
-            evaluation=evaluation,
-            evaluated_at=evaluated_at,
-        )
+        async with self._acquire() as conn:
+            await ActiveSetupRepository(conn).update_status(
+                setup_id=setup_id,
+                status=status,
+                evaluation=evaluation,
+                evaluated_at=evaluated_at,
+            )
 
     # ---- lifecycle --------------------------------------------------------
 
     async def aclose(self) -> None:
-        """Close the underlying connection."""
-        await self._conn.close()
+        """Close the underlying connection pool (releases every connection)."""
+        await self._pool.close()
