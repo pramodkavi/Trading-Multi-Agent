@@ -35,10 +35,12 @@ Why the Data API surface looks the way it does
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid4
 
 import asyncpg
+from botocore.exceptions import ClientError
 
 from src.common.models import (
     ActiveSetupStatus,
@@ -73,6 +75,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 # --strict, so it is opaque here; the store's only contact surface is
 # ``execute_statement`` (see the pyproject mypy override for boto3).
 RdsDataClient = Any
+
+logger = logging.getLogger(__name__)
+
+# Aurora Serverless v2 scale-to-zero (min 0 ACU auto-pause, SPEC §2.2): the first
+# RDS Data API call after the cluster idles raises DatabaseResumingException while
+# it wakes (~20-30s). Without a retry the scheduled scan dies on its very first DB
+# call (start_scan) every time -- the failure mode seen in production. Retry the
+# transient resume error with linear backoff so a scan rides out the wake; the CD
+# migration step retries for the same reason. Worst-case wait
+# (5+10+15+20+25 = 75s) is well under the 10-minute Lambda timeout. Only the Data
+# API backend needs this -- local asyncpg / Docker Postgres never auto-pauses.
+_RESUME_RETRY_CODES: frozenset[str] = frozenset({"DatabaseResumingException"})
+_RESUME_MAX_ATTEMPTS: int = 6
+_RESUME_BACKOFF_SECONDS: float = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +348,14 @@ class DataApiSignalStore:
         *,
         with_metadata: bool = False,
     ) -> dict[str, Any]:
-        """Run one statement off the event loop (boto3 is synchronous)."""
+        """Run one statement off the event loop (boto3 is synchronous).
+
+        Retries ``DatabaseResumingException`` -- Aurora Serverless v2 waking from
+        its scale-to-zero auto-pause -- with linear backoff, so a scan that lands
+        on a paused cluster rides out the ~20-30s resume instead of failing on its
+        first DB call. Any other error (including a non-resume ``ClientError``)
+        propagates immediately.
+        """
 
         def _call() -> dict[str, Any]:
             result: dict[str, Any] = self._client.execute_statement(
@@ -345,7 +368,25 @@ class DataApiSignalStore:
             )
             return result
 
-        return await asyncio.to_thread(_call)
+        for attempt in range(1, _RESUME_MAX_ATTEMPTS + 1):
+            try:
+                return await asyncio.to_thread(_call)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code not in _RESUME_RETRY_CODES or attempt == _RESUME_MAX_ATTEMPTS:
+                    raise
+                delay = _RESUME_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "Aurora resuming (%s); retry %d/%d in %.0fs",
+                    code,
+                    attempt,
+                    _RESUME_MAX_ATTEMPTS,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        # The loop returns on success or re-raises on the final attempt; this line
+        # is unreachable but satisfies the type checker's return-path analysis.
+        raise AssertionError("unreachable: _execute retry loop exited")  # pragma: no cover
 
     # ---- scan_runs --------------------------------------------------------
 

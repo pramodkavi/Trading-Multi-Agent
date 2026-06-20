@@ -21,7 +21,9 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from botocore.exceptions import ClientError
 
+import src.persistence.store as store_module
 from src.common.models import (
     AgentRole,
     SignalDirection,
@@ -571,6 +573,79 @@ def test_parse_records_zips_columns_to_values() -> None:
 
 def test_parse_records_empty() -> None:
     assert _parse_records(response(["a"])) == []
+
+
+# ---------------------------------------------------------------------------
+# Aurora resume retry (_execute) — scale-to-zero wake-up handling
+# ---------------------------------------------------------------------------
+
+
+def _client_error(code: str) -> ClientError:
+    return ClientError(
+        {"Error": {"Code": code, "Message": f"{code} (simulated)"}},
+        "ExecuteStatement",
+    )
+
+
+class FlakyRdsDataClient:
+    """Raises ``error`` for the first ``fail_times`` calls, then returns a response."""
+
+    def __init__(
+        self, *, error: Exception, fail_times: int, response: dict[str, Any] | None = None
+    ) -> None:
+        self._error = error
+        self._fail_times = fail_times
+        self._response = response if response is not None else {}
+        self.calls = 0
+
+    def execute_statement(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise self._error
+        return self._response
+
+
+def _flaky_store(client: FlakyRdsDataClient) -> DataApiSignalStore:
+    return DataApiSignalStore(
+        client=client,
+        cluster_arn=CLUSTER_ARN,
+        secret_arn=SECRET_ARN,
+        database=DATABASE,
+    )
+
+
+async def test_execute_retries_db_resuming_then_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No real sleeping: collapse the backoff to 0 so the retries run instantly.
+    monkeypatch.setattr(store_module, "_RESUME_BACKOFF_SECONDS", 0.0)
+    client = FlakyRdsDataClient(error=_client_error("DatabaseResumingException"), fail_times=2)
+    store = _flaky_store(client)
+
+    # start_scan succeeds despite two "resuming" rejections (Aurora woke up).
+    await store.start_scan(scan_id=uuid4(), started_at=datetime(2026, 6, 1, 8, tzinfo=UTC))
+
+    assert client.calls == 3  # 2 resuming failures + 1 success
+
+
+async def test_execute_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(store_module, "_RESUME_BACKOFF_SECONDS", 0.0)
+    client = FlakyRdsDataClient(error=_client_error("DatabaseResumingException"), fail_times=999)
+    store = _flaky_store(client)
+
+    with pytest.raises(ClientError):
+        await store.start_scan(scan_id=uuid4(), started_at=datetime(2026, 6, 1, 8, tzinfo=UTC))
+
+    assert client.calls == store_module._RESUME_MAX_ATTEMPTS
+
+
+async def test_execute_does_not_retry_other_client_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(store_module, "_RESUME_BACKOFF_SECONDS", 0.0)
+    client = FlakyRdsDataClient(error=_client_error("BadRequestException"), fail_times=999)
+    store = _flaky_store(client)
+
+    with pytest.raises(ClientError):
+        await store.start_scan(scan_id=uuid4(), started_at=datetime(2026, 6, 1, 8, tzinfo=UTC))
+
+    assert client.calls == 1  # non-resume error raises immediately, no retry
 
 
 # ---------------------------------------------------------------------------

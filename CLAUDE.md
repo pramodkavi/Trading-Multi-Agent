@@ -106,7 +106,7 @@ Minutes are `:03` deliberately — avoids clock-jitter on `:00`.
 - **Slice 3 (Weeks 8-11):** Strategy registry + embeddings + Critic with PR opening.
 - **Slice 4 (Weeks 12-15):** FastAPI + React dashboard, Cognito auth, WebSocket real-time.
 
-**Open action items** (detail in `docs/PROJECT_STATE.md §7`): rotate the Anthropic + Telegram credentials (exposed in chat); set the git remote + configure CD secrets/vars/environments (region = ap-south-1); add an Aurora-resume retry in `DataApiSignalStore._execute`.
+**Open action items** (detail in `docs/PROJECT_STATE.md §7`): rotate the Anthropic + Telegram credentials (exposed in chat); set the git remote + configure CD secrets/vars/environments (region = ap-south-1). *(Resolved: the Aurora-resume retry in `DataApiSignalStore._execute` — shipped on `fix/aurora-resume-retry`.)*
 
 ## 8. Things NOT to Build (Hard Scope Boundaries)
 

@@ -119,7 +119,7 @@ ignore_missing_imports = true
 # than pulling in the heavy boto3-stubs (which are themselves strict and would
 # add more friction than they remove at this scale).
 [[tool.mypy.overrides]]
-module = ["boto3"]
+module = ["boto3", "botocore.*"]
 ignore_missing_imports = true
 
 # langfuse is an optional extra (the `tracing` group) -- not installed in CI or
