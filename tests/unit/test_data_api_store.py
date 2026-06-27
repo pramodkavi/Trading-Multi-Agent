@@ -152,8 +152,9 @@ async def test_start_scan_builds_typed_parameters() -> None:
     call = client.calls[0]
     assert "INSERT INTO scan_runs" in call["sql"]
     # RDS Data API rejects array parameters, so symbols go in as a comma-joined
-    # string and string_to_array() reconstructs the text[] server-side.
-    assert "string_to_array" in call["sql"]
+    # string and string_to_array() reconstructs the text[] server-side. The
+    # ::text cast pins the param type so a NULL symbols value still type-checks.
+    assert "string_to_array(:symbols::text" in call["sql"]
     params = params_by_name(call)
     assert params["id"] == {"stringValue": str(scan_id)}
     assert params["started_at"] == {"stringValue": started.isoformat()}
@@ -307,7 +308,7 @@ async def test_create_signal_binds_tags_and_features() -> None:
 
     call = client.calls[0]
     # tags use the comma-string + string_to_array workaround (Data API rejects arrays).
-    assert "string_to_array" in call["sql"]
+    assert "string_to_array(:tags::text" in call["sql"]
     params = params_by_name(call)
     assert params["tags"] == {"stringValue": "bullish-ob,liquidity-sweep"}
     assert json.loads(params["features"]["stringValue"]) == {"score": 3}
@@ -319,8 +320,12 @@ async def test_create_signal_skip_has_empty_tags() -> None:
 
     await store.create_signal(skip)
 
-    # A skip has no tags -> NULL param -> server-side '{}'::text[].
-    params = params_by_name(client.calls[0])
+    # A skip has no tags -> NULL param -> server-side '{}'::text[]. The :tags::text
+    # cast is what lets that typeless NULL be accepted (else 42P18 "could not
+    # determine data type of parameter"); this is the regression guard for that bug.
+    call = client.calls[0]
+    assert "string_to_array(:tags::text" in call["sql"]
+    params = params_by_name(call)
     assert params["tags"] == {"isNull": True}
 
 

@@ -409,8 +409,8 @@ class DataApiSignalStore:
                 (id, started_at, status, session, strategy, symbols)
             VALUES
                 (:id::uuid, :started_at::timestamptz, :status, :session,
-                 :strategy, CASE WHEN :symbols IS NOT NULL
-                              THEN string_to_array(:symbols, ',')
+                 :strategy, CASE WHEN :symbols::text IS NOT NULL
+                              THEN string_to_array(:symbols::text, ',')
                               ELSE NULL
                            END)
             """,
@@ -494,6 +494,10 @@ class DataApiSignalStore:
         # comma-joined string and is rebuilt server-side with string_to_array --
         # the same workaround scan_runs.symbols uses. Tags are kebab-case and
         # never contain commas, so the join is unambiguous. None -> empty array.
+        # The :tags::text cast in the SQL is REQUIRED: a skip sends tags as a
+        # typeless NULL, and inside string_to_array()/IS NOT NULL Postgres has no
+        # column context to infer the type, so an uncast NULL fails with
+        # "could not determine data type of parameter $N" (42P18).
         tags_str = ",".join(tags) if tags else None
 
         await self._execute(
@@ -503,8 +507,8 @@ class DataApiSignalStore:
             VALUES
                 (:id::uuid, :scan_id::uuid, :symbol, :strategy, :direction,
                  :status, :payload::jsonb,
-                 CASE WHEN :tags IS NOT NULL
-                      THEN string_to_array(:tags, ',')
+                 CASE WHEN :tags::text IS NOT NULL
+                      THEN string_to_array(:tags::text, ',')
                       ELSE '{}'::text[]
                  END,
                  :features::jsonb)
@@ -645,7 +649,7 @@ class DataApiSignalStore:
         params.append(_str_param("qtags", ",".join(query_tags) if query_tags else None))
         overlap_expr = (
             "COALESCE(cardinality(ARRAY(SELECT unnest(s.tags) "
-            "INTERSECT SELECT unnest(string_to_array(:qtags, ',')))), 0)"
+            "INTERSECT SELECT unnest(string_to_array(:qtags::text, ',')))), 0)"
         )
 
         # --- stage 3: L2 distance over the numeric feature vector ---

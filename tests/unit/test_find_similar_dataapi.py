@@ -91,8 +91,9 @@ async def test_find_similar_builds_three_stage_sql() -> None:
     assert "s.direction = :direction" in sql
     assert "r.session = :session" in sql
     assert "s.features->>'primary_poi_type' = :primary_poi_type" in sql
-    # Stage 2: tag overlap via array operators
-    assert "INTERSECT SELECT unnest(string_to_array(:qtags, ','))" in sql
+    # Stage 2: tag overlap via array operators. The ::text cast pins the param
+    # type so empty query_tags (sent as a typeless NULL) still type-checks (42P18).
+    assert "INTERSECT SELECT unnest(string_to_array(:qtags::text, ','))" in sql
     assert "AS tag_overlap" in sql
     # Stage 3: L2 distance via sqrt/power over the numeric vector
     assert "sqrt(" in sql
