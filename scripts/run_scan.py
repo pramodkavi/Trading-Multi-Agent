@@ -19,6 +19,15 @@ Pipeline placement:
     symbols. A SkipDecision short-circuits the conditional edge, so skips cost
     no LLM calls (see src/agents/orchestration/graph.py).
 
+Parallelism (Step 2.13):
+    The Lambda path (`_run_symbols`) scans the whole watchlist concurrently with
+    asyncio.gather, so the Skeptic + Judge LLM calls overlap across symbols and
+    one symbol failing is isolated to its own result entry. A shared
+    ScanReservationLedger keeps the §1.6 stateful caps (max concurrent / daily
+    cap / correlated exposure) exact when several symbols publish in one scan.
+    The local asyncpg store pools connections so concurrent symbols never share
+    one; the cloud Data API store is already stateless and concurrency-safe.
+
 Telegram trigger:
     A message is sent on every outcome (published signal, analyzer skip, or a
     Judge veto) so the operator always sees the end-to-end result. The message
@@ -53,7 +62,7 @@ from anthropic import AsyncAnthropic
 from src.agents.forecaster import Forecaster
 from src.agents.historian import HistorianRepository
 from src.agents.judge import Judge
-from src.agents.orchestration import build_pipeline_graph
+from src.agents.orchestration import ScanReservationLedger, build_pipeline_graph
 from src.agents.skeptic import Skeptic, SkepticObjection, build_macro_providers
 from src.common.models import (
     AgentRole,
@@ -106,6 +115,7 @@ def build_pipeline(
     settings: Settings,
     store: SignalStore,
     client: AsyncAnthropic,
+    reservations: ScanReservationLedger | None = None,
 ) -> tuple[Any, list[DataProvider]]:
     """Construct the compiled pipeline graph and the macro providers it owns.
 
@@ -113,6 +123,10 @@ def build_pipeline(
     graph plus the Skeptic's macro providers so the caller can ``aclose`` them
     (they each hold an httpx client). With no FRED / Twelve Data keys configured
     the provider list is empty and the Skeptic degrades to NoMacroData (FR-4.3).
+
+    ``reservations`` (Step 2.13) is the per-batch ledger that keeps the §1.6
+    stateful caps exact across the concurrently-scanned watchlist; ``None`` (the
+    single-symbol CLI path) leaves the risk gate behaving as in Step 2.11.
     """
     macro_providers = build_macro_providers(settings)
     graph = build_pipeline_graph(
@@ -120,6 +134,7 @@ def build_pipeline(
         historian=HistorianRepository(store),
         skeptic=Skeptic(macro_providers, client=client),
         judge=Judge(client=client),
+        reservations=reservations,
     )
     return graph, macro_providers
 
@@ -283,6 +298,18 @@ def compose_message(state: AgentState) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _published(state: AgentState) -> bool:
+    """True when the scan ended in a published signal (mirrors ``_persist``).
+
+    Must match the condition under which ``_persist`` opens an active setup, so a
+    Step-2.13 reservation is released exactly when the symbol did NOT publish.
+    """
+    return (
+        isinstance(state.get("proposal"), SignalProposal)
+        and state.get("decision") in _PUBLISH_RULINGS
+    )
+
+
 async def run_one_symbol(
     *,
     symbol: str,
@@ -290,6 +317,7 @@ async def run_one_symbol(
     store: SignalStore,
     graph: Any,
     notifier: Notifier | None,
+    reservations: ScanReservationLedger | None = None,
 ) -> ScanContext:
     """Run one full scan for one symbol through the pipeline; returns its ScanContext.
 
@@ -298,6 +326,12 @@ async def run_one_symbol(
     the caller surfaces a non-zero exit. The compiled ``graph`` (built once by
     the caller) holds the Historian / Skeptic / Judge; persistence reaches the
     backend-neutral ``SignalStore`` (Step 1.17) the graph's Historian also uses.
+
+    ``reservations`` (Step 2.13): when the watchlist is scanned in parallel the
+    risk gate reserves a §1.6 slot for a proposal that clears the stateful caps.
+    If this symbol does not end up publishing (a Judge veto) or the scan fails,
+    we release that reservation so it does not wrongly block a sibling symbol. A
+    publish keeps the reservation — its active_setups row now reflects it.
     """
     ctx = ScanContext(
         session=ScanSession.AD_HOC,
@@ -340,6 +374,12 @@ async def run_one_symbol(
         await _persist(store=store, ctx=ctx, symbol=symbol, state=state)
         logger.info("persisted signal + reasoning chain for scan %s", ctx.scan_id)
 
+        # Step 2.13: a reservation that did not become a published setup (the gate
+        # reserved a slot but the Judge vetoed) must be released so it stops
+        # counting against sibling symbols' gates. Idempotent if nothing reserved.
+        if reservations is not None and not _published(state):
+            await reservations.release(ctx.scan_id)
+
         if notifier is not None:
             await notifier.send(compose_message(state))
             logger.info("telegram message sent")
@@ -348,6 +388,9 @@ async def run_one_symbol(
         logger.info("scan %s completed", ctx.scan_id)
     except Exception as exc:
         logger.exception("scan %s failed", ctx.scan_id)
+        if reservations is not None:
+            # The scan failed -> it cannot publish, so free any reserved slot.
+            await reservations.release(ctx.scan_id)
         await store.fail_scan(
             scan_id=ctx.scan_id,
             completed_at=_utcnow(),
@@ -367,26 +410,72 @@ def _utcnow() -> datetime:
 # ---------------------------------------------------------------------------
 
 
+async def _scan_symbol_isolated(
+    *,
+    symbol: str,
+    provider: DataProvider,
+    store: SignalStore,
+    graph: Any,
+    notifier: Notifier | None,
+    reservations: ScanReservationLedger,
+) -> dict[str, Any]:
+    """Run one symbol and convert its outcome into a result entry, never raising.
+
+    The per-symbol error isolation seam (Step 2.13): a failure here is captured
+    in this symbol's result dict and returned, so ``asyncio.gather`` over the
+    watchlist never sees an exception and one symbol failing cannot abort the
+    others (``run_one_symbol`` has already flipped that scan's row to FAILED and
+    released its reservation before re-raising).
+    """
+    try:
+        ctx = await run_one_symbol(
+            symbol=symbol,
+            provider=provider,
+            store=store,
+            graph=graph,
+            notifier=notifier,
+            reservations=reservations,
+        )
+        return {"symbol": symbol, "scan_id": str(ctx.scan_id), "status": "ok"}
+    except Exception as exc:
+        logger.exception("lambda scan failed for %s", symbol)
+        return {"symbol": symbol, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
 async def _run_symbols(
     *,
     settings: Settings,
     symbols: list[str],
     notify: bool,
 ) -> list[dict[str, Any]]:
-    """Run a scan for each symbol, sharing one store / provider / pipeline / notifier.
+    """Scan the watchlist **in parallel**, sharing one store / provider / pipeline.
 
-    Each symbol is independent: a failure on one is captured in its result entry
-    and does not abort the others (``run_one_symbol`` has already flipped that
-    scan's row to FAILED before re-raising). The store backend is chosen by
-    ``settings.persistence_backend`` -- ``dataapi`` in the Lambda. The pipeline
-    graph + Anthropic client are built once and reused across symbols.
+    Step 2.13: the per-symbol pipelines run concurrently via ``asyncio.gather``
+    (the expensive Skeptic + Judge LLM calls overlap across symbols), each behind
+    the ``_scan_symbol_isolated`` error boundary so one symbol's failure cannot
+    abort the others. ``gather`` preserves input order, so the returned results
+    line up with ``symbols``.
+
+    A single :class:`ScanReservationLedger` is shared across the batch so the
+    §1.6 stateful caps (max concurrent, daily cap, correlated exposure) stay
+    exact even when several symbols publish in the same scan: the risk gate
+    serialises its read → evaluate → reserve under the ledger lock and counts
+    sibling symbols' pending publishes.
+
+    The store backend is chosen by ``settings.persistence_backend`` -- the cloud
+    ``dataapi`` store is stateless and concurrency-safe; the local ``asyncpg``
+    store pools connections (Step 2.13) so concurrent symbols never share one.
+    The pipeline graph + Anthropic client are built once and reused.
     """
     store = await create_store(settings)
     results: list[dict[str, Any]] = []
     try:
         provider = BinanceProvider()
         client = AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
-        graph, macro_providers = build_pipeline(settings=settings, store=store, client=client)
+        reservations = ScanReservationLedger()
+        graph, macro_providers = build_pipeline(
+            settings=settings, store=store, client=client, reservations=reservations
+        )
         notifier: Notifier | None = (
             TelegramNotifier(
                 token=settings.telegram_bot_token.get_secret_value(),
@@ -396,26 +485,21 @@ async def _run_symbols(
             else None
         )
         try:
-            for symbol in symbols:
-                try:
-                    ctx = await run_one_symbol(
-                        symbol=symbol,
-                        provider=provider,
-                        store=store,
-                        graph=graph,
-                        notifier=notifier,
+            results = list(
+                await asyncio.gather(
+                    *(
+                        _scan_symbol_isolated(
+                            symbol=symbol,
+                            provider=provider,
+                            store=store,
+                            graph=graph,
+                            notifier=notifier,
+                            reservations=reservations,
+                        )
+                        for symbol in symbols
                     )
-                    results.append({"symbol": symbol, "scan_id": str(ctx.scan_id), "status": "ok"})
-                except Exception as exc:
-                    # Report this symbol's failure and keep scanning the rest.
-                    logger.exception("lambda scan failed for %s", symbol)
-                    results.append(
-                        {
-                            "symbol": symbol,
-                            "status": "error",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
+                )
+            )
         finally:
             await provider.aclose()
             for macro_provider in macro_providers:

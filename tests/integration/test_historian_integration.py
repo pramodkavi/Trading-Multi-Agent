@@ -55,8 +55,8 @@ def _reset_database(url: str) -> None:
 async def store() -> AsyncpgSignalStore:  # type: ignore[misc]
     url = _require_database_url()
     _reset_database(url)
-    connection = await asyncpg.connect(url)
-    backend = AsyncpgSignalStore(connection)
+    pool = await asyncpg.create_pool(url, min_size=1, max_size=4)
+    backend = AsyncpgSignalStore(pool)
     # Seed a populated journal (50 synthetic signals with outcomes).
     await seed(backend, build_synthetic_signals(50))
     try:

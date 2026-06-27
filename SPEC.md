@@ -669,8 +669,10 @@ The build is organized into **four vertical slices**. Each slice goes through th
 
 #### Step 2.13: Multi-symbol parallelization
 
-- Update scan runner to process watchlist in parallel using asyncio
-- Add per-symbol error isolation (one symbol failing doesn't crash the scan)
+- Update scan runner to process watchlist in parallel using asyncio (`_run_symbols` runs the per-symbol pipelines under one `asyncio.gather`; the Skeptic + Judge LLM calls overlap across symbols)
+- Add per-symbol error isolation (one symbol failing doesn't crash the scan) — each symbol runs behind an error boundary that converts a failure into an `error` result entry; `run_one_symbol` still flips that scan row to FAILED
+- **§1.6 stateful caps stay exact under concurrency.** The risk gate reads portfolio state at the *start* of a symbol's pipeline but the reservation (`open_active_setup`) lands at the *end*, so concurrent symbols could otherwise both clear `max-concurrent` / `daily-cap` / `correlated-exposure` on the same stale counts and over-publish by one. A per-batch `ScanReservationLedger` (in-process, `asyncio.Lock`-guarded) closes the window: the gate serialises its read → evaluate → reserve and counts sibling symbols' pending publishes (`augment`). A reservation is released only if the symbol does not publish (Judge veto / error); a published reservation is held for the batch, so the count can only ever err *strict*, never over the cap.
+- **Connection pooling.** `AsyncpgSignalStore` (local dev / integration) now owns an asyncpg connection *pool* and acquires a fresh connection per call — a single connection cannot serve concurrent operations. The cloud Data API store is stateless and already concurrency-safe.
 - Test with the full watchlist: BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT
 
 #### Step 2.14: Full pipeline production validation

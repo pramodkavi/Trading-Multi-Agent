@@ -9,6 +9,7 @@ invoking scripts/run_scan.py.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -27,7 +28,7 @@ from scripts.run_scan import (
 from src.agents.forecaster import ForecasterUpdate
 from src.agents.historian import HistorianReport, HistorianRepository
 from src.agents.judge import Judge, JudgeDecision
-from src.agents.orchestration import build_pipeline_graph
+from src.agents.orchestration import ScanReservationLedger, build_pipeline_graph
 from src.agents.skeptic import Skeptic, SkepticObjection
 from src.common.models import (
     ForecastStatus,
@@ -163,6 +164,18 @@ def _client(responses: list[Any]) -> MagicMock:
     return client
 
 
+def _const_client(response: Any) -> MagicMock:
+    """A client that returns ``response`` for every call (no list to exhaust).
+
+    Used by the parallel-scan tests where a single shared graph may serve any
+    number of symbols that reach the Skeptic/Judge.
+    """
+    client = MagicMock()
+    client.messages = MagicMock()
+    client.messages.create = AsyncMock(return_value=response)
+    return client
+
+
 _OBJECTION_PAYLOAD: dict[str, Any] = {
     "severity": "LOW",
     "recommends_against": False,
@@ -186,6 +199,7 @@ def _pipeline_graph(
     judge_client: MagicMock,
     *,
     store: _FakeHistorianStore | None = None,
+    reservations: ScanReservationLedger | None = None,
 ) -> Any:
     fake_store = store or _FakeHistorianStore()
     return build_pipeline_graph(
@@ -193,6 +207,7 @@ def _pipeline_graph(
         historian=HistorianRepository(fake_store),
         skeptic=Skeptic([_FakeMacroProvider()], client=skeptic_client),
         judge=Judge(client=judge_client),
+        reservations=reservations,
     )
 
 
@@ -609,6 +624,33 @@ class TestLambdaHandler:
         deps["store"].aclose.assert_awaited_once()
         deps["client"].close.assert_awaited_once()
 
+    async def test_symbols_scanned_concurrently(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Prove the watchlist runs in parallel (Step 2.13), not a sequential loop:
+        # each call records how many siblings are in flight; with asyncio.gather
+        # all four overlap so the peak is 4. A sequential loop would peak at 1.
+        in_flight = 0
+        peak = 0
+
+        async def _run(**kwargs: Any) -> SimpleNamespace:
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            for _ in range(3):
+                await asyncio.sleep(0)  # yield so the siblings can enter
+            in_flight -= 1
+            return SimpleNamespace(scan_id=uuid4())
+
+        run = AsyncMock(side_effect=_run)
+        self._patch(monkeypatch, run=run)
+
+        result = await _alambda(
+            {"symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]}, _settings()
+        )
+
+        assert result["ok"] is True
+        assert run.await_count == 4
+        assert peak == 4  # all four pipelines were in flight at once
+
     async def test_event_single_symbol(self, monkeypatch: pytest.MonkeyPatch) -> None:
         run = self._ok_run()
         self._patch(monkeypatch, run=run)
@@ -759,3 +801,85 @@ class TestLoadSettings:
 
         assert result is settings
         assert order == ["hydrate", "get_settings"]
+
+
+# ---------------------------------------------------------------------------
+# Step 2.13 — the reservation ledger keeps §1.6 caps exact in parallel
+# ---------------------------------------------------------------------------
+
+
+class TestParallelScanReservations:
+    """The headline Step 2.13 correctness property: a shared ledger prevents
+    simultaneous publishes from breaching a §1.6 stateful hard cap.
+    """
+
+    async def test_concurrent_cap_enforced_across_simultaneous_publishes(self) -> None:
+        symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
+        # Two setups already open -> the max-concurrent cap (3) allows exactly one
+        # more. Without the ledger, all four gates would read "2 open" off the same
+        # stale snapshot and publish, opening four setups (a hard-rule violation).
+        gate_store = _FakeHistorianStore(
+            open_setups=[SimpleNamespace(signal_id=uuid4()) for _ in range(2)]
+        )
+        ledger = ScanReservationLedger()
+        graph = _pipeline_graph(
+            _const_client(_tool_response(_OBJECTION_PAYLOAD, tool_name="emit_objection")),
+            _const_client(_tool_response(_ruling_payload("PUBLISH"), tool_name="emit_ruling")),
+            store=gate_store,
+            reservations=ledger,
+        )
+        store = _store()
+        notifier = _notifier()
+
+        await asyncio.gather(
+            *(
+                run_one_symbol(
+                    symbol=s,
+                    provider=_provider(_snapshot(_bullish_series(), symbol=s)),
+                    store=store,
+                    graph=graph,
+                    notifier=notifier,
+                    reservations=ledger,
+                )
+                for s in symbols
+            )
+        )
+
+        # Exactly one symbol published (one active setup opened); the other three
+        # were force-skipped at the concurrent cap, never four.
+        assert store.open_active_setup.await_count == 1
+        assert store.create_signal.await_count == 4
+        skips = [
+            call.args[0]
+            for call in store.create_signal.call_args_list
+            if isinstance(call.args[0], SkipDecision)
+        ]
+        assert len(skips) == 3
+        assert all(s.violated_rule == "RULE_4_MAX_CONCURRENT" for s in skips)
+        # The publisher's reservation is retained for the batch; the three skips
+        # never reserved, so exactly one reservation remains.
+        assert ledger.pending_count() == 1
+
+    async def test_vetoed_symbol_releases_its_reservation(self) -> None:
+        # A symbol that clears the gate but is then vetoed by the Judge must free
+        # its reserved slot so it does not wrongly block siblings.
+        ledger = ScanReservationLedger()
+        graph = _pipeline_graph(
+            _const_client(_tool_response(_OBJECTION_PAYLOAD, tool_name="emit_objection")),
+            _const_client(_tool_response(_ruling_payload("SKIP"), tool_name="emit_ruling")),
+            reservations=ledger,
+        )
+        store = _store()
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_bullish_series())),
+            store=store,
+            graph=graph,
+            notifier=None,
+            reservations=ledger,
+        )
+
+        # The Judge vetoed -> no setup opened and the reservation was released.
+        store.open_active_setup.assert_not_awaited()
+        assert ledger.pending_count() == 0

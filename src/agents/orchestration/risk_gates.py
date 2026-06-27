@@ -53,6 +53,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Awaitable, Callable, Sequence
 
     from src.agents.orchestration.graph import AgentState
+    from src.agents.orchestration.reservations import ScanReservationLedger
     from src.common.models import ScanContext
     from src.persistence import SignalStore, StoredSignal
     from src.providers import MarketSnapshot
@@ -638,6 +639,7 @@ def make_risk_gate_node(
     store: SignalStore,
     *,
     clock: Callable[[], datetime] | None = None,
+    reservations: ScanReservationLedger | None = None,
 ) -> Callable[[AgentState], Awaitable[AgentState]]:
     """Build the risk-gate node bound to ``store`` (SPEC §4 Step 2.11).
 
@@ -649,6 +651,15 @@ def make_risk_gate_node(
     proposal untouched and records the report.
 
     ``clock`` is injectable so tests can pin "now" for the loss-streak window.
+
+    ``reservations`` (Step 2.13) keeps the stateful caps exact under parallel
+    multi-symbol scans. When supplied, the read → evaluate → reserve sequence runs
+    inside the ledger's lock and the DB-derived counts are augmented with pending
+    reservations from sibling symbols, so two concurrent gates can never both
+    clear a cap on the same stale snapshot. A passing proposal reserves a slot the
+    scan runner releases iff the symbol ends up not publishing. When ``None`` (the
+    single-symbol CLI path and the unit tests) the gate behaves exactly as in
+    Step 2.11 — no lock, no reservation.
     """
     now_fn: Callable[[], datetime] = clock if clock is not None else _default_now
 
@@ -657,8 +668,27 @@ def make_risk_gate_node(
         if not isinstance(proposal, SignalProposal):
             return {}  # defensive: routing prevents this; nothing to gate
 
-        context = await gather_risk_context(store=store, snapshot=state["snapshot"], now=now_fn())
-        report = evaluate_risk_gates(proposal, state["scan_context"], context)
+        scan_context = state["scan_context"]
+        snapshot = state["snapshot"]
+
+        if reservations is None:
+            context = await gather_risk_context(store=store, snapshot=snapshot, now=now_fn())
+            report = evaluate_risk_gates(proposal, scan_context, context)
+        else:
+            # Serialize read → evaluate → reserve so concurrent symbols cannot both
+            # clear a stateful cap on the same stale counts (Step 2.13). A passing
+            # proposal reserves a pending slot the next gate counts via augment().
+            async with reservations.lock:
+                db_context = await gather_risk_context(store=store, snapshot=snapshot, now=now_fn())
+                context = reservations.augment(db_context)
+                report = evaluate_risk_gates(proposal, scan_context, context)
+                if report.passed:
+                    reservations.reserve(
+                        scan_id=scan_context.scan_id,
+                        symbol=proposal.symbol,
+                        direction=proposal.direction,
+                    )
+
         if report.passed:
             return {"risk_gate_report": report}
 

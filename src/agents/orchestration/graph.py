@@ -52,6 +52,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
     from src.agents.historian import HistorianRepository
     from src.agents.judge import Judge
+    from src.agents.orchestration.reservations import ScanReservationLedger
     from src.agents.skeptic import Skeptic
     from src.persistence import SignalStore
 
@@ -202,6 +203,7 @@ def build_pipeline_graph(
     judge: Judge,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
     tracer: Callable[[str, Any], Any] = trace_node,
+    reservations: ScanReservationLedger | None = None,
 ) -> Any:
     """Compile the full per-signal pipeline.
 
@@ -228,6 +230,12 @@ def build_pipeline_graph(
         tracer: wraps each node for observability; defaults to the env-gated
             Langfuse ``trace_node`` (a transparent no-op until LANGFUSE_* is set).
             Injectable so tests can assert every node is wrapped.
+        reservations: optional per-batch :class:`ScanReservationLedger` (Step
+            2.13). When supplied, the risk-gate node serialises its read →
+            evaluate → reserve under the ledger's lock and counts sibling symbols'
+            pending publishes, keeping the §1.6 stateful caps exact across the
+            concurrent watchlist. ``None`` (single-symbol / tests) leaves the gate
+            behaving exactly as in Step 2.11.
 
     Returned graph is typed ``Any`` for the same reason as ``build_graph``: the
     CompiledStateGraph generics differ between local mypy and the pre-commit
@@ -235,7 +243,7 @@ def build_pipeline_graph(
     """
     nodes: dict[str, Callable[[AgentState], Awaitable[AgentState]]] = {
         "analyzer": analyzer_node,
-        "risk_gate": make_risk_gate_node(store),
+        "risk_gate": make_risk_gate_node(store, reservations=reservations),
         "historian": make_historian_node(historian),
         "skeptic": make_skeptic_node(skeptic),
         "judge": make_judge_node(judge),
