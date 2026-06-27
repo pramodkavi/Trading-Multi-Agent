@@ -111,6 +111,13 @@ class BinanceProvider(DataProvider):
         await self._client.close()
         if self._session is not None and not self._session.closed:
             await self._session.close()
+        # ccxt's Exchange.__del__ logs "requires to release all resources with an
+        # explicit call to the .close() coroutine" whenever exchange.session is not
+        # None at garbage-collection -- even after close(), because close() does not
+        # null the reference and we assigned our own session. On Lambda the GC runs
+        # at container freeze, so that (benign) warning fired on every scan. Null the
+        # reference now that we are done with the client to keep the logs clean.
+        self._client.session = None
 
     async def fetch_market_snapshot(
         self,

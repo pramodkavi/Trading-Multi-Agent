@@ -6,7 +6,7 @@
 > **not** cloned, so everything durable has been written here instead. Read this file
 > first; it points to everything else.
 >
-> **Last updated:** 2026-06-12 (end of Slice 1).
+> **Last updated:** 2026-06-27 (Slice 2 build complete through Step 2.13; live-verified).
 > **Authority order:** `SPEC.md` (authoritative spec) → `CLAUDE.md` (index/rules) → this file (current state).
 
 ---
@@ -38,25 +38,41 @@ UTC cron (crypto never closes). Full detail in `SPEC.md`; quick index in `CLAUDE
 
 ---
 
-## 2. Current status — **Slice 1 COMPLETE and deployed LIVE**
+## 2. Current status — **Slice 2 build COMPLETE through Step 2.13, deployed & live-verified**
 
-All 22 steps of Slice 1 (1.1 → 1.22) are done, committed to `main`, and the system is
-**running in production** in AWS. End-to-end verified: a manual Lambda invoke returned
-`{"ok": true}` for all 4 watchlist symbols, signals persisted to Aurora, and **Telegram
-messages were delivered to the user's phone (confirmed 2026-06-12).**
+Slice 1 (1.1 → 1.22) and Slice 2 build steps **2.1 → 2.13** are done, on `main`, and
+**running in production** (ap-south-1). **Live-verified 2026-06-27:** a manual scan returned
+`{"ok": true}` for all 4 watchlist symbols **scanned in parallel**, signals persisted to
+Aurora, and Telegram delivered. (Slice-1 Telegram first confirmed 2026-06-12.)
 
-What works end-to-end:
+What runs end-to-end now:
 ```
-EventBridge Scheduler (08:03 UTC daily)
-  → Lambda (container image, ap-south-1)
-    → Binance market data (CCXT)
-    → SMC Analyzer (Slice-1 stub: HTF swing-pivot bias → stub proposal | skip)
-    → Aurora (RDS Data API): scan_runs / signals / agent_runs
-    → Telegram notification (on BOTH publish and skip)
+EventBridge Scheduler (08:03 / 13:03 / 15:03 / 22:03 UTC)
+  → Lambda (container, ap-south-1) — scans the watchlist IN PARALLEL (Step 2.13)
+    → Binance market data (ccxt)
+    → full SMC Analyzer (2.1) → §1.6 risk gates (2.11) → Historian (2.4b)
+      → Skeptic (2.5) → Judge (2.6)          [LangGraph pipeline, 2.7]
+    → Aurora (RDS Data API): scan_runs / signals / agent_runs / active_setups
+    → Telegram notification (publish / caveat / skip / veto)
+  + Forecaster pass (2.9 / scheduled 2.10) re-evaluates open setups
 ```
 
-The Slice-1 analyzer is a **stub** (HTF bias only). The full SMC analyzer (BOS/CHoCH/FVG/OB/
-liquidity/OTE/premium-discount) is **Slice 2 Step 2.1**.
+The Slice-1 stub analyzer is **gone** — Step 2.1 replaced it with the full SMC protocol
+(BOS/CHoCH/FVG/OB/liquidity/OTE/premium-discount).
+
+**Five production fixes landed during the 2.12 → live bring-up (2026-06-16 … 27)**, all on
+`main`: (1) deploy ordering for cross-stack export removal; (2) region-agnostic Compute-first
+deploy; (3) Aurora scale-to-zero **resume retry** in `DataApiSignalStore._execute`; (4) a
+`{"mode":"migrate"}` Lambda escape hatch — the CD pre-deploy migration **silently skips**
+because the OIDC deploy role can't `describe-stacks`, so apply schema this way after a deploy
+that adds tables/columns (`docs/operations.md §2.1`); (5) `::text` casts on Data API
+`string_to_array` params (NULL type inference, 42P18). Known-benign leftover: cold-start
+`INIT_REPORT … Status: timeout` (suppressed-init; non-fatal).
+
+**Next: Step 2.14** — let it run on the crons ~1 week and review signals (observation, no code).
+**Open follow-up (AWS-side, not in repo):** grant the OIDC deploy role `cloudformation:DescribeStacks`
++ `rds-data:ExecuteStatement` + `secretsmanager:GetSecretValue` so the CD migration stops
+skipping (then `{"mode":"migrate"}` is no longer needed). See §7.
 
 ---
 

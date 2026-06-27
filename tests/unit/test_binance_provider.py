@@ -355,6 +355,9 @@ class TestLifecycle:
         mock_client = provider._client
         await provider.aclose()
         mock_client.close.assert_awaited_once()  # type: ignore[union-attr]
+        # The ccxt session reference is nulled so Exchange.__del__ does not log its
+        # "release all resources" warning at GC (Lambda container freeze).
+        assert provider._client.session is None
 
     async def test_async_context_manager_closes_on_exit(self) -> None:
         mock_client = MagicMock()
