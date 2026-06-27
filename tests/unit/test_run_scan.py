@@ -689,6 +689,49 @@ class TestLambdaHandler:
         provider.aclose.assert_awaited_once()
         notifier.aclose.assert_awaited_once()
 
+    async def test_migrate_mode_applies_schema(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # {"mode": "migrate"} wakes the cluster via a retried read, then applies
+        # schema.sql through the Data API using the Lambda's own role.
+        store = MagicMock()
+        store.get_scan_run = AsyncMock(return_value=None)
+        store.aclose = AsyncMock()
+        migrate = MagicMock(return_value=12)
+        monkeypatch.setattr(run_scan_module, "create_store", AsyncMock(return_value=store))
+        monkeypatch.setattr(run_scan_module, "run_data_api_migration", migrate)
+
+        settings = Settings(
+            anthropic_api_key="sk-ant-test",
+            telegram_bot_token="123:ABC",
+            telegram_chat_id="111",
+            persistence_backend="dataapi",
+            db_cluster_arn="arn:aws:rds:ap-south-1:1:cluster:c",
+            db_secret_arn="arn:aws:secretsmanager:ap-south-1:1:secret:s",
+            db_name="signals",
+            _env_file=None,
+        )
+
+        result = await _alambda({"mode": "migrate"}, settings)
+
+        assert result == {"ok": True, "mode": "migrate", "statements": 12}
+        store.get_scan_run.assert_awaited_once()  # the wake read
+        store.aclose.assert_awaited_once()
+        migrate.assert_called_once_with(
+            cluster_arn="arn:aws:rds:ap-south-1:1:cluster:c",
+            secret_arn="arn:aws:secretsmanager:ap-south-1:1:secret:s",
+            database="signals",
+        )
+
+    async def test_migrate_mode_requires_arns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Without the cluster/secret ARNs (asyncpg backend) migrate must error
+        # rather than silently no-op.
+        migrate = MagicMock(return_value=0)
+        monkeypatch.setattr(run_scan_module, "run_data_api_migration", migrate)
+
+        with pytest.raises(RuntimeError, match="db_cluster_arn"):
+            await _alambda({"mode": "migrate"}, _settings())
+
+        migrate.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # _load_settings — secret hydration ordering

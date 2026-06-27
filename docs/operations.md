@@ -116,6 +116,32 @@ First-time-on-this-account only: `cdk bootstrap` (already done for ap-south-1).
 > If switching off Secrets Manager for the first time, **create the SSM
 > parameters (§1.1) before the deploy** so the post-deploy scan can read them.
 
+### 2.1 Database schema migration
+
+The CD deploy workflow runs `scripts/migrate.py` (the idempotent `schema.sql`,
+all `CREATE/ALTER ... IF NOT EXISTS`) over the Data API **before** `cdk deploy`.
+That step is gated by `aws cloudformation describe-stacks` using the OIDC deploy
+role; if the role can't make that call directly it **silently skips** (logging
+"skipping — first deploy?"), so schema changes never reach the live DB and scans
+then fail with `relation "active_setups" does not exist` /
+`column "tags" ... does not exist`.
+
+Escape hatch (no AWS CLI needed) — apply the schema with the **Lambda's own
+role**, which has Data API + DB-secret access:
+
+```jsonc
+// Lambda console → Test → invoke the scan function with:
+{ "mode": "migrate" }
+// -> {"ok": true, "mode": "migrate", "statements": N}
+```
+
+It wakes Aurora through the retried read path first, then applies every
+statement; idempotent, so it's safe to run anytime the schema looks behind. Run
+it once after any deploy that adds tables/columns until the CD step's IAM is
+fixed (give the deploy role `cloudformation:DescribeStacks`,
+`rds-data:ExecuteStatement` on the cluster, and `secretsmanager:GetSecretValue`
+on the DB secret — see PROJECT_STATE §7).
+
 ---
 
 ## 3. Alarms (NFR-2.2)
