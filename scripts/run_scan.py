@@ -46,6 +46,7 @@ import logging
 import sys
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from anthropic import AsyncAnthropic
 
@@ -69,7 +70,7 @@ from src.notifications import (
     format_new_signal,
     format_skip,
 )
-from src.persistence import create_store
+from src.persistence import create_store, run_data_api_migration
 from src.providers import BinanceProvider, NoMacroData, ProviderError, Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -467,6 +468,44 @@ async def _run_forecaster(*, settings: Settings, notify: bool) -> dict[str, Any]
     return {"ok": True, "mode": "forecaster", "evaluated": len(updates), "by_status": by_status}
 
 
+async def _run_migration(settings: Settings) -> dict[str, Any]:
+    """Apply the idempotent schema to Aurora via the Data API ({"mode": "migrate"}).
+
+    A manual escape hatch for when the CD pre-deploy migration step did not run
+    (e.g. the OIDC deploy role can't reach CloudFormation / the Data API, so the
+    step's describe-stacks guard skips it). The Lambda's OWN execution role has
+    rds-data access to the cluster plus the DB secret (``grant_data_api_access``),
+    so it can apply ``schema.sql`` itself. Idempotent -- the schema is all
+    ``CREATE/ALTER ... IF NOT EXISTS``, so re-running is safe.
+
+    Requires the dataapi backend (cluster + secret ARNs). We first issue one
+    retried no-op read through the store so Aurora's scale-to-zero resume is
+    ridden out by ``_execute``'s retry, then apply the (un-retried) migration
+    statements against the now-awake cluster.
+    """
+    if settings.db_cluster_arn is None or settings.db_secret_arn is None:
+        raise RuntimeError(
+            "mode=migrate requires the dataapi backend (db_cluster_arn + db_secret_arn)"
+        )
+
+    # Wake the cluster through the retried Data API path (get_scan_run is a
+    # harmless SELECT) so the migration statements don't hit DatabaseResumingException.
+    store = await create_store(settings)
+    try:
+        await store.get_scan_run(uuid4())
+    finally:
+        await store.aclose()
+
+    count = await asyncio.to_thread(
+        run_data_api_migration,
+        cluster_arn=settings.db_cluster_arn,
+        secret_arn=settings.db_secret_arn,
+        database=settings.db_name,
+    )
+    logger.info("schema migration applied: %d statement(s)", count)
+    return {"ok": True, "mode": "migrate", "statements": count}
+
+
 def _symbols_from_event(event: dict[str, Any], settings: Settings) -> list[str]:
     """Resolve the symbols to scan: event override, else the watchlist.
 
@@ -497,6 +536,11 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
     if payload.get("mode") == "forecaster":
         return await _run_forecaster(settings=settings, notify=notify)
 
+    # Manual escape hatch: {"mode": "migrate"} applies the DB schema via the Data
+    # API using the Lambda's own role (for when the CD migration step skipped).
+    if payload.get("mode") == "migrate":
+        return await _run_migration(settings)
+
     symbols = _symbols_from_event(payload, settings)
     logger.info("lambda scan starting for %s (notify=%s)", symbols, notify)
 
@@ -526,6 +570,11 @@ def lambda_handler(event: dict[str, Any] | None, context: object) -> dict[str, A
     and returns a JSON-serialisable summary. ``ok`` is False if any symbol
     errored, so the invocation surfaces failures to CloudWatch without losing
     the successful scans.
+
+    Event ``mode`` selects the entry point: ``"forecaster"`` re-evaluates open
+    setups; ``"migrate"`` applies the DB schema via the Data API (manual escape
+    hatch, see ``_run_migration``); absent/any other value runs the per-signal
+    scan over the event's symbols (or the watchlist).
     """
     return asyncio.run(_alambda(event, _load_settings()))
 
