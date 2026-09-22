@@ -12,6 +12,7 @@ in tests/integration/test_binance_integration.py (opt-in, skipped in CI).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,6 +21,7 @@ import pytest
 
 from src.providers import (
     BinanceProvider,
+    ProviderError,
     ProviderInvalidResponseError,
     ProviderRateLimitError,
     ProviderTimeoutError,
@@ -62,6 +64,19 @@ def _make_provider(
     mock_client.close = AsyncMock()
     provider = BinanceProvider(client=mock_client)
     return provider, mock_client.fetch_ohlcv
+
+
+def _provider_with_ohlcv(*, side_effect: Any) -> tuple[BinanceProvider, MagicMock]:
+    """Construct a BinanceProvider whose ccxt ``fetch_ohlcv`` follows ``side_effect``.
+
+    Unlike ``_make_provider`` this returns the whole mock exchange so paging tests
+    can inspect every ``fetch_ohlcv`` call (``since``/``limit`` per page).
+    """
+    exchange = MagicMock()
+    exchange.fetch_ohlcv = AsyncMock(side_effect=side_effect)
+    exchange.close = AsyncMock()
+    provider = BinanceProvider(client=exchange)
+    return provider, exchange
 
 
 # ---------------------------------------------------------------------------
@@ -366,3 +381,135 @@ class TestLifecycle:
         async with BinanceProvider(client=mock_client) as provider:
             await provider.fetch_market_snapshot("BTCUSDT", [Timeframe.H4])
         mock_client.close.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Historical candle paging (Critic v0, Task 4)
+# ---------------------------------------------------------------------------
+
+
+class TestFetchKlines:
+    def _rows(self, start_ms: int, n: int, step_ms: int = 300_000) -> list[list[float]]:
+        return [[start_ms + i * step_ms, 100.0, 101.0, 99.0, 100.5, 1.0] for i in range(n)]
+
+    async def test_pages_until_end_and_filters_window(self) -> None:
+        start = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=5 * 1500)
+        start_ms = int(start.timestamp() * 1000)
+        page1 = self._rows(start_ms, 1000)
+        page2 = self._rows(start_ms + 1000 * 300_000, 1000)  # overshoots end
+        provider, exchange = _provider_with_ohlcv(side_effect=[page1, page2])
+        klines = await provider.fetch_klines("BTCUSDT", Timeframe.M5, start=start, end=end)
+        assert len(klines) == 1500
+        assert klines[0].open_time == start
+        assert klines[-1].open_time < end
+        assert exchange.fetch_ohlcv.await_count == 2
+        first_call = exchange.fetch_ohlcv.await_args_list[0]
+        assert first_call.args == ("BTCUSDT", "5m")
+        assert first_call.kwargs["since"] == start_ms
+        second_call = exchange.fetch_ohlcv.await_args_list[1]
+        assert second_call.kwargs["since"] == start_ms + 1000 * 300_000
+        assert second_call.kwargs["limit"] == 1000
+
+    async def test_result_is_ascending_without_duplicates(self) -> None:
+        start = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        end = start + timedelta(minutes=5 * 1200)
+        start_ms = int(start.timestamp() * 1000)
+        page1 = self._rows(start_ms, 1000)
+        page2 = self._rows(start_ms + 1000 * 300_000, 1000)
+        provider, _ = _provider_with_ohlcv(side_effect=[page1, page2])
+        klines = await provider.fetch_klines("BTCUSDT", Timeframe.M5, start=start, end=end)
+        assert len(klines) == 1200
+        times = [k.open_time for k in klines]
+        assert times == sorted(times)
+        assert len(set(times)) == len(times)
+
+    async def test_stops_on_short_page(self) -> None:
+        start = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        end = start + timedelta(days=30)
+        rows = self._rows(int(start.timestamp() * 1000), 10)
+        provider, exchange = _provider_with_ohlcv(side_effect=[rows])
+        klines = await provider.fetch_klines("BTCUSDT", Timeframe.M5, start=start, end=end)
+        assert len(klines) == 10
+        assert exchange.fetch_ohlcv.await_count == 1
+
+    async def test_stops_on_empty_page(self) -> None:
+        start = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        end = start + timedelta(days=30)
+        provider, exchange = _provider_with_ohlcv(side_effect=[[]])
+        klines = await provider.fetch_klines("BTCUSDT", Timeframe.M5, start=start, end=end)
+        assert klines == []
+        assert exchange.fetch_ohlcv.await_count == 1
+
+    async def test_drops_candles_before_start(self) -> None:
+        # Binance may return the candle *containing* ``since`` when it is not
+        # aligned to the timeframe grid; anything before ``start`` is dropped.
+        start = datetime(2026, 7, 1, 0, 2, tzinfo=UTC)  # not on the 5m grid
+        end = start + timedelta(minutes=20)
+        grid_ms = int(datetime(2026, 7, 1, 0, 0, tzinfo=UTC).timestamp() * 1000)
+        rows = self._rows(grid_ms, 6)  # 00:00 .. 00:25
+        provider, _ = _provider_with_ohlcv(side_effect=[rows])
+        klines = await provider.fetch_klines("BTCUSDT", Timeframe.M5, start=start, end=end)
+        assert [k.open_time.minute for k in klines] == [5, 10, 15, 20]
+
+    async def test_uses_timeframe_step_for_paging(self) -> None:
+        start = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        end = start + timedelta(hours=1500)
+        start_ms = int(start.timestamp() * 1000)
+        page1 = self._rows(start_ms, 1000, step_ms=3_600_000)
+        page2 = self._rows(start_ms + 1000 * 3_600_000, 500, step_ms=3_600_000)
+        provider, exchange = _provider_with_ohlcv(side_effect=[page1, page2])
+        klines = await provider.fetch_klines("BTCUSDT", Timeframe.H1, start=start, end=end)
+        assert len(klines) == 1500
+        assert exchange.fetch_ohlcv.await_args_list[0].args == ("BTCUSDT", "1h")
+        second_call = exchange.fetch_ohlcv.await_args_list[1]
+        assert second_call.kwargs["since"] == start_ms + 1000 * 3_600_000
+
+    async def test_meters_page_weight_on_rate_limiter(self) -> None:
+        bucket = MagicMock()
+        bucket.acquire = AsyncMock()
+        exchange = MagicMock()
+        start = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        exchange.fetch_ohlcv = AsyncMock(return_value=self._rows(int(start.timestamp() * 1000), 3))
+        exchange.close = AsyncMock()
+        provider = BinanceProvider(client=exchange, rate_limiter=bucket)
+        await provider.fetch_klines(
+            "BTCUSDT", Timeframe.M5, start=start, end=start + timedelta(hours=1)
+        )
+        # A 1000-candle page costs Binance kline weight 5.
+        bucket.acquire.assert_awaited_once_with(5)
+
+    async def test_rejects_inverted_window(self) -> None:
+        provider, exchange = _provider_with_ohlcv(side_effect=[[]])
+        t = datetime(2026, 7, 1, tzinfo=UTC)
+        with pytest.raises(ValueError):
+            await provider.fetch_klines("BTCUSDT", Timeframe.M5, start=t, end=t)
+        with pytest.raises(ValueError):
+            await provider.fetch_klines(
+                "BTCUSDT", Timeframe.M5, start=t, end=t - timedelta(minutes=5)
+            )
+        exchange.fetch_ohlcv.assert_not_awaited()
+
+    async def test_translates_ccxt_errors(self) -> None:
+        provider, _ = _provider_with_ohlcv(side_effect=ccxt.NetworkError("down"))
+        t = datetime(2026, 7, 1, tzinfo=UTC)
+        with pytest.raises(ProviderError):
+            await provider.fetch_klines(
+                "BTCUSDT", Timeframe.M5, start=t, end=t + timedelta(hours=1)
+            )
+
+    async def test_translates_rate_limit_error_specifically(self) -> None:
+        provider, _ = _provider_with_ohlcv(side_effect=ccxt.RateLimitExceeded("slow down"))
+        t = datetime(2026, 7, 1, tzinfo=UTC)
+        with pytest.raises(ProviderRateLimitError):
+            await provider.fetch_klines(
+                "BTCUSDT", Timeframe.M5, start=t, end=t + timedelta(hours=1)
+            )
+
+    async def test_malformed_row_raises_invalid_response(self) -> None:
+        provider, _ = _provider_with_ohlcv(side_effect=[[[1, 2, 3]]])
+        t = datetime(2026, 7, 1, tzinfo=UTC)
+        with pytest.raises(ProviderInvalidResponseError):
+            await provider.fetch_klines(
+                "BTCUSDT", Timeframe.M5, start=t, end=t + timedelta(hours=1)
+            )

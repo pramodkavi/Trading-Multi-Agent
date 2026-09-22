@@ -310,9 +310,11 @@ class DataProvider(ABC):
     orchestrator may hold several providers and route by source type rather
     than relying on a single God-provider.
 
-    Slice 1 only defines `fetch_market_snapshot`; macro methods are added in
-    Step 2.3 when the Skeptic ships. Designing the abstract surface now keeps
-    consumer code stable.
+    Abstract surface: `fetch_market_snapshot` (Slice 1) and `fetch_klines`
+    (Slice 2 Step 2.14, Critic v0 outcome replay). `fetch_macro_context`
+    (Step 2.3) has a default that raises, so market-only providers need not
+    override it. Designing the abstract surface up front keeps consumer code
+    stable.
     """
 
     name: str  # concrete subclasses must set this; used in error messages and traces
@@ -343,6 +345,41 @@ class DataProvider(ABC):
             ProviderRateLimitError: caller has hit the venue's rate limit.
             ProviderTimeoutError: request did not complete in time.
             ProviderInvalidResponseError: response did not parse to a MarketSnapshot.
+        """
+
+    @abstractmethod
+    async def fetch_klines(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[Kline]:
+        """Historical candles with ``start <= open_time < end``, ascending.
+
+        Used by the Critic's OutcomeResolver to replay a decision against what
+        the market did afterwards. Unlike `fetch_market_snapshot` (most-recent N
+        candles) this fetches an explicit time window and pages through the
+        venue's per-request limit as needed.
+
+        Args:
+            symbol: market symbol in venue-native format (e.g., 'BTCUSDT').
+            timeframe: candle timeframe to fetch.
+            start: inclusive lower bound on candle open time (timezone-aware UTC).
+            end: exclusive upper bound on candle open time (timezone-aware UTC).
+
+        Returns:
+            Candles sorted ascending by open_time with no duplicates. May be
+            empty if the venue has no data in the window. Providers that do not
+            serve candles (macro providers) raise ProviderError.
+
+        Raises:
+            ValueError: when ``end <= start``.
+            ProviderUnavailableError: venue unreachable or returned 5xx.
+            ProviderRateLimitError: caller has hit the venue's rate limit.
+            ProviderTimeoutError: request did not complete in time.
+            ProviderInvalidResponseError: response did not parse to Kline rows.
         """
 
     async def fetch_macro_context(self) -> MacroContext | NoMacroData:

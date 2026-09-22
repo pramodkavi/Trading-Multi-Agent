@@ -48,6 +48,20 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 _FUNDING_WEIGHT: Final[int] = 1
 _OPEN_INTEREST_WEIGHT: Final[int] = 1
 
+# Candle duration per timeframe in milliseconds. Used by `fetch_klines` to
+# advance the paging cursor to the open of the candle after the last one
+# received, so consecutive pages never overlap or skip a candle.
+_TIMEFRAME_MS: Final[dict[Timeframe, int]] = {
+    Timeframe.D1: 86_400_000,
+    Timeframe.H4: 14_400_000,
+    Timeframe.H1: 3_600_000,
+    Timeframe.M15: 900_000,
+    Timeframe.M5: 300_000,
+}
+# Binance Futures /klines caps a single request at 1500 candles; 1000 is the
+# largest page that still costs weight 5 (see `_klines_weight`).
+_PAGE_LIMIT: Final[int] = 1000
+
 
 class BinanceProvider(DataProvider):
     """Concrete DataProvider for Binance USDT-M Futures klines.
@@ -169,6 +183,49 @@ class BinanceProvider(DataProvider):
             raise ProviderInvalidResponseError(
                 f"MarketSnapshot validation failed: {exc}", provider=self.name
             ) from exc
+
+    async def fetch_klines(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[Kline]:
+        """Page through Binance /klines to cover ``[start, end)`` (Critic v0).
+
+        Each page asks for `_PAGE_LIMIT` candles from ``since`` and costs the
+        matching kline weight against the rate limiter. The cursor advances to
+        the open of the candle after the last one received. Paging stops on an
+        empty page, a page shorter than requested (venue ran out of history), or
+        once the next candle would open at or after ``end``. Candles outside the
+        window are dropped — Binance returns the candle *containing* ``since``
+        when it is not aligned to the timeframe grid, and the last page usually
+        overshoots ``end``.
+        """
+        if end <= start:
+            raise ValueError(f"end must be after start (got {start} .. {end})")
+        step_ms = _TIMEFRAME_MS[timeframe]
+        since = int(start.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+        out: list[Kline] = []
+        while since < end_ms:
+            await self._bucket.acquire(self._klines_weight(_PAGE_LIMIT))
+            try:
+                raw = await self._client.fetch_ohlcv(
+                    symbol, timeframe.value, since=since, limit=_PAGE_LIMIT
+                )
+            except ccxt.BaseError as exc:
+                raise self._translate_ccxt_error(exc) from exc
+            page = self._normalize_ohlcv(raw, timeframe=timeframe)
+            if not page:
+                break
+            out.extend(k for k in page if start <= k.open_time < end)
+            last_ms = int(page[-1].open_time.timestamp() * 1000)
+            if len(page) < _PAGE_LIMIT or last_ms + step_ms >= end_ms:
+                break
+            since = last_ms + step_ms
+        return out
 
     async def fetch_funding_rate(self, symbol: str) -> float | None:
         """Latest perpetual funding rate as a decimal (e.g. 0.0001 = 0.01%).

@@ -17,6 +17,7 @@ from src.providers import (
     Kline,
     MacroContext,
     MarketSnapshot,
+    NoMacroData,
     ProviderError,
     ProviderInvalidResponseError,
     ProviderRateLimitError,
@@ -254,3 +255,26 @@ class TestDataProviderABC:
     def test_cannot_instantiate_directly(self) -> None:
         with pytest.raises(TypeError):
             DataProvider()  # type: ignore[abstract]
+
+    def test_fetch_klines_is_abstract(self) -> None:
+        # A provider that implements only the Slice-1/2 surface (snapshot +
+        # macro) is incomplete: the Critic's OutcomeResolver needs fetch_klines
+        # on every provider, so the ABC must refuse to instantiate it.
+        class SnapshotOnlyProvider(DataProvider):
+            name = "snapshot-only"
+
+            async def fetch_market_snapshot(
+                self,
+                symbol: str,
+                timeframes: list[Timeframe],
+                *,
+                limit: int = 200,
+                include_derivatives: bool = False,
+            ) -> MarketSnapshot:
+                raise NotImplementedError
+
+            async def fetch_macro_context(self) -> MacroContext | NoMacroData:
+                raise NotImplementedError
+
+        with pytest.raises(TypeError, match="fetch_klines"):
+            SnapshotOnlyProvider()  # type: ignore[abstract]

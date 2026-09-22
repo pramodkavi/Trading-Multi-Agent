@@ -47,6 +47,7 @@ from src.providers import (
     MacroContext,
     MarketSnapshot,
     NoMacroData,
+    ProviderError,
     Timeframe,
 )
 
@@ -145,6 +146,16 @@ class _FakeMacroProvider(DataProvider):
         include_derivatives: bool = False,
     ) -> MarketSnapshot:
         raise NotImplementedError
+
+    async def fetch_klines(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[Kline]:
+        raise ProviderError("fetch_klines not supported", provider=self.name)
 
     async def fetch_macro_context(self) -> MacroContext | NoMacroData:
         return MacroContext(fetched_at=datetime(2026, 6, 1, 12, tzinfo=UTC), dxy=104.0, vix=18.0)
