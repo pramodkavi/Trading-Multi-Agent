@@ -77,7 +77,8 @@ changes. Delivered as a PR on `claude/proposed-rules-YYYY-MM-DD`.
                  └──────────────────────────────────────────────────┘
 ```
 
-Layer 1 (Resolver) lives in the Lambda because it needs Binance. Layer 2 (Reviewer +
+**Nothing runs on the operator's machine**: the backfill driver is the same Actions workflow
+(`workflow_dispatch` with `mode=backfill`). Layer 1 (Resolver) lives in the Lambda because it needs Binance. Layer 2 (Reviewer +
 Report) lives in Actions because it needs only Aurora, Anthropic and GitHub, and the PR
 is opened with the workflow's own `GITHUB_TOKEN` (no PAT in Secrets Manager).
 
@@ -130,7 +131,7 @@ Recorded per resolution:
 
 | Field | Meaning |
 |---|---|
-| `outcome` | `WIN / LOSS / EXPIRED` |
+| `outcome` | `WIN / LOSS / EXPIRED / UNRESOLVABLE` (the last when the proposal payload is missing or corrupt; never retried) |
 | `entered_at`, `resolved_at` | timestamps; `entered_at` null if never entered |
 | `realized_r` | `(exit − entry) / |entry − stop|` signed by direction; for EXPIRED-unentered = 0 |
 | `max_adverse_excursion_r`, `max_favorable_excursion_r` | in R, after entry |
@@ -151,7 +152,9 @@ retrieval, which filters on `PUBLISHED` rows with outcome.
 
 Event: `{"mode": "resolve", "chunk_size": 25}` → returns
 `{"ok": true, "mode": "resolve", "resolved": n, "deferred": m, "remaining": k}` where
-`remaining` is the queue size *after* this run (deferred = window still open). The
+`remaining` is the number of unresolved decisions whose 7-day window has already closed
+(deferred = window still open or provider error). Still-open decisions are not counted, so the
+backfill loop terminates. The
 backfill loop stops when `remaining == 0`. Per-decision provider errors are logged with
 the existing `PROVIDER_ERROR` marker, counted in `deferred`, and never fail the batch.
 
@@ -211,8 +214,8 @@ the SPEC FR-2.2 contract.
 ### 6.4 Slice 2 exit-gate section
 
 The first report (backfill) additionally renders a "Slice 2 exit gate" section computed
-in Python from `scan_runs`, `signals`, `active_setups`, `agent_runs`, alarm history and
-Cost Explorer, using the corrected queries from `docs/step-2.14-validation-plan.md`
+in Python from `scan_runs`, `signals` and `active_setups` (alarm history and AWS cost are
+reviewed by the operator from the console; LLM cost comes from `agent_runs.cost_usd`), using the corrected queries from `docs/step-2.14-validation-plan.md`
 review: 16 scan rows/day expected, published = has `active_setups` row, Forecaster
 evidence = `active_setups.last_evaluated_at`, gate evidence = `SKIPPED` rows with
 `violated_rule` (log cross-check noted as unavailable). Each criterion is PASS / FAIL
@@ -274,7 +277,7 @@ reviews) before continuing.
 CREATE TABLE IF NOT EXISTS decision_resolutions (
     signal_id                   UUID PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
     decision_kind               TEXT NOT NULL CHECK (decision_kind IN ('PUBLISHED','VETOED','GATE_REJECTED')),
-    outcome                     TEXT NOT NULL CHECK (outcome IN ('WIN','LOSS','EXPIRED')),
+    outcome                     TEXT NOT NULL CHECK (outcome IN ('WIN','LOSS','EXPIRED','UNRESOLVABLE')),
     entered_at                  TIMESTAMPTZ,
     resolved_at                 TIMESTAMPTZ NOT NULL,
     realized_r                  DOUBLE PRECISION NOT NULL,
@@ -294,6 +297,7 @@ CREATE TABLE IF NOT EXISTS decision_reviews (
     token_usage     JSONB NOT NULL DEFAULT '{}'::JSONB,
     cost_usd        NUMERIC(12,6),
     error           TEXT,                    -- set when the call failed; retried once
+    attempts        INTEGER NOT NULL DEFAULT 1,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
