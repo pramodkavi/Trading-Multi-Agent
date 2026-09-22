@@ -53,8 +53,10 @@ from src.common.models import (
     SkipDecision,
 )
 from src.persistence.models import (
+    DecisionSummary,
     StoredActiveSetup,
     StoredAgentRun,
+    StoredCriticReport,
     StoredScanRun,
     StoredSignal,
 )
@@ -71,6 +73,11 @@ from src.persistence.repositories import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import AsyncIterator, Mapping, Sequence
     from datetime import datetime
+
+    # Typing-only: ``src.agents.critic.models`` itself imports
+    # ``src.persistence.models`` (-> this package's __init__ -> this module), so a
+    # runtime import here would be a cycle whenever the critic package loads first.
+    from src.agents.critic.models import Resolution
 
 # A boto3 ``rds-data`` client. botocore ships no usable static types under
 # --strict, so it is opaque here; the store's only contact surface is
@@ -284,6 +291,98 @@ class SignalStore(Protocol):
         evaluated_at: datetime | None = None,
     ) -> None:
         """Record an evaluation + status on a setup (keeps OPEN, or closes it)."""
+        ...
+
+    # ---- Critic v0 (Step 2.14) -- Layer 1: OutcomeResolver queue ---------------
+
+    async def list_unresolved_decisions(
+        self, *, limit: int, decided_before: datetime
+    ) -> list[StoredSignal]:
+        """Decisions (proposals or gate-rejected skips) with no resolution row, oldest first."""
+        ...
+
+    async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
+        """Size of the unresolved-decision queue whose ``created_at < decided_before``."""
+        ...
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        """Every agent_runs row for one scan (one scan == one decision), oldest first."""
+        ...
+
+    async def save_resolution(self, resolution: Resolution) -> None:
+        """Upsert a ``decision_resolutions`` row keyed on ``signal_id``."""
+        ...
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        """The resolution for a signal, or None when unresolved."""
+        ...
+
+    async def close_active_setup_for_signal(
+        self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
+    ) -> None:
+        """Close the OPEN active_setups row of a signal (no-op when none is open)."""
+        ...
+
+    # ---- Critic v0 (Step 2.14) -- Layer 2: DecisionReviewer queue --------------
+
+    async def list_pending_reviews(
+        self, *, limit: int, no_setup_before: datetime, retry_before: datetime
+    ) -> list[StoredSignal]:
+        """Resolved (or aged NO_SETUP) decisions lacking a successful review, oldest first."""
+        ...
+
+    async def count_pending_reviews(
+        self, *, no_setup_before: datetime, retry_before: datetime
+    ) -> int:
+        """Size of the pending-review queue (same predicate as ``list_pending_reviews``)."""
+        ...
+
+    async def save_review(
+        self,
+        *,
+        signal_id: UUID,
+        decision_kind: str,
+        review: Mapping[str, Any],
+        model: str,
+        token_usage: Mapping[str, Any],
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        """Upsert a ``decision_reviews`` row; a conflict bumps ``attempts`` and ``created_at``."""
+        ...
+
+    # ---- Critic v0 (Step 2.14) -- report reads (keyset-paginated) --------------
+
+    async def list_decision_summaries(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[DecisionSummary]:
+        """Decisions in ``[since, until)`` joined to resolution/review, by (created_at, id)."""
+        ...
+
+    async def list_scan_runs_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[StoredScanRun]:
+        """scan_runs started in ``[since, until)``, ordered by (started_at, id)."""
+        ...
+
+    async def list_active_setups(
+        self, *, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[StoredActiveSetup]:
+        """All active_setups rows (any status), ordered by (opened_at, id)."""
+        ...
+
+    async def save_critic_report(self, report: StoredCriticReport) -> None:
+        """Insert one ``critic_reports`` row."""
         ...
 
     async def aclose(self) -> None: ...
@@ -868,6 +967,81 @@ class DataApiSignalStore:
             row["latest_evaluation"] = _parse_jsonb_field(row["latest_evaluation"])
         return StoredActiveSetup.model_validate(row)
 
+    # ---- Critic v0 (Step 2.14) -- implemented in Task 7 ---------------------
+
+    async def list_unresolved_decisions(
+        self, *, limit: int, decided_before: datetime
+    ) -> list[StoredSignal]:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def save_resolution(self, resolution: Resolution) -> None:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def close_active_setup_for_signal(
+        self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
+    ) -> None:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def list_pending_reviews(
+        self, *, limit: int, no_setup_before: datetime, retry_before: datetime
+    ) -> list[StoredSignal]:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def count_pending_reviews(
+        self, *, no_setup_before: datetime, retry_before: datetime
+    ) -> int:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def save_review(
+        self,
+        *,
+        signal_id: UUID,
+        decision_kind: str,
+        review: Mapping[str, Any],
+        model: str,
+        token_usage: Mapping[str, Any],
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def list_decision_summaries(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[DecisionSummary]:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def list_scan_runs_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[StoredScanRun]:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def list_active_setups(
+        self, *, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[StoredActiveSetup]:
+        raise NotImplementedError("implemented in Task 7")
+
+    async def save_critic_report(self, report: StoredCriticReport) -> None:
+        raise NotImplementedError("implemented in Task 7")
+
     # ---- lifecycle --------------------------------------------------------
 
     async def aclose(self) -> None:
@@ -1085,6 +1259,81 @@ class AsyncpgSignalStore:
                 evaluation=evaluation,
                 evaluated_at=evaluated_at,
             )
+
+    # ---- Critic v0 (Step 2.14) -- implemented in Task 6 ---------------------
+
+    async def list_unresolved_decisions(
+        self, *, limit: int, decided_before: datetime
+    ) -> list[StoredSignal]:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def save_resolution(self, resolution: Resolution) -> None:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def close_active_setup_for_signal(
+        self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
+    ) -> None:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def list_pending_reviews(
+        self, *, limit: int, no_setup_before: datetime, retry_before: datetime
+    ) -> list[StoredSignal]:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def count_pending_reviews(
+        self, *, no_setup_before: datetime, retry_before: datetime
+    ) -> int:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def save_review(
+        self,
+        *,
+        signal_id: UUID,
+        decision_kind: str,
+        review: Mapping[str, Any],
+        model: str,
+        token_usage: Mapping[str, Any],
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def list_decision_summaries(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[DecisionSummary]:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def list_scan_runs_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[StoredScanRun]:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def list_active_setups(
+        self, *, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[StoredActiveSetup]:
+        raise NotImplementedError("implemented in Task 6")
+
+    async def save_critic_report(self, report: StoredCriticReport) -> None:
+        raise NotImplementedError("implemented in Task 6")
 
     # ---- lifecycle --------------------------------------------------------
 
