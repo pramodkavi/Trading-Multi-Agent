@@ -203,9 +203,9 @@ class TestSchemaContent:
         for stmt in ("CREATE TABLE", "CREATE EXTENSION", "CREATE INDEX"):
             count_total = sql.count(stmt)
             count_guarded = sql.count(f"{stmt} IF NOT EXISTS")
-            assert (
-                count_total == count_guarded
-            ), f"Non-idempotent '{stmt}' statement detected; all DDL must use IF NOT EXISTS"
+            assert count_total == count_guarded, (
+                f"Non-idempotent '{stmt}' statement detected; all DDL must use IF NOT EXISTS"
+            )
 
     def test_signals_status_constrained_to_known_values(self) -> None:
         sql = self._schema()
