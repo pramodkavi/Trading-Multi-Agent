@@ -66,6 +66,7 @@ __all__ = [
     "Aggregates",
     "CriticReporter",
     "Lesson",
+    "ReportBuild",
     "compute_aggregates",
     "decision_kind_of",
     "fetch_all_decisions",
@@ -579,6 +580,20 @@ async def fetch_all_setups(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ReportBuild:
+    """What one ``CriticReporter.build`` produced.
+
+    ``decision_count`` is the number of decisions the report covers -- the CLI
+    prints it in its ``REPORT ... decisions=<n>`` contract line -- surfaced here
+    so the caller does not have to page the decisions a second time.
+    """
+
+    stored: StoredCriticReport
+    exit_gate: ExitGateReport | None
+    decision_count: int
+
+
 def _input_hash(since: datetime, until: datetime, decision_count: int) -> str:
     """Stable SHA-256 for the critic's ``agent_runs.input_hash`` (one report per period)."""
     key = f"critic-report:{since.isoformat()}:{until.isoformat()}:{decision_count}"
@@ -609,7 +624,7 @@ class CriticReporter:
 
     async def build(
         self, *, since: datetime, until: datetime, include_exit_gate: bool
-    ) -> tuple[StoredCriticReport, ExitGateReport | None]:
+    ) -> ReportBuild:
         """Report over decisions in ``[since, until)``; optionally with the Slice 2 gate.
 
         Zero decisions skip the Claude call (``EMPTY_PERIOD_REPORT``) and the
@@ -652,7 +667,7 @@ class CriticReporter:
             len(report.proposed_changes),
             "n/a" if exit_gate is None else ("PASS" if exit_gate.all_passed else "FAIL"),
         )
-        return stored, exit_gate
+        return ReportBuild(stored=stored, exit_gate=exit_gate, decision_count=len(decisions))
 
     async def _call_claude(
         self,

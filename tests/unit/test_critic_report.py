@@ -605,9 +605,11 @@ async def test_build_calls_claude_saves_report_and_logs_agent_run() -> None:
     now = datetime(2026, 7, 9, 12, tzinfo=UTC)
     reporter = CriticReporter(store=store, client=client, now=lambda: now)
 
-    stored, gate = await reporter.build(since=SINCE, until=UNTIL, include_exit_gate=False)
+    built = await reporter.build(since=SINCE, until=UNTIL, include_exit_gate=False)
+    stored, gate = built.stored, built.exit_gate
 
     assert gate is None
+    assert built.decision_count == len(rows)
     assert isinstance(stored, StoredCriticReport)
     assert (stored.period_start, stored.period_end, stored.created_at) == (SINCE, UNTIL, now)
     assert stored.pr_url is None
@@ -654,9 +656,11 @@ async def test_build_with_exit_gate_reads_runs_and_setups() -> None:
     ]
     store = FakeStore(decision_pages=[rows], scan_run_pages=[runs], setup_pages=[[]])
     client = _client([_response(_critic_report_payload())])
-    stored, gate = await CriticReporter(store=store, client=client).build(
+    built = await CriticReporter(store=store, client=client).build(
         since=SINCE, until=UNTIL, include_exit_gate=True
     )
+    stored, gate = built.stored, built.exit_gate
+    assert built.decision_count == len(rows)
     assert gate is not None and len(gate.criteria) == 4
     assert gate.criteria[0].passed is True  # 7 healthy days
     assert gate.all_passed is False  # only 3 published (no setups rows) -> criterion 2 fails
@@ -668,10 +672,12 @@ async def test_build_with_exit_gate_reads_runs_and_setups() -> None:
 async def test_build_empty_period_skips_claude_and_agent_run() -> None:
     store = FakeStore(decision_pages=[[]])
     client = _client([])
-    stored, gate = await CriticReporter(store=store, client=client).build(
+    built = await CriticReporter(store=store, client=client).build(
         since=SINCE, until=UNTIL, include_exit_gate=False
     )
+    stored, gate = built.stored, built.exit_gate
     assert gate is None
+    assert built.decision_count == 0
     client.messages.create.assert_not_awaited()
     assert store.agent_runs == []
     assert store.saved_reports == [stored]

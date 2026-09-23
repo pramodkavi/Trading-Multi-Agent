@@ -2878,10 +2878,16 @@ async def fetch_all_setups(store, *, page=500) -> list[StoredActiveSetup]
 
 class CriticReporter:
     def __init__(self, *, store, client, model=DEFAULT_MODEL, now=_utcnow) -> None
-    async def build(self, *, since: datetime, until: datetime, include_exit_gate: bool) -> tuple[StoredCriticReport, ExitGateReport | None]
+    async def build(self, *, since: datetime, until: datetime, include_exit_gate: bool) -> ReportBuild
+
+@dataclass(frozen=True)
+class ReportBuild:          # Task 13 follow-up: the CLI prints decisions=<n> from decision_count
+    stored: StoredCriticReport
+    exit_gate: ExitGateReport | None
+    decision_count: int
 ```
 
-`CriticReporter.build`: fetch decisions (+ scan runs / setups when `include_exit_gate`), `aggregates = compute_aggregates(...)`, `report = structured_completion(output_schema=CriticReport, system=REPORT_SYSTEM_PROMPT, user=build_report_user_prompt(aggregates, lessons), tool_name="emit_critic_report", ...)`, log to `agent_runs` with `agent_role=AgentRole.CRITIC` (`scan_id` = the most recent decision's `scan_id`, or skip logging when there are zero decisions), `exit_gate = evaluate_exit_gate(...)` when requested, `markdown = render_markdown(...)`, `stored = StoredCriticReport(id=uuid4(), period_start=since, period_end=until, report=report.model_dump(mode="json"), markdown=markdown, pr_url=None, created_at=now())`, `await store.save_critic_report(stored)`; return `(stored, exit_gate)`.
+`CriticReporter.build`: fetch decisions (+ scan runs / setups when `include_exit_gate`), `aggregates = compute_aggregates(...)`, `report = structured_completion(output_schema=CriticReport, system=REPORT_SYSTEM_PROMPT, user=build_report_user_prompt(aggregates, lessons), tool_name="emit_critic_report", ...)`, log to `agent_runs` with `agent_role=AgentRole.CRITIC` (`scan_id` = the most recent decision's `scan_id`, or skip logging when there are zero decisions), `exit_gate = evaluate_exit_gate(...)` when requested, `markdown = render_markdown(...)`, `stored = StoredCriticReport(id=uuid4(), period_start=since, period_end=until, report=report.model_dump(mode="json"), markdown=markdown, pr_url=None, created_at=now())`, `await store.save_critic_report(stored)`; return `ReportBuild(stored, exit_gate, decision_count=len(decisions))`.
 
 `REPORT_SYSTEM_PROMPT` (exact text):
 
