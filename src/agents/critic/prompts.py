@@ -1,22 +1,35 @@
-"""Prompts for the Critic v0 per-decision review (design §6.2).
+"""Prompts for the Critic v0 per-decision review and period report (design §6.2 / §6.3).
 
-``REVIEW_SYSTEM_PROMPT`` frames the task: grade the *reasoning* behind one past
-decision with the benefit of a deterministic price-replay resolution, never the
-luck of the outcome. ``build_review_user_prompt`` renders one ``DecisionRecord``
-plus its ``Resolution`` into the sectioned user message that goes with it.
+``REVIEW_SYSTEM_PROMPT`` frames the per-decision task: grade the *reasoning*
+behind one past decision with the benefit of a deterministic price-replay
+resolution, never the luck of the outcome. ``build_review_user_prompt`` renders
+one ``DecisionRecord`` plus its ``Resolution`` into the sectioned user message
+that goes with it.
 
-Token bounds (design §6.2): the user prompt carries the proposal / skip payload,
-the Historian / Skeptic / Judge outputs, and the resolution row with a one-line
-human summary -- never raw candles.
+``REPORT_SYSTEM_PROMPT`` frames the aggregate task: turn pre-computed period
+statistics (``report.Aggregates``) plus the per-decision lessons into a
+``CriticReport`` with evidence-backed proposed rule changes.
+``build_report_user_prompt`` renders those inputs.
+
+Token bounds (design §6.2 / §6.3): the review prompt carries the proposal /
+skip payload, the Historian / Skeptic / Judge outputs, and the resolution row
+with a one-line human summary -- never raw candles. The report prompt carries
+only the aggregate numbers and at most 25 one-sentence lessons, never the
+per-decision payloads.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from src.agents.critic.models import DecisionKind, DecisionRecord, Resolution
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; report.py imports this module at runtime
+    from src.agents.critic.report import Aggregates, Lesson
 
 REVIEW_SYSTEM_PROMPT: Final[str] = """\
 You are the Critic for a signal-only Smart Money Concepts (SMC) crypto analyzer.
@@ -166,5 +179,68 @@ def build_review_user_prompt(record: DecisionRecord, resolution: Resolution | No
         _agent_section("Skeptic", record.skeptic),
         _agent_section("Judge", record.judge),
         _resolution_section(record, resolution),
+    ]
+    return "\n\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
+# Period report (design §6.3)
+# ---------------------------------------------------------------------------
+
+REPORT_SYSTEM_PROMPT: Final[str] = """\
+You are the weekly Critic for a signal-only SMC crypto analyzer. You receive
+pre-computed statistics over a period (win rates by decision kind, symbol, hour,
+rule; Skeptic / Judge / gate value; failure-category counts) plus the per-decision
+lessons written by the per-decision reviewer. Produce:
+- summary: what worked, what did not, in plain language with the numbers.
+- key_patterns: recurring, evidence-backed patterns (max 20).
+- skeptic_assessment / judge_assessment / gate_assessment: is each agent adding
+  value? Quote the relevant rates.
+- proposed_changes: at most 10 concrete, minimal changes. Each `target` must be one
+  of SKEPTIC_SYSTEM_PROMPT, JUDGE_SYSTEM_PROMPT, FORECASTER_SYSTEM_PROMPT,
+  risk_gates.<CONSTANT>, or "SPEC §1.6 rule N". `change` is the exact wording or
+  value to adopt. `rationale` cites the statistic. `evidence_signal_ids` lists the
+  signal ids from the lessons that support it.
+Never propose RSI/MACD/moving averages/Bollinger (forbidden). Never propose order
+execution, position sizing changes above SPEC §1.6 limits, or removing a hard rule.
+Prefer "no change" over speculative change when the sample is small (say so).
+"""
+
+# Fields of ``Aggregates`` already rendered in the ``## Period`` section.
+_PERIOD_FIELDS: Final[frozenset[str]] = frozenset({"period_start", "period_end"})
+
+
+def _lessons_section(lessons: Sequence[Lesson]) -> str:
+    if not lessons:
+        return _section("Per-decision lessons (most recent first)", "(none)")
+    lines = [
+        f"- signal_id={lesson.signal_id} symbol={lesson.symbol} kind={lesson.kind}: {lesson.lesson}"
+        for lesson in lessons
+    ]
+    return _section("Per-decision lessons (most recent first)", "\n".join(lines))
+
+
+def build_report_user_prompt(aggregates: Aggregates, lessons: Sequence[Lesson]) -> str:
+    """Render the period statistics + recent lessons as the report call's user message.
+
+    Sections: ``## Period`` (ISO bounds, UTC), ``## Statistics`` (the
+    ``Aggregates`` dataclass as JSON; ``null`` marks a rate with no sample) and
+    ``## Per-decision lessons`` (one line each, carrying the ``signal_id`` the
+    model must quote in ``evidence_signal_ids``).
+    """
+    stats = {
+        name: value
+        for name, value in dataclasses.asdict(aggregates).items()
+        if name not in _PERIOD_FIELDS
+    }
+    period = (
+        f"{aggregates.period_start.isoformat()} -> {aggregates.period_end.isoformat()} (UTC)\n"
+        "Rates are fractions in [0, 1]; null means no resolved sample. "
+        "Treat small samples with caution and say so."
+    )
+    sections = [
+        _section("Period", period),
+        _section("Statistics", _dump(stats)),
+        _lessons_section(lessons),
     ]
     return "\n\n".join(sections)
