@@ -25,6 +25,7 @@ from scripts.run_scan import (
     compose_message,
     run_one_symbol,
 )
+from src.agents.critic.resolver import ResolveSummary
 from src.agents.forecaster import ForecasterUpdate
 from src.agents.historian import HistorianReport, HistorianRepository
 from src.agents.judge import Judge, JudgeDecision
@@ -784,6 +785,82 @@ class TestLambdaHandler:
             await _alambda({"mode": "migrate"}, _settings())
 
         migrate.assert_not_called()
+
+    @staticmethod
+    def _patch_resolver(
+        monkeypatch: pytest.MonkeyPatch, summary: ResolveSummary
+    ) -> dict[str, MagicMock]:
+        # {"mode": "resolve"} builds only store + provider (no Anthropic client,
+        # no Telegram) and hands them to the OutcomeResolver.
+        store = MagicMock()
+        store.aclose = AsyncMock()
+        provider = MagicMock()
+        provider.aclose = AsyncMock()
+        fake_resolver = MagicMock()
+        fake_resolver.run = AsyncMock(return_value=summary)
+        resolver_cls = MagicMock(return_value=fake_resolver)
+        monkeypatch.setattr(run_scan_module, "create_store", AsyncMock(return_value=store))
+        monkeypatch.setattr(run_scan_module, "BinanceProvider", MagicMock(return_value=provider))
+        monkeypatch.setattr(run_scan_module, "OutcomeResolver", resolver_cls)
+        return {
+            "store": store,
+            "provider": provider,
+            "resolver": fake_resolver,
+            "resolver_cls": resolver_cls,
+        }
+
+    async def test_resolve_mode_runs_resolver(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mocks = self._patch_resolver(
+            monkeypatch, ResolveSummary(resolved=3, deferred=1, remaining=9)
+        )
+
+        result = await _alambda({"mode": "resolve", "chunk_size": 7}, _settings())
+
+        assert result == {
+            "ok": True,
+            "mode": "resolve",
+            "resolved": 3,
+            "deferred": 1,
+            "remaining": 9,
+        }
+        mocks["resolver"].run.assert_awaited_once_with(chunk_size=7)
+        mocks["resolver_cls"].assert_called_once_with(
+            store=mocks["store"], provider=mocks["provider"]
+        )
+        mocks["store"].aclose.assert_awaited_once()
+        mocks["provider"].aclose.assert_awaited_once()
+
+    async def test_resolve_mode_defaults_chunk_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The EventBridge rate(2 days) schedule sends only {"mode": "resolve"}.
+        mocks = self._patch_resolver(monkeypatch, ResolveSummary(0, 0, 0))
+
+        await _alambda({"mode": "resolve"}, _settings())
+
+        mocks["resolver"].run.assert_awaited_once_with(chunk_size=25)
+
+    @pytest.mark.parametrize(("raw", "expected"), [(999, 100), (0, 1), (-5, 1), ("12", 12)])
+    async def test_resolve_mode_clamps_chunk_size(
+        self, monkeypatch: pytest.MonkeyPatch, raw: object, expected: int
+    ) -> None:
+        mocks = self._patch_resolver(monkeypatch, ResolveSummary(0, 0, 0))
+
+        await _alambda({"mode": "resolve", "chunk_size": raw}, _settings())
+
+        mocks["resolver"].run.assert_awaited_once_with(chunk_size=expected)
+
+    async def test_resolve_mode_closes_dependencies_on_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A resolver crash must still release the store pool and the Binance
+        # session, and must surface (not swallow) the error to CloudWatch.
+        mocks = self._patch_resolver(monkeypatch, ResolveSummary(0, 0, 0))
+        mocks["resolver"].run = AsyncMock(side_effect=RuntimeError("boom"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await _alambda({"mode": "resolve"}, _settings())
+
+        mocks["store"].aclose.assert_awaited_once()
+        mocks["provider"].aclose.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

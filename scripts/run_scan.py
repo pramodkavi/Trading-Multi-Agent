@@ -59,6 +59,7 @@ from uuid import uuid4
 
 from anthropic import AsyncAnthropic
 
+from src.agents.critic.resolver import OutcomeResolver
 from src.agents.forecaster import Forecaster
 from src.agents.historian import HistorianRepository
 from src.agents.judge import Judge
@@ -103,6 +104,13 @@ CANDLE_LIMIT: int = 200
 _PUBLISH_RULINGS: frozenset[JudgeRuling] = frozenset(
     {JudgeRuling.PUBLISH, JudgeRuling.PUBLISH_WITH_CAVEAT}
 )
+
+# {"mode": "resolve"} chunking (Critic v0 design §5.5). One chunk of 25 decisions
+# is at most 25 seven-day 5m candle fetches (cached per symbol/window within a
+# run), which fits comfortably inside the Lambda timeout; 100 is the hard ceiling
+# so an operator's manual backfill invocation can't run the function into it.
+RESOLVE_CHUNK_DEFAULT: int = 25
+RESOLVE_CHUNK_MAX: int = 100
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +560,44 @@ async def _run_forecaster(*, settings: Settings, notify: bool) -> dict[str, Any]
     return {"ok": True, "mode": "forecaster", "evaluated": len(updates), "by_status": by_status}
 
 
+async def _run_resolver(*, settings: Settings, chunk_size: int) -> dict[str, Any]:
+    """Resolve one chunk of decisions against real price action ({"mode": "resolve"}).
+
+    Critic v0 Layer 1 (design §5). Runs in this Lambda because Binance geofences
+    GitHub's US runners (HTTP 451); the review layer (GitHub Actions) only reads
+    the ``decision_resolutions`` rows this writes. Needs no Anthropic client and
+    no Telegram notifier -- resolution is deterministic replay, not an agent.
+
+    Returns the ``ResolveSummary`` counts as a JSON-serialisable dict so a
+    backfill loop over the invocation can stop when ``remaining`` hits zero.
+    """
+    store = await create_store(settings)
+    try:
+        provider = BinanceProvider()
+        try:
+            summary = await OutcomeResolver(store=store, provider=provider).run(
+                chunk_size=chunk_size
+            )
+        finally:
+            await provider.aclose()
+    finally:
+        await store.aclose()
+    logger.info(
+        "resolver run complete: resolved=%d deferred=%d remaining=%d (chunk_size=%d)",
+        summary.resolved,
+        summary.deferred,
+        summary.remaining,
+        chunk_size,
+    )
+    return {
+        "ok": True,
+        "mode": "resolve",
+        "resolved": summary.resolved,
+        "deferred": summary.deferred,
+        "remaining": summary.remaining,
+    }
+
+
 async def _run_migration(settings: Settings) -> dict[str, Any]:
     """Apply the idempotent schema to Aurora via the Data API ({"mode": "migrate"}).
 
@@ -620,6 +666,14 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
     if payload.get("mode") == "forecaster":
         return await _run_forecaster(settings=settings, notify=notify)
 
+    # Critic v0 Layer 1: {"mode": "resolve"} replays unresolved decisions against
+    # 5m candles and writes decision_resolutions (+ signals.outcome for published).
+    # chunk_size defaults to RESOLVE_CHUNK_DEFAULT and is clamped to 1..RESOLVE_CHUNK_MAX.
+    if payload.get("mode") == "resolve":
+        raw = payload.get("chunk_size", RESOLVE_CHUNK_DEFAULT)
+        chunk = max(1, min(RESOLVE_CHUNK_MAX, int(raw)))
+        return await _run_resolver(settings=settings, chunk_size=chunk)
+
     # Manual escape hatch: {"mode": "migrate"} applies the DB schema via the Data
     # API using the Lambda's own role (for when the CD migration step skipped).
     if payload.get("mode") == "migrate":
@@ -656,9 +710,11 @@ def lambda_handler(event: dict[str, Any] | None, context: object) -> dict[str, A
     the successful scans.
 
     Event ``mode`` selects the entry point: ``"forecaster"`` re-evaluates open
-    setups; ``"migrate"`` applies the DB schema via the Data API (manual escape
-    hatch, see ``_run_migration``); absent/any other value runs the per-signal
-    scan over the event's symbols (or the watchlist).
+    setups; ``"resolve"`` scores one chunk of past decisions against real price
+    action (Critic v0 Layer 1, see ``_run_resolver``; optional ``chunk_size``);
+    ``"migrate"`` applies the DB schema via the Data API (manual escape hatch,
+    see ``_run_migration``); absent/any other value runs the per-signal scan
+    over the event's symbols (or the watchlist).
     """
     return asyncio.run(_alambda(event, _load_settings()))
 
