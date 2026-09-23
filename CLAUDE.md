@@ -17,7 +17,7 @@ A **multi-agent, autonomous crypto trading signal analyzer** built around Smart 
 - **Signal-only system** — never places trades. No broker credentials. No order placement. This is a hard architectural constraint, not a limitation to remove later.
 - User receives Telegram alerts and executes manually.
 - Runs on a scheduled UTC cron (7 days/week — crypto never closes).
-- Self-improving via a weekly Critic that opens PRs proposing rule changes.
+- Self-improving via a Critic that opens PRs proposing rule changes (Critic v0 runs every 2 days; SPEC's weekly cadence is the Slice 3 target).
 
 ## 2. Six Agent Roles (all powered by Claude Sonnet 4.5)
 
@@ -29,7 +29,7 @@ A **multi-agent, autonomous crypto trading signal analyzer** built around Smart 
 
 **Background loops**:
 5. **Forecaster** — Re-evaluates open setups every scan. STILL_VALID / AT_RISK / INVALIDATED.
-6. **Critic** — Weekly meta-review; opens a PR on `claude/proposed-rules-YYYY-MM-DD` branch.
+6. **Critic** — Critic v0 (Slice 2.14, GitHub Actions `critic.yml`, every 2 days): resolves outcomes deterministically (OutcomeResolver in the Lambda, 5m candle replay) then grades every decision with Claude; report + PR on `claude/proposed-rules-YYYY-MM-DD`. Design: `docs/superpowers/specs/2026-09-22-decision-review-critic-v0-design.md`; runbook `docs/operations.md §7`.
 
 ## 3. Hard Rules (Programmatically Enforced — Cannot Be Overruled by Any Agent)
 
@@ -74,9 +74,11 @@ All external data is accessed through a uniform `DataProvider` interface. Agents
 | `3 13 * * *` | NY open |
 | `3 15 * * *` | London-NY overlap |
 | `3 22 * * *` | Daily wrap + active setups review |
-| `0 21 * * 0` | Weekly Critic meta-review |
+| `rate(2 days)` | Critic v0 OutcomeResolver — scan Lambda `{"mode":"resolve"}` (EventBridge, `SchedulingStack`) |
+| `30 22 */2 * *` | Critic v0 review + report — **GitHub Actions** `.github/workflows/critic.yml` (not EventBridge) |
+| `0 21 * * 0` | Weekly Critic meta-review (SPEC Step 3.7 — superseded by the every-2-days Critic v0 cadence; not deployed) |
 
-Minutes are `:03` deliberately — avoids clock-jitter on `:00`.
+Minutes are `:03` deliberately — avoids clock-jitter on `:00`. The Actions cron runs at `:30`, after the 22:03 wrap scan has persisted.
 
 ## 6. Build Discipline — Read This Every Session
 
@@ -102,7 +104,7 @@ Minutes are `:03` deliberately — avoids clock-jitter on `:00`.
 ## 7. Current Build Status
 
 - **Slice 1 (Weeks 1-3): ✅ COMPLETE & DEPLOYED LIVE** (Steps 1.1–1.22). End-to-end substrate — multi-symbol watchlist, SMC-stub Analyzer, Telegram delivery from a scheduled **Lambda** (container image, **ap-south-1**) + Aurora Serverless v2 via the RDS Data API. Verified end-to-end (Telegram confirmed 2026-06-12). **See [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md) for live resource IDs, gotchas, and open items.**
-- **Slice 2 (Weeks 4-7): ⬅️ NEXT.** Full 4-agent pipeline + Forecaster + risk gates + multi-symbol + **real** SMC Analyzer (replaces the Slice-1 stub at Step 2.1).
+- **Slice 2 (Weeks 4-7): ⬅️ IN PROGRESS — 2.1–2.13 LIVE (since 2026-06-27); Step 2.14 in progress via Critic v0** on `feat/slice-2-step-2.14-critic-v0`. Full 4-agent pipeline + Forecaster + risk gates + multi-symbol + real SMC Analyzer are deployed. Step 2.14's manual review is automated: OutcomeResolver (Lambda) + DecisionReviewer/CriticReport (GitHub Actions `critic.yml`); the **Slice 2 exit gate is the first section of the backfill report** (`docs/critic-reports/<date>.md`). Blocked on the operator IAM grants in `docs/operations.md §7.4`, then the first `mode=backfill` run.
 - **Slice 3 (Weeks 8-11):** Strategy registry + embeddings + Critic with PR opening.
 - **Slice 4 (Weeks 12-15):** FastAPI + React dashboard, Cognito auth, WebSocket real-time.
 
