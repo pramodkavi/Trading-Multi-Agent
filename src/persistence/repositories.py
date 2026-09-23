@@ -1,4 +1,5 @@
-"""asyncpg-backed repositories for scan_runs, signals, and agent_runs.
+"""asyncpg-backed repositories for scan_runs, signals, agent_runs, active_setups
+and the Critic v0 tables (decision_resolutions, decision_reviews, critic_reports).
 
 Each repository takes an `asyncpg.Connection` in its constructor and operates
 on that connection. The caller is responsible for connection lifecycle
@@ -37,8 +38,10 @@ from src.common.models import (
     SkipDecision,
 )
 from src.persistence.models import (
+    DecisionSummary,
     StoredActiveSetup,
     StoredAgentRun,
+    StoredCriticReport,
     StoredScanRun,
     StoredSignal,
 )
@@ -48,6 +51,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from datetime import datetime
 
     import asyncpg
+
+    # Typing-only: ``src.agents.critic.models`` imports ``src.persistence.models``
+    # (-> this package's __init__ -> this module), so a runtime import here would
+    # be a cycle whenever the critic package loads first. ``get_resolution``
+    # imports it lazily at call time.
+    from src.agents.critic.models import Resolution
 
 # Historian stage-3 builds the L2-distance SQL by interpolating feature KEY names
 # (the values are always bound parameters). Keys originate from a code constant
@@ -195,6 +204,10 @@ class ScanRunRepository:
         )
         if record is None:
             return None
+        return self._record_to_stored(record)
+
+    @staticmethod
+    def _record_to_stored(record: asyncpg.Record) -> StoredScanRun:
         return StoredScanRun.model_validate(_record_to_dict(record))
 
 
@@ -435,7 +448,8 @@ class SignalRepository:
             )
         return f"sqrt({' + '.join(terms)})"
 
-    def _record_to_stored(self, record: asyncpg.Record) -> StoredSignal:
+    @staticmethod
+    def _record_to_stored(record: asyncpg.Record) -> StoredSignal:
         data = _record_to_dict(record)
         # find_similar adds ranking columns the StoredSignal model forbids; the
         # Historian recomputes them in Python, so drop them here.
@@ -514,6 +528,10 @@ class AgentRunRepository:
         )
         if record is None:
             return None
+        return self._record_to_stored(record)
+
+    @staticmethod
+    def _record_to_stored(record: asyncpg.Record) -> StoredAgentRun:
         data = _record_to_dict(record)
         data["output"] = _parse_jsonb_field(data["output"])
         data["token_usage"] = _parse_jsonb_field(data["token_usage"])
@@ -617,3 +635,397 @@ class ActiveSetupRepository:
         if data.get("latest_evaluation") is not None:
             data["latest_evaluation"] = _parse_jsonb_field(data["latest_evaluation"])
         return StoredActiveSetup.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# DecisionRepository (Critic v0, Step 2.14)
+# ---------------------------------------------------------------------------
+
+# Column lists shared with the sibling repositories' mappers. ``_prefixed`` is
+# for queries that alias ``signals`` as ``s`` (joins against the Critic tables).
+_SIGNAL_COLUMNS = (
+    "id, scan_id, symbol, strategy, direction, status, "
+    "created_at, payload, tags, features, outcome, outcome_metadata"
+)
+_AGENT_RUN_COLUMNS = (
+    "id, scan_id, agent_role, strategy, input_hash, output, "
+    "latency_ms, token_usage, cost_usd, created_at"
+)
+_SCAN_RUN_COLUMNS = (
+    "id, started_at, completed_at, status, error_message, session, strategy, symbols"
+)
+
+
+def _prefixed(columns: str, alias: str) -> str:
+    return ", ".join(f"{alias}.{c}" for c in columns.split(", "))
+
+
+_SIGNAL_COLUMNS_S = _prefixed(_SIGNAL_COLUMNS, "s")
+
+# The list_* / count_* pairs below must agree on their predicate, so each pair
+# is built from one shared SQL fragment rather than two hand-copied strings.
+#
+# Unresolved decision ($1 = decided_before): a proposal (direction set) or a
+# gate-rejected skip (payload.violated_rule set) that has no resolution row yet.
+# NO_SETUP skips never get one -- there is nothing to price-replay.
+_UNRESOLVED_FROM_WHERE = """
+    FROM signals s
+    LEFT JOIN decision_resolutions r ON r.signal_id = s.id
+    WHERE r.signal_id IS NULL
+      AND (s.direction IS NOT NULL OR s.payload->>'violated_rule' IS NOT NULL)
+      AND s.created_at < $1
+"""
+
+# Pending review ($1 = no_setup_before, $2 = retry_before). A decision needs a
+# review when it has no review row, or its only row errored and is still under
+# the retry cap (attempts < 2) and old enough to retry. Branch (a): resolved
+# decisions. Branch (b): NO_SETUP skips, which skip resolution entirely and are
+# reviewed once they are ``no_setup_before`` old (design §6.1).
+_REVIEW_MISSING_OR_RETRYABLE = """(v.signal_id IS NULL
+         OR (v.error IS NOT NULL AND v.attempts < 2 AND v.created_at < $2))"""
+
+_PENDING_REVIEWS_UNION = f"""
+    SELECT {_SIGNAL_COLUMNS_S}
+    FROM signals s
+    JOIN decision_resolutions r ON r.signal_id = s.id
+    LEFT JOIN decision_reviews v ON v.signal_id = s.id
+    WHERE {_REVIEW_MISSING_OR_RETRYABLE}
+    UNION ALL
+    SELECT {_SIGNAL_COLUMNS_S}
+    FROM signals s
+    LEFT JOIN decision_reviews v ON v.signal_id = s.id
+    WHERE s.direction IS NULL AND s.payload->>'violated_rule' IS NULL
+      AND s.created_at < $1
+      AND {_REVIEW_MISSING_OR_RETRYABLE}
+"""
+
+_RESOLUTION_COLUMNS = (
+    "signal_id, decision_kind, outcome, decided_at, entered_at, resolved_at, realized_r, "
+    "max_adverse_excursion_r, max_favorable_excursion_r, tp2_reached, candles_used, "
+    "engine_version"
+)
+
+
+def _split_cursor(
+    after: tuple[datetime, UUID] | None,
+) -> tuple[datetime | None, UUID | None]:
+    """Unpack a keyset cursor into its two bind params (both NULL == first page)."""
+    if after is None:
+        return None, None
+    return after[0], after[1]
+
+
+class DecisionRepository:
+    """Critic v0 persistence: resolver / reviewer queues and report reads (Step 2.14).
+
+    The queues are *derived from the data* -- an unresolved decision is simply
+    a ``signals`` row with no ``decision_resolutions`` row -- so both layers are
+    idempotent and restartable without any job table. Row mapping for the
+    existing tables reuses the sibling repositories' ``_record_to_stored``
+    mappers so JSONB / NUMERIC handling lives in exactly one place per table.
+
+    Report reads are keyset-paginated on ``(timestamp, id)``: ``after`` is that
+    tuple from the last row of the previous page (``None`` for the first page)
+    and pages are ordered by the same tuple ascending, so a page never skips or
+    repeats rows while new ones are being inserted.
+    """
+
+    def __init__(self, conn: asyncpg.Connection[Any]) -> None:
+        self._conn = conn
+
+    # ---- Layer 1: OutcomeResolver queue --------------------------------------
+
+    async def list_unresolved_decisions(
+        self, *, limit: int, decided_before: datetime
+    ) -> list[StoredSignal]:
+        """Oldest-first chunk of decisions that still need a price replay."""
+        rows = await self._conn.fetch(
+            f"""
+            SELECT {_SIGNAL_COLUMNS_S}
+            {_UNRESOLVED_FROM_WHERE}
+            ORDER BY s.created_at ASC, s.id ASC
+            LIMIT $2
+            """,
+            decided_before,
+            limit,
+        )
+        return [SignalRepository._record_to_stored(r) for r in rows]
+
+    async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
+        n = await self._conn.fetchval(
+            f"""
+            SELECT count(*)
+            {_UNRESOLVED_FROM_WHERE}
+            """,
+            decided_before,
+        )
+        return int(n) if n is not None else 0
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        """Every agent run of one scan (== one decision), in execution order."""
+        rows = await self._conn.fetch(
+            f"""
+            SELECT {_AGENT_RUN_COLUMNS}
+            FROM agent_runs
+            WHERE scan_id = $1
+            ORDER BY created_at ASC
+            """,
+            scan_id,
+        )
+        return [AgentRunRepository._record_to_stored(r) for r in rows]
+
+    async def save_resolution(self, resolution: Resolution) -> None:
+        """Upsert on ``signal_id`` so re-running the resolver is idempotent."""
+        await self._conn.execute(
+            f"""
+            INSERT INTO decision_resolutions
+                ({_RESOLUTION_COLUMNS})
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (signal_id) DO UPDATE SET
+                decision_kind = EXCLUDED.decision_kind,
+                outcome = EXCLUDED.outcome,
+                decided_at = EXCLUDED.decided_at,
+                entered_at = EXCLUDED.entered_at,
+                resolved_at = EXCLUDED.resolved_at,
+                realized_r = EXCLUDED.realized_r,
+                max_adverse_excursion_r = EXCLUDED.max_adverse_excursion_r,
+                max_favorable_excursion_r = EXCLUDED.max_favorable_excursion_r,
+                tp2_reached = EXCLUDED.tp2_reached,
+                candles_used = EXCLUDED.candles_used,
+                engine_version = EXCLUDED.engine_version,
+                created_at = NOW()
+            """,
+            resolution.signal_id,
+            resolution.decision_kind.value,
+            resolution.outcome.value,
+            resolution.decided_at,
+            resolution.entered_at,
+            resolution.resolved_at,
+            resolution.realized_r,
+            resolution.max_adverse_excursion_r,
+            resolution.max_favorable_excursion_r,
+            resolution.tp2_reached,
+            resolution.candles_used,
+            resolution.engine_version,
+        )
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        # Runtime import: ``src.agents.critic.models`` imports this package's
+        # models (-> __init__ -> this module), so a top-level import would be a
+        # cycle whenever the critic package loads first. Mirrors store.py.
+        from src.agents.critic.models import Resolution
+
+        record = await self._conn.fetchrow(
+            f"""
+            SELECT {_RESOLUTION_COLUMNS}
+            FROM decision_resolutions
+            WHERE signal_id = $1
+            """,
+            signal_id,
+        )
+        if record is None:
+            return None
+        return Resolution.model_validate(_record_to_dict(record))
+
+    async def close_active_setup_for_signal(
+        self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
+    ) -> None:
+        """Close a signal's OPEN setup with the resolver's verdict; no-op if none is open.
+
+        Guarding on ``status = 'OPEN'`` keeps the Forecaster's own terminal
+        status (and evaluation) intact when it already closed the setup.
+        """
+        await self._conn.execute(
+            """
+            UPDATE active_setups
+            SET status = $2,
+                latest_evaluation = $3::jsonb,
+                last_evaluated_at = NOW()
+            WHERE signal_id = $1 AND status = 'OPEN'
+            """,
+            signal_id,
+            status.value,
+            _to_jsonb(dict(evaluation)),
+        )
+
+    # ---- Layer 2: DecisionReviewer queue -------------------------------------
+
+    async def list_pending_reviews(
+        self, *, limit: int, no_setup_before: datetime, retry_before: datetime
+    ) -> list[StoredSignal]:
+        """Oldest-first chunk of decisions lacking a successful Claude review."""
+        rows = await self._conn.fetch(
+            f"""
+            SELECT * FROM (
+            {_PENDING_REVIEWS_UNION}
+            ) q
+            ORDER BY q.created_at ASC, q.id ASC
+            LIMIT $3
+            """,
+            no_setup_before,
+            retry_before,
+            limit,
+        )
+        return [SignalRepository._record_to_stored(r) for r in rows]
+
+    async def count_pending_reviews(
+        self, *, no_setup_before: datetime, retry_before: datetime
+    ) -> int:
+        n = await self._conn.fetchval(
+            f"""
+            SELECT count(*) FROM (
+            {_PENDING_REVIEWS_UNION}
+            ) q
+            """,
+            no_setup_before,
+            retry_before,
+        )
+        return int(n) if n is not None else 0
+
+    async def save_review(
+        self,
+        *,
+        signal_id: UUID,
+        decision_kind: str,
+        review: Mapping[str, Any],
+        model: str,
+        token_usage: Mapping[str, Any],
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        """Upsert a review; a conflict (retry) bumps ``attempts`` and refreshes ``created_at``.
+
+        ``attempts`` is what caps retries in the pending-review predicate, so
+        it must count *every* write, including the failed ones -- hence the
+        increment lives in the upsert rather than in Python.
+        """
+        await self._conn.execute(
+            """
+            INSERT INTO decision_reviews
+                (signal_id, decision_kind, review, model, token_usage, cost_usd, error, attempts)
+            VALUES ($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7, 1)
+            ON CONFLICT (signal_id) DO UPDATE SET
+                decision_kind = EXCLUDED.decision_kind,
+                review = EXCLUDED.review,
+                model = EXCLUDED.model,
+                token_usage = EXCLUDED.token_usage,
+                cost_usd = EXCLUDED.cost_usd,
+                error = EXCLUDED.error,
+                attempts = decision_reviews.attempts + 1,
+                created_at = NOW()
+            """,
+            signal_id,
+            decision_kind,
+            _to_jsonb(dict(review)),
+            model,
+            _to_jsonb(dict(token_usage)),
+            cost_usd,
+            error,
+        )
+
+    # ---- Report reads (keyset-paginated) -------------------------------------
+
+    async def list_decision_summaries(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[DecisionSummary]:
+        """One light row per decision in ``[since, until)`` with its resolution/review."""
+        after_ts, after_id = _split_cursor(after)
+        rows = await self._conn.fetch(
+            """
+            SELECT s.id, s.scan_id, s.symbol, s.direction, s.status, s.created_at,
+                   s.payload->>'violated_rule' AS violated_rule, s.outcome,
+                   r.decision_kind, r.outcome AS resolution_outcome, r.realized_r, r.entered_at,
+                   CASE WHEN v.error IS NULL THEN v.review END AS review,
+                   v.error AS review_error
+            FROM signals s
+            LEFT JOIN decision_resolutions r ON r.signal_id = s.id
+            LEFT JOIN decision_reviews v ON v.signal_id = s.id
+            WHERE s.created_at >= $1 AND s.created_at < $2
+              AND ($3::timestamptz IS NULL OR (s.created_at, s.id) > ($3, $4))
+            ORDER BY s.created_at ASC, s.id ASC
+            LIMIT $5
+            """,
+            since,
+            until,
+            after_ts,
+            after_id,
+            limit,
+        )
+        return [self._record_to_summary(r) for r in rows]
+
+    async def list_scan_runs_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[StoredScanRun]:
+        after_ts, after_id = _split_cursor(after)
+        rows = await self._conn.fetch(
+            f"""
+            SELECT {_SCAN_RUN_COLUMNS}
+            FROM scan_runs
+            WHERE started_at >= $1 AND started_at < $2
+              AND ($3::timestamptz IS NULL OR (started_at, id) > ($3, $4))
+            ORDER BY started_at ASC, id ASC
+            LIMIT $5
+            """,
+            since,
+            until,
+            after_ts,
+            after_id,
+            limit,
+        )
+        return [ScanRunRepository._record_to_stored(r) for r in rows]
+
+    async def list_active_setups(
+        self, *, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[StoredActiveSetup]:
+        """Every setup regardless of status (the exit gate counts closed ones too)."""
+        after_ts, after_id = _split_cursor(after)
+        rows = await self._conn.fetch(
+            f"""
+            SELECT {_ACTIVE_SETUP_COLUMNS}
+            FROM active_setups
+            WHERE ($1::timestamptz IS NULL OR (opened_at, id) > ($1, $2))
+            ORDER BY opened_at ASC, id ASC
+            LIMIT $3
+            """,
+            after_ts,
+            after_id,
+            limit,
+        )
+        return [ActiveSetupRepository._record_to_stored(r) for r in rows]
+
+    async def save_critic_report(self, report: StoredCriticReport) -> None:
+        await self._conn.execute(
+            """
+            INSERT INTO critic_reports
+                (id, period_start, period_end, report, markdown, pr_url, created_at)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
+            """,
+            report.id,
+            report.period_start,
+            report.period_end,
+            _to_jsonb(dict(report.report)),
+            report.markdown,
+            report.pr_url,
+            report.created_at,
+        )
+
+    @staticmethod
+    def _record_to_summary(record: asyncpg.Record) -> DecisionSummary:
+        data = _record_to_dict(record)
+        # The SQL CASE already NULLs `review` for errored rows; only parse real JSONB.
+        data["review"] = (
+            _parse_jsonb_field(data["review"]) if data.get("review") is not None else None
+        )
+        if data.get("realized_r") is not None:
+            data["realized_r"] = float(data["realized_r"])
+        return DecisionSummary.model_validate(data)

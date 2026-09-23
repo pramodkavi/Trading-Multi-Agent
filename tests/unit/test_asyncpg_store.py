@@ -151,3 +151,110 @@ async def test_aclose_closes_pool() -> None:
     store = AsyncpgSignalStore(pool)
     await store.aclose()
     pool.close.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Critic v0 (Step 2.14) wiring -- each new method must reach a pooled connection
+# ---------------------------------------------------------------------------
+
+
+def _critic_store() -> tuple[AsyncpgSignalStore, MagicMock]:
+    store, conn = _store()
+    conn.fetchval = AsyncMock(return_value=0)
+    return store, conn
+
+
+async def test_list_and_count_unresolved_decisions_query_connection() -> None:
+    store, conn = _critic_store()
+    cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+    assert await store.list_unresolved_decisions(limit=10, decided_before=cutoff) == []
+    assert await store.count_unresolved_decisions(decided_before=cutoff) == 0
+    conn.fetch.assert_awaited_once()
+    conn.fetchval.assert_awaited_once()
+
+
+async def test_list_agent_runs_for_scan_queries_connection() -> None:
+    store, conn = _critic_store()
+    assert await store.list_agent_runs_for_scan(uuid4()) == []
+    conn.fetch.assert_awaited_once()
+
+
+async def test_save_and_get_resolution_reach_connection() -> None:
+    from src.agents.critic.models import DecisionKind, Resolution, ResolutionOutcome
+
+    store, conn = _critic_store()
+    res = Resolution(
+        signal_id=uuid4(),
+        decision_kind=DecisionKind.PUBLISHED,
+        outcome=ResolutionOutcome.LOSS,
+        decided_at=datetime(2026, 7, 1, tzinfo=UTC),
+        resolved_at=datetime(2026, 7, 2, tzinfo=UTC),
+        realized_r=-1.0,
+        candles_used=3,
+        engine_version="replay-v1",
+    )
+    await store.save_resolution(res)
+    assert await store.get_resolution(res.signal_id) is None
+    conn.execute.assert_awaited_once()
+    conn.fetchrow.assert_awaited_once()
+
+
+async def test_close_active_setup_for_signal_executes() -> None:
+    from src.common.models import ActiveSetupStatus
+
+    store, conn = _critic_store()
+    await store.close_active_setup_for_signal(
+        signal_id=uuid4(), status=ActiveSetupStatus.LOSS, evaluation={"source": "resolver"}
+    )
+    conn.execute.assert_awaited_once()
+
+
+async def test_list_and_count_pending_reviews_query_connection() -> None:
+    store, conn = _critic_store()
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    assert await store.list_pending_reviews(limit=5, no_setup_before=t, retry_before=t) == []
+    assert await store.count_pending_reviews(no_setup_before=t, retry_before=t) == 0
+    conn.fetch.assert_awaited_once()
+    conn.fetchval.assert_awaited_once()
+
+
+async def test_save_review_executes() -> None:
+    store, conn = _critic_store()
+    await store.save_review(
+        signal_id=uuid4(),
+        decision_kind="PUBLISHED",
+        review={"lesson": "x"},
+        model="m",
+        token_usage={},
+        cost_usd=None,
+        error=None,
+    )
+    conn.execute.assert_awaited_once()
+
+
+async def test_report_reads_query_connection() -> None:
+    store, conn = _critic_store()
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    assert await store.list_decision_summaries(since=t, until=t, after=None, limit=10) == []
+    assert await store.list_scan_runs_between(since=t, until=t, after=None, limit=10) == []
+    assert await store.list_active_setups(after=None, limit=10) == []
+    assert conn.fetch.await_count == 3
+
+
+async def test_save_critic_report_executes() -> None:
+    from src.persistence.models import StoredCriticReport
+
+    store, conn = _critic_store()
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    await store.save_critic_report(
+        StoredCriticReport(
+            id=uuid4(),
+            period_start=t,
+            period_end=t,
+            report={"summary": "s"},
+            markdown="# r",
+            pr_url=None,
+            created_at=t,
+        )
+    )
+    conn.execute.assert_awaited_once()

@@ -63,6 +63,7 @@ from src.persistence.models import (
 from src.persistence.repositories import (
     ActiveSetupRepository,
     AgentRunRepository,
+    DecisionRepository,
     ScanRunRepository,
     SignalRepository,
     _assert_safe_feature_key,
@@ -1260,39 +1261,57 @@ class AsyncpgSignalStore:
                 evaluated_at=evaluated_at,
             )
 
-    # ---- Critic v0 (Step 2.14) -- implemented in Task 6 ---------------------
+    # ---- Critic v0 (Step 2.14) -- DecisionRepository delegation ----------------
 
     async def list_unresolved_decisions(
         self, *, limit: int, decided_before: datetime
     ) -> list[StoredSignal]:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_unresolved_decisions(
+                limit=limit, decided_before=decided_before
+            )
 
     async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).count_unresolved_decisions(
+                decided_before=decided_before
+            )
 
     async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_agent_runs_for_scan(scan_id)
 
     async def save_resolution(self, resolution: Resolution) -> None:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).save_resolution(resolution)
 
     async def get_resolution(self, signal_id: UUID) -> Resolution | None:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).get_resolution(signal_id)
 
     async def close_active_setup_for_signal(
         self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
     ) -> None:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).close_active_setup_for_signal(
+                signal_id=signal_id, status=status, evaluation=evaluation
+            )
 
     async def list_pending_reviews(
         self, *, limit: int, no_setup_before: datetime, retry_before: datetime
     ) -> list[StoredSignal]:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_pending_reviews(
+                limit=limit, no_setup_before=no_setup_before, retry_before=retry_before
+            )
 
     async def count_pending_reviews(
         self, *, no_setup_before: datetime, retry_before: datetime
     ) -> int:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).count_pending_reviews(
+                no_setup_before=no_setup_before, retry_before=retry_before
+            )
 
     async def save_review(
         self,
@@ -1305,7 +1324,16 @@ class AsyncpgSignalStore:
         cost_usd: float | None,
         error: str | None,
     ) -> None:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).save_review(
+                signal_id=signal_id,
+                decision_kind=decision_kind,
+                review=review,
+                model=model,
+                token_usage=token_usage,
+                cost_usd=cost_usd,
+                error=error,
+            )
 
     async def list_decision_summaries(
         self,
@@ -1315,7 +1343,10 @@ class AsyncpgSignalStore:
         after: tuple[datetime, UUID] | None,
         limit: int,
     ) -> list[DecisionSummary]:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_decision_summaries(
+                since=since, until=until, after=after, limit=limit
+            )
 
     async def list_scan_runs_between(
         self,
@@ -1325,15 +1356,20 @@ class AsyncpgSignalStore:
         after: tuple[datetime, UUID] | None,
         limit: int,
     ) -> list[StoredScanRun]:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_scan_runs_between(
+                since=since, until=until, after=after, limit=limit
+            )
 
     async def list_active_setups(
         self, *, after: tuple[datetime, UUID] | None, limit: int
     ) -> list[StoredActiveSetup]:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_active_setups(after=after, limit=limit)
 
     async def save_critic_report(self, report: StoredCriticReport) -> None:
-        raise NotImplementedError("implemented in Task 6")
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).save_critic_report(report)
 
     # ---- lifecycle --------------------------------------------------------
 
