@@ -115,7 +115,7 @@ to `decided_at + MAX_HOLD` (default **7 days**).
 
 1. **Entry.** Walk candles from `decided_at`. Entry is *touched* when
    `low ≤ entry ≤ high`. If not touched within `ENTRY_VALIDITY` (default **72h**) →
-   `EXPIRED`. If the very first candle already has price beyond entry in the trade's
+   `EXPIRED`. If any candle before the fill opens beyond entry in the trade's
    favour (a gap through), entry is treated as filled at that candle's open.
 2. **After entry**, per candle in order:
    - stop touched: `LONG: low ≤ stop_loss`, `SHORT: high ≥ stop_loss`
@@ -182,7 +182,7 @@ model = Sonnet 4.5 (`DEFAULT_MODEL`). Prompt contents:
 
 | Field | Type |
 |---|---|
-| `decision_id` | UUID (signals.id) |
+| *(keyed by)* | `decision_reviews.signal_id` — the id is the row's PK, not a field of the LLM output |
 | `smc_read_valid` | bool |
 | `skeptic_vindicated` | `YES / NO / NOT_APPLICABLE` |
 | `judge_correct` | bool |
@@ -278,6 +278,7 @@ CREATE TABLE IF NOT EXISTS decision_resolutions (
     signal_id                   UUID PRIMARY KEY REFERENCES signals(id) ON DELETE CASCADE,
     decision_kind               TEXT NOT NULL CHECK (decision_kind IN ('PUBLISHED','VETOED','GATE_REJECTED')),
     outcome                     TEXT NOT NULL CHECK (outcome IN ('WIN','LOSS','EXPIRED','UNRESOLVABLE')),
+    decided_at                  TIMESTAMPTZ NOT NULL,   -- = signals.created_at at replay time
     entered_at                  TIMESTAMPTZ,
     resolved_at                 TIMESTAMPTZ NOT NULL,
     realized_r                  DOUBLE PRECISION NOT NULL,
