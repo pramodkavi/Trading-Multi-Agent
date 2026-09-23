@@ -53,7 +53,7 @@ on:
         description: "upper bound on resolve / review chunks (25 decisions each) per run"
       period_start:
         default: ""
-        description: "ISO date; empty = 14 days ago (incremental) or 2026-06-12 (backfill)"
+        description: "ISO date YYYY-MM-DD (taken as 00:00 UTC) or full YYYY-MM-DDTHH:MM:SSZ; empty = 14 days ago (incremental) or 2026-06-12 (backfill)"
 
 permissions:
   id-token: write # OIDC
@@ -185,6 +185,14 @@ jobs:
           if [ -z "$START" ]; then
             if [ "$MODE" = "backfill" ]; then START=2026-06-12T00:00:00Z; else START=$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z); fi
           fi
+          # `run_critic report --since` rejects a naive timestamp (period bounds must be
+          # unambiguous), while the input is documented as an ISO *date*: widen a bare
+          # YYYY-MM-DD to UTC midnight and pass a full timestamp through untouched.
+          case "$START" in
+            *T*) ;;
+            *) START="${START}T00:00:00Z" ;;
+          esac
+          echo "period: $START -> now"
           UNTIL=$(date -u +%Y-%m-%dT%H:%M:%SZ); DAY=$(date -u +%Y-%m-%d)
           GATE=""; [ "$MODE" = "backfill" ] && GATE="--exit-gate"
           OUT="docs/critic-reports/$DAY.md"

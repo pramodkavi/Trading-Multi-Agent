@@ -281,8 +281,12 @@ adds `--exit-gate`, so the report's first section is the **Slice 2 exit gate**
 (SPEC §5 "End of Slice 2") with PASS / FAIL per criterion and evidence counts.
 
 Inputs: `mode` (`incremental` | `backfill`), `confirm_cost` (bool, backfill
-only), `max_chunks` (default `40`), `period_start` (ISO date; empty = 14 days
-ago for incremental, 2026-06-12 for backfill).
+only), `max_chunks` (default `40`), `period_start` (ISO date `YYYY-MM-DD`, taken
+as 00:00 UTC, or a full `YYYY-MM-DDTHH:MM:SSZ`; empty = 14 days ago for
+incremental, 2026-06-12 for backfill). The workflow widens a bare date to
+`T00:00:00Z` before calling `run_critic report --since`, which rejects any
+timestamp without a `Z` / offset — the period bounds decide which decisions a
+report covers, so an ambiguous bound is an error rather than "assume UTC".
 
 ### 7.3 Where reports land
 
