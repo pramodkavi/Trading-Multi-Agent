@@ -24,7 +24,7 @@ if str(_INFRA_DIR) not in sys.path:
 
 @pytest.fixture(scope="session")
 def templates() -> dict[str, Any]:
-    """Synthesize the data/compute/monitoring stacks once; return their Templates.
+    """Synthesize the data/compute/scheduling/monitoring stacks once; return their Templates.
 
     Built env-agnostically (no account/region) -- enough for resource-shape
     assertions; cross-stack references render as Fn::ImportValue.
@@ -35,6 +35,7 @@ def templates() -> dict[str, Any]:
     from stacks.data_stack import DataStack
     from stacks.monitoring_stack import MonitoringStack
     from stacks.network_stack import NetworkStack
+    from stacks.scheduling_stack import SchedulingStack
 
     app = core.App()
     network = NetworkStack(app, "Network")
@@ -45,6 +46,7 @@ def templates() -> dict[str, Any]:
         db_security_group=network.db_security_group,
     )
     compute = ComputeStack(app, "Compute", cluster=data.cluster, bucket=data.bucket)
+    scheduling = SchedulingStack(app, "Scheduling", scan_function=compute.function)
     monitoring = MonitoringStack(
         app,
         "Monitoring",
@@ -55,5 +57,6 @@ def templates() -> dict[str, Any]:
     return {
         "data": assertions.Template.from_stack(data),
         "compute": assertions.Template.from_stack(compute),
+        "scheduling": assertions.Template.from_stack(scheduling),
         "monitoring": assertions.Template.from_stack(monitoring),
     }
