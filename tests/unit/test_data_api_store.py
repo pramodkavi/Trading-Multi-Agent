@@ -24,14 +24,21 @@ import pytest
 from botocore.exceptions import ClientError
 
 import src.persistence.store as store_module
+from src.agents.critic.models import DecisionKind, Resolution, ResolutionOutcome
 from src.common.models import (
+    ActiveSetupStatus,
     AgentRole,
     SignalDirection,
     SignalProposal,
     SignalStatus,
 )
 from src.common.models.skip_decision import SkipDecision, SkipReason
-from src.persistence.models import StoredAgentRun, StoredScanRun, StoredSignal
+from src.persistence.models import (
+    StoredAgentRun,
+    StoredCriticReport,
+    StoredScanRun,
+    StoredSignal,
+)
 from src.persistence.store import (
     DataApiSignalStore,
     _parse_field,
@@ -662,3 +669,586 @@ async def test_aclose_is_noop() -> None:
     store, client = make_store()
     await store.aclose()
     assert client.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Critic v0 (Step 2.14): resolver / reviewer queues + report reads
+# ---------------------------------------------------------------------------
+
+
+def _resolution(**overrides: Any) -> Resolution:
+    base: dict[str, Any] = {
+        "signal_id": uuid4(),
+        "decision_kind": DecisionKind.PUBLISHED,
+        "outcome": ResolutionOutcome.LOSS,
+        "decided_at": datetime(2026, 7, 1, tzinfo=UTC),
+        "entered_at": None,
+        "resolved_at": datetime(2026, 7, 2, tzinfo=UTC),
+        "realized_r": -1.0,
+        "max_adverse_excursion_r": -1.0,
+        "max_favorable_excursion_r": 0.4,
+        "tp2_reached": False,
+        "candles_used": 12,
+        "engine_version": "replay-v1",
+    }
+    base.update(overrides)
+    return Resolution(**base)
+
+
+async def test_list_unresolved_decisions_binds_cutoff_and_limit() -> None:
+    store, client = make_store(response([]))
+    cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+    rows = await store.list_unresolved_decisions(limit=25, decided_before=cutoff)
+    assert rows == []
+    call = client.calls[0]
+    assert "LEFT JOIN decision_resolutions" in call["sql"]
+    assert "r.signal_id IS NULL" in call["sql"]
+    assert "payload->>'violated_rule' IS NOT NULL" in call["sql"]
+    assert "ORDER BY s.created_at ASC, s.id ASC" in call["sql"]
+    assert call["includeResultMetadata"] is True
+    p = params_by_name(call)
+    assert p["decided_before"] == {"stringValue": cutoff.isoformat()}
+    assert p["limit"] == {"longValue": 25}
+
+
+async def test_list_unresolved_decisions_parses_signal_rows() -> None:
+    proposal = make_proposal()
+    signal_id = uuid4()
+    store, _ = make_store(response(_signal_columns(), _signal_record(proposal, signal_id)))
+    rows = await store.list_unresolved_decisions(
+        limit=10, decided_before=datetime(2026, 7, 1, tzinfo=UTC)
+    )
+    assert len(rows) == 1
+    assert isinstance(rows[0], StoredSignal)
+    assert rows[0].id == signal_id
+    assert rows[0].payload["entry_price"] == 100.0
+
+
+async def test_count_unresolved_decisions_parses_count() -> None:
+    store, client = make_store(response(["n"], [{"longValue": 7}]))
+    n = await store.count_unresolved_decisions(decided_before=datetime(2026, 7, 1, tzinfo=UTC))
+    assert n == 7
+    call = client.calls[0]
+    assert "count(*)" in call["sql"]
+    assert "LEFT JOIN decision_resolutions" in call["sql"]
+    assert "limit" not in params_by_name(call)
+
+
+async def test_list_agent_runs_for_scan_binds_scan_id_and_parses_rows() -> None:
+    scan_id, run_id = uuid4(), uuid4()
+    store, client = make_store(
+        response(
+            [
+                "id",
+                "scan_id",
+                "agent_role",
+                "strategy",
+                "input_hash",
+                "output",
+                "latency_ms",
+                "token_usage",
+                "cost_usd",
+                "created_at",
+            ],
+            [
+                {"stringValue": str(run_id)},
+                {"stringValue": str(scan_id)},
+                {"stringValue": "judge"},
+                {"stringValue": "smc"},
+                {"stringValue": "a" * 64},
+                {"stringValue": '{"ruling": "SKIP"}'},
+                {"longValue": 900},
+                {"stringValue": '{"input_tokens": 1}'},
+                {"isNull": True},
+                {"stringValue": "2026-07-01T08:03:00.000000+00:00"},
+            ],
+        )
+    )
+    runs = await store.list_agent_runs_for_scan(scan_id)
+    call = client.calls[0]
+    assert "WHERE scan_id = :scan_id::uuid" in call["sql"]
+    assert "ORDER BY created_at ASC" in call["sql"]
+    assert params_by_name(call)["scan_id"] == {"stringValue": str(scan_id)}
+    assert len(runs) == 1
+    assert isinstance(runs[0], StoredAgentRun)
+    assert runs[0].agent_role is AgentRole.JUDGE
+    assert runs[0].output == {"ruling": "SKIP"}
+    assert runs[0].cost_usd is None
+
+
+async def test_save_resolution_types_every_param() -> None:
+    store, client = make_store()
+    res = _resolution()
+    await store.save_resolution(res)
+    call = client.calls[0]
+    p = params_by_name(call)
+    assert p["signal_id"] == {"stringValue": str(res.signal_id)}
+    assert p["decision_kind"] == {"stringValue": "PUBLISHED"}
+    assert p["outcome"] == {"stringValue": "LOSS"}
+    assert p["decided_at"] == {"stringValue": res.decided_at.isoformat()}
+    assert p["entered_at"] == {"isNull": True}
+    assert p["resolved_at"] == {"stringValue": res.resolved_at.isoformat()}
+    assert p["realized_r"] == {"doubleValue": -1.0}
+    assert p["max_adverse_excursion_r"] == {"doubleValue": -1.0}
+    assert p["max_favorable_excursion_r"] == {"doubleValue": 0.4}
+    assert p["tp2_reached"] == {"booleanValue": False}
+    assert p["candles_used"] == {"longValue": 12}
+    assert p["engine_version"] == {"stringValue": "replay-v1"}
+    assert "ON CONFLICT (signal_id) DO UPDATE" in call["sql"]
+    assert ":signal_id::uuid" in call["sql"]
+    assert ":decided_at::timestamptz" in call["sql"]
+    assert ":entered_at::timestamptz" in call["sql"]
+
+
+async def test_save_resolution_binds_entered_at_and_null_excursions() -> None:
+    store, client = make_store()
+    entered = datetime(2026, 7, 1, 9, tzinfo=UTC)
+    res = _resolution(
+        outcome=ResolutionOutcome.UNRESOLVABLE,
+        entered_at=entered,
+        realized_r=0.0,
+        max_adverse_excursion_r=None,
+        max_favorable_excursion_r=None,
+        candles_used=0,
+    )
+    await store.save_resolution(res)
+    p = params_by_name(client.calls[0])
+    assert p["entered_at"] == {"stringValue": entered.isoformat()}
+    assert p["max_adverse_excursion_r"] == {"isNull": True}
+    assert p["max_favorable_excursion_r"] == {"isNull": True}
+    assert p["candles_used"] == {"longValue": 0}
+
+
+def _resolution_columns() -> list[str]:
+    return [
+        "signal_id",
+        "decision_kind",
+        "outcome",
+        "decided_at",
+        "entered_at",
+        "resolved_at",
+        "realized_r",
+        "max_adverse_excursion_r",
+        "max_favorable_excursion_r",
+        "tp2_reached",
+        "candles_used",
+        "engine_version",
+    ]
+
+
+async def test_get_resolution_parses_row() -> None:
+    sid = uuid4()
+    store, client = make_store(
+        response(
+            _resolution_columns(),
+            [
+                {"stringValue": str(sid)},
+                {"stringValue": "VETOED"},
+                {"stringValue": "WIN"},
+                {"stringValue": "2026-07-01T00:00:00.000000+00:00"},
+                {"isNull": True},
+                {"stringValue": "2026-07-02T00:00:00.000000+00:00"},
+                {"doubleValue": 3.0},
+                {"isNull": True},
+                {"isNull": True},
+                {"booleanValue": True},
+                {"longValue": 5},
+                {"stringValue": "replay-v1"},
+            ],
+        )
+    )
+    res = await store.get_resolution(sid)
+    call = client.calls[0]
+    assert "WHERE signal_id = :signal_id::uuid" in call["sql"]
+    assert params_by_name(call)["signal_id"] == {"stringValue": str(sid)}
+    assert res is not None
+    assert res.signal_id == sid
+    assert res.decision_kind is DecisionKind.VETOED
+    assert res.outcome is ResolutionOutcome.WIN
+    assert res.decided_at == datetime(2026, 7, 1, tzinfo=UTC)
+    assert res.entered_at is None
+    assert res.realized_r == 3.0
+    assert res.max_adverse_excursion_r is None
+    assert res.tp2_reached is True
+    assert res.candles_used == 5
+
+
+async def test_get_resolution_returns_none_when_empty() -> None:
+    store, _ = make_store(response(_resolution_columns()))
+    assert await store.get_resolution(uuid4()) is None
+
+
+async def test_close_active_setup_for_signal() -> None:
+    store, client = make_store()
+    sid = uuid4()
+    await store.close_active_setup_for_signal(
+        signal_id=sid, status=ActiveSetupStatus.LOSS, evaluation={"source": "resolver"}
+    )
+    call = client.calls[0]
+    assert "UPDATE active_setups" in call["sql"]
+    assert "status = 'OPEN'" in call["sql"]
+    assert "signal_id = :signal_id::uuid" in call["sql"]
+    assert ":latest_evaluation::jsonb" in call["sql"]
+    p = params_by_name(call)
+    assert p["status"] == {"stringValue": "LOSS"}
+    assert p["signal_id"] == {"stringValue": str(sid)}
+    assert json.loads(p["latest_evaluation"]["stringValue"]) == {"source": "resolver"}
+
+
+async def test_save_review_uses_jsonb_casts_and_attempt_increment() -> None:
+    store, client = make_store()
+    sid = uuid4()
+    await store.save_review(
+        signal_id=sid,
+        decision_kind="NO_SETUP",
+        review={"lesson": "x"},
+        model="m",
+        token_usage={},
+        cost_usd=None,
+        error="boom",
+    )
+    call = client.calls[0]
+    assert ":review::jsonb" in call["sql"]
+    assert ":token_usage::jsonb" in call["sql"]
+    assert "attempts = decision_reviews.attempts + 1" in call["sql"]
+    assert "ON CONFLICT (signal_id) DO UPDATE" in call["sql"]
+    p = params_by_name(call)
+    assert p["signal_id"] == {"stringValue": str(sid)}
+    assert p["decision_kind"] == {"stringValue": "NO_SETUP"}
+    assert json.loads(p["review"]["stringValue"]) == {"lesson": "x"}
+    assert p["model"] == {"stringValue": "m"}
+    assert json.loads(p["token_usage"]["stringValue"]) == {}
+    assert p["cost_usd"] == {"isNull": True}
+    assert p["error"] == {"stringValue": "boom"}
+
+
+async def test_save_review_binds_cost_and_null_error() -> None:
+    store, client = make_store()
+    await store.save_review(
+        signal_id=uuid4(),
+        decision_kind="PUBLISHED",
+        review={"lesson": "ok"},
+        model="m",
+        token_usage={"input_tokens": 10},
+        cost_usd=0.0123,
+        error=None,
+    )
+    p = params_by_name(client.calls[0])
+    assert p["cost_usd"] == {"doubleValue": 0.0123}
+    assert p["error"] == {"isNull": True}
+
+
+async def test_list_pending_reviews_binds_both_cutoffs() -> None:
+    store, client = make_store(response([]))
+    t_setup = datetime(2026, 7, 1, tzinfo=UTC)
+    t_retry = datetime(2026, 7, 2, tzinfo=UTC)
+    rows = await store.list_pending_reviews(limit=3, no_setup_before=t_setup, retry_before=t_retry)
+    assert rows == []
+    call = client.calls[0]
+    assert "UNION ALL" in call["sql"]
+    assert "attempts < 2" in call["sql"]
+    assert "JOIN decision_resolutions r" in call["sql"]
+    assert "LEFT JOIN decision_reviews v" in call["sql"]
+    assert "ORDER BY q.created_at ASC, q.id ASC" in call["sql"]
+    p = params_by_name(call)
+    assert p["no_setup_before"] == {"stringValue": t_setup.isoformat()}
+    assert p["retry_before"] == {"stringValue": t_retry.isoformat()}
+    assert p["limit"] == {"longValue": 3}
+
+
+def _signal_record_for_skip(skip: SkipDecision, signal_id: UUID) -> list[dict[str, Any]]:
+    return [
+        {"stringValue": str(signal_id)},
+        {"stringValue": str(skip.scan_id)},
+        {"stringValue": skip.symbol},
+        {"stringValue": skip.strategy},
+        {"isNull": True},
+        {"stringValue": "SKIPPED"},
+        {"stringValue": "2026-07-01T08:03:00.000000+00:00"},
+        {"stringValue": json.dumps(skip.model_dump(mode="json"))},
+        {"arrayValue": {"stringValues": []}},
+        {"stringValue": "{}"},
+        {"isNull": True},
+        {"isNull": True},
+    ]
+
+
+async def test_list_pending_reviews_parses_signal_rows() -> None:
+    skip = make_skip()
+    signal_id = uuid4()
+    store, _ = make_store(response(_signal_columns(), _signal_record_for_skip(skip, signal_id)))
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    rows = await store.list_pending_reviews(limit=5, no_setup_before=t, retry_before=t)
+    assert len(rows) == 1
+    assert rows[0].id == signal_id
+    assert rows[0].direction is None
+    assert rows[0].status is SignalStatus.SKIPPED
+    assert rows[0].payload["reason"] == SkipReason.NO_CLEAR_BIAS.value
+
+
+async def test_count_pending_reviews_parses_count() -> None:
+    store, client = make_store(response(["n"], [{"longValue": 4}]))
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    n = await store.count_pending_reviews(no_setup_before=t, retry_before=t)
+    assert n == 4
+    call = client.calls[0]
+    assert "count(*)" in call["sql"]
+    assert "UNION ALL" in call["sql"]
+    p = params_by_name(call)
+    assert {"no_setup_before", "retry_before"} == set(p)
+
+
+async def test_list_decision_summaries_first_page_nulls_cursor() -> None:
+    store, client = make_store(response([]))
+    since = datetime(2026, 7, 1, tzinfo=UTC)
+    until = datetime(2026, 7, 8, tzinfo=UTC)
+    rows = await store.list_decision_summaries(since=since, until=until, after=None, limit=500)
+    assert rows == []
+    call = client.calls[0]
+    assert "LEFT JOIN decision_resolutions r" in call["sql"]
+    assert "LEFT JOIN decision_reviews v" in call["sql"]
+    assert "CASE WHEN v.error IS NULL THEN v.review::text END AS review" in call["sql"]
+    assert ":after_ts::timestamptz IS NULL" in call["sql"]
+    assert "(s.created_at, s.id) > (:after_ts::timestamptz, :after_id::uuid)" in call["sql"]
+    p = params_by_name(call)
+    assert p["since"] == {"stringValue": since.isoformat()}
+    assert p["until"] == {"stringValue": until.isoformat()}
+    assert p["after_ts"] == {"isNull": True}
+    assert p["after_id"] == {"isNull": True}
+    assert p["limit"] == {"longValue": 500}
+
+
+async def test_list_decision_summaries_second_page_binds_cursor() -> None:
+    store, client = make_store(response([]))
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    cursor_ts = datetime(2026, 7, 3, 13, 3, tzinfo=UTC)
+    cursor_id = uuid4()
+    await store.list_decision_summaries(since=t, until=t, after=(cursor_ts, cursor_id), limit=10)
+    p = params_by_name(client.calls[0])
+    assert p["after_ts"] == {"stringValue": cursor_ts.isoformat()}
+    assert p["after_id"] == {"stringValue": str(cursor_id)}
+
+
+def _summary_columns() -> list[str]:
+    return [
+        "id",
+        "scan_id",
+        "symbol",
+        "direction",
+        "status",
+        "created_at",
+        "violated_rule",
+        "outcome",
+        "decision_kind",
+        "resolution_outcome",
+        "realized_r",
+        "entered_at",
+        "review",
+        "review_error",
+    ]
+
+
+async def test_list_decision_summaries_parses_review_json() -> None:
+    sid, scan = uuid4(), uuid4()
+    rec = [
+        {"stringValue": str(sid)},
+        {"stringValue": str(scan)},
+        {"stringValue": "ETHUSDT"},
+        {"isNull": True},
+        {"stringValue": "SKIPPED"},
+        {"stringValue": "2026-07-01T08:03:00.000000+00:00"},
+        {"stringValue": "RULE_2_MIN_RR"},
+        {"isNull": True},
+        {"stringValue": "GATE_REJECTED"},
+        {"stringValue": "LOSS"},
+        {"doubleValue": -1.0},
+        {"isNull": True},
+        {"stringValue": '{"gate_correct": true}'},
+        {"isNull": True},
+    ]
+    store, _ = make_store(response(_summary_columns(), rec))
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    rows = await store.list_decision_summaries(since=t, until=t, after=None, limit=10)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.id == sid and row.scan_id == scan
+    assert row.direction is None
+    assert row.status is SignalStatus.SKIPPED
+    assert row.created_at == datetime(2026, 7, 1, 8, 3, tzinfo=UTC)
+    assert row.violated_rule == "RULE_2_MIN_RR"
+    assert row.outcome is None
+    assert row.decision_kind == "GATE_REJECTED"
+    assert row.resolution_outcome == "LOSS"
+    assert row.realized_r == -1.0
+    assert row.entered_at is None
+    assert row.review == {"gate_correct": True}
+    assert row.review_error is None
+
+
+async def test_list_decision_summaries_unresolved_published_row() -> None:
+    sid, scan = uuid4(), uuid4()
+    rec = [
+        {"stringValue": str(sid)},
+        {"stringValue": str(scan)},
+        {"stringValue": "BTCUSDT"},
+        {"stringValue": "LONG"},
+        {"stringValue": "PUBLISHED"},
+        {"stringValue": "2026-07-01T13:03:00.000000+00:00"},
+        {"isNull": True},
+        {"stringValue": "WIN"},
+        {"isNull": True},
+        {"isNull": True},
+        {"isNull": True},
+        {"isNull": True},
+        {"isNull": True},
+        {"stringValue": "rate limited"},
+    ]
+    store, _ = make_store(response(_summary_columns(), rec))
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    rows = await store.list_decision_summaries(since=t, until=t, after=None, limit=10)
+    row = rows[0]
+    assert row.direction is SignalDirection.LONG
+    assert row.decision_kind is None and row.resolution_outcome is None
+    assert row.realized_r is None
+    assert row.review is None
+    assert row.review_error == "rate limited"
+
+
+async def test_list_scan_runs_between_second_page_binds_cursor() -> None:
+    store, client = make_store(response([]))
+    since = datetime(2026, 7, 1, tzinfo=UTC)
+    until = datetime(2026, 7, 8, tzinfo=UTC)
+    cur = uuid4()
+    rows = await store.list_scan_runs_between(
+        since=since, until=until, after=(since, cur), limit=100
+    )
+    assert rows == []
+    call = client.calls[0]
+    assert "FROM scan_runs" in call["sql"]
+    assert "started_at >= :since::timestamptz AND started_at < :until::timestamptz" in call["sql"]
+    assert "(started_at, id) > (:after_ts::timestamptz, :after_id::uuid)" in call["sql"]
+    assert "ORDER BY started_at ASC, id ASC" in call["sql"]
+    p = params_by_name(call)
+    assert p["after_ts"] == {"stringValue": since.isoformat()}
+    assert p["after_id"] == {"stringValue": str(cur)}
+    assert p["limit"] == {"longValue": 100}
+
+
+async def test_list_scan_runs_between_parses_rows() -> None:
+    scan_id = uuid4()
+    store, client = make_store(
+        response(
+            [
+                "id",
+                "started_at",
+                "completed_at",
+                "status",
+                "error_message",
+                "session",
+                "strategy",
+                "symbols",
+            ],
+            [
+                {"stringValue": str(scan_id)},
+                {"stringValue": "2026-07-01T08:03:00.000000+00:00"},
+                {"stringValue": "2026-07-01T08:04:30.000000+00:00"},
+                {"stringValue": "SUCCESS"},
+                {"isNull": True},
+                {"stringValue": "LONDON"},
+                {"stringValue": "smc"},
+                {"arrayValue": {"stringValues": ["BTCUSDT", "ETHUSDT"]}},
+            ],
+        )
+    )
+    t = datetime(2026, 7, 1, tzinfo=UTC)
+    rows = await store.list_scan_runs_between(since=t, until=t, after=None, limit=10)
+    p = params_by_name(client.calls[0])
+    assert p["after_ts"] == {"isNull": True} and p["after_id"] == {"isNull": True}
+    assert len(rows) == 1
+    assert isinstance(rows[0], StoredScanRun)
+    assert rows[0].id == scan_id
+    assert rows[0].symbols == ["BTCUSDT", "ETHUSDT"]
+
+
+async def test_list_active_setups_first_page_and_parses_rows() -> None:
+    setup_id, signal_id = uuid4(), uuid4()
+    store, client = make_store(
+        response(
+            ["id", "signal_id", "opened_at", "status", "last_evaluated_at", "latest_evaluation"],
+            [
+                {"stringValue": str(setup_id)},
+                {"stringValue": str(signal_id)},
+                {"stringValue": "2026-07-01T08:03:00.000000+00:00"},
+                {"stringValue": "WIN"},
+                {"stringValue": "2026-07-02T08:03:00.000000+00:00"},
+                {"stringValue": '{"source": "resolver"}'},
+            ],
+        )
+    )
+    rows = await store.list_active_setups(after=None, limit=50)
+    call = client.calls[0]
+    assert "FROM active_setups" in call["sql"]
+    # Every status is included: no status filter after the FROM clause.
+    assert "status =" not in call["sql"].split("FROM active_setups")[1]
+    assert "(opened_at, id) > (:after_ts::timestamptz, :after_id::uuid)" in call["sql"]
+    assert "ORDER BY opened_at ASC, id ASC" in call["sql"]
+    p = params_by_name(call)
+    assert p["after_ts"] == {"isNull": True} and p["after_id"] == {"isNull": True}
+    assert p["limit"] == {"longValue": 50}
+    assert len(rows) == 1
+    assert rows[0].id == setup_id
+    assert rows[0].status is ActiveSetupStatus.WIN
+    assert rows[0].latest_evaluation == {"source": "resolver"}
+
+
+async def test_list_active_setups_second_page_binds_cursor() -> None:
+    store, client = make_store(response([]))
+    ts = datetime(2026, 7, 1, 8, 3, tzinfo=UTC)
+    cur = uuid4()
+    await store.list_active_setups(after=(ts, cur), limit=5)
+    p = params_by_name(client.calls[0])
+    assert p["after_ts"] == {"stringValue": ts.isoformat()}
+    assert p["after_id"] == {"stringValue": str(cur)}
+
+
+async def test_save_critic_report() -> None:
+    store, client = make_store()
+    rep = StoredCriticReport(
+        id=uuid4(),
+        period_start=datetime(2026, 7, 1, tzinfo=UTC),
+        period_end=datetime(2026, 7, 8, tzinfo=UTC),
+        report={"summary": "s"},
+        markdown="# m",
+        pr_url=None,
+        created_at=datetime(2026, 7, 8, tzinfo=UTC),
+    )
+    await store.save_critic_report(rep)
+    call = client.calls[0]
+    assert "INSERT INTO critic_reports" in call["sql"]
+    assert ":report::jsonb" in call["sql"]
+    assert ":created_at::timestamptz" in call["sql"]
+    p = params_by_name(call)
+    assert p["id"] == {"stringValue": str(rep.id)}
+    assert p["period_start"] == {"stringValue": rep.period_start.isoformat()}
+    assert p["period_end"] == {"stringValue": rep.period_end.isoformat()}
+    assert json.loads(p["report"]["stringValue"]) == {"summary": "s"}
+    assert p["markdown"] == {"stringValue": "# m"}
+    assert p["pr_url"] == {"isNull": True}
+    assert p["created_at"] == {"stringValue": rep.created_at.isoformat()}
+
+
+async def test_save_critic_report_binds_pr_url() -> None:
+    store, client = make_store()
+    rep = StoredCriticReport(
+        id=uuid4(),
+        period_start=datetime(2026, 7, 1, tzinfo=UTC),
+        period_end=datetime(2026, 7, 8, tzinfo=UTC),
+        report={},
+        markdown="",
+        pr_url="https://github.com/o/r/pull/1",
+        created_at=datetime(2026, 7, 8, tzinfo=UTC),
+    )
+    await store.save_critic_report(rep)
+    assert params_by_name(client.calls[0])["pr_url"] == {
+        "stringValue": "https://github.com/o/r/pull/1"
+    }
