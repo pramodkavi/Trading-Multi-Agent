@@ -32,9 +32,10 @@ The cluster / bucket live in the DataStack and are passed in, so those grants ar
 cross-stack references (CDK emits the exports/imports). The SSM parameters are
 provisioned out-of-band (docs/operations.md) and referenced here only by ARN.
 
-The layer is exposed as ``self.deps_layer`` so the MonitoringStack's notifier
-Lambda can share it (the notifier builds its OWN code asset -- CDK refuses to bind
-one AssetCode in two stacks).
+The MonitoringStack notifier builds its OWN code asset and LayerVersion from the
+same content (CDK refuses to bind one AssetCode in two stacks, and a cross-stack
+layer import would break ``cdk deploy --all`` on every dependency bump); the
+staged assets are identical, so each uploads once.
 """
 
 from __future__ import annotations
@@ -97,7 +98,7 @@ class ComputeStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # ---- Dependency layer (shared with the MonitoringStack notifier) -----
+        # ---- Dependency layer (MonitoringStack builds its own identical one) --
         self.deps_layer = deps_layer(self, "DepsLayer")
 
         # ---- The scan Lambda (zip code asset + layer) -------------------------

@@ -6,7 +6,7 @@ Why this exists: the Lambda console inline editor only works for a zip
 deployment package under 3 MB, and function + layers must stay under 250 MB
 unzipped. So the deployable is split into
 
-  * a **code asset** -- ``src/`` + ``scripts/`` copied verbatim (~0.6 MB), and
+  * a **code asset** -- ``src/`` + ``scripts/`` copied verbatim (~0.4 MB), and
   * a **dependency layer** -- every ``[project].dependencies`` entry from
     ``pyproject.toml`` except ``boto3`` (already in the Lambda runtime) and
     ``psycopg`` (used only by ``scripts/migrate.py``'s local socket path and
@@ -21,9 +21,10 @@ Size guards fail ``cdk synth`` loudly if either cap is approached, naming the
 largest packages, instead of letting a deploy succeed and the console editor
 silently disappear.
 
-The layer asset hash is CUSTOM (sha256 of the filtered requirement list +
-python version + platform), so the ~190 MB layer is rebuilt and re-uploaded
-only when dependencies change; code-only deploys ship just the small zip.
+Both assets use the OUTPUT hash: the ~130 MB layer is re-uploaded only when the
+installed tree actually changes (pip runs each synth to find out), and a
+code-only deploy ships just the small zip. ``layer_asset_hash`` is kept as a
+cheap fingerprint of the requirement set for logging / tests.
 """
 
 from __future__ import annotations
@@ -135,8 +136,17 @@ def pip_install_command(
 
 
 def run_pip(cmd: list[str]) -> None:
-    """Default runner: execute pip, raising CalledProcessError (with output) on failure."""
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    """Default runner: execute pip; on failure raise with pip's own diagnostic.
+
+    ``CalledProcessError.__str__`` only repeats the command line, and jsii shows
+    just ``str(exc)`` during ``cdk synth`` -- so re-raise with the stderr tail,
+    which is where pip names the package it could not resolve.
+    """
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        tail = (exc.stderr or exc.stdout or "").strip()[-4000:]
+        raise RuntimeError(f"pip failed (exit {exc.returncode}):\n{tail}") from exc
 
 
 def dir_size(path: Path) -> int:
@@ -196,7 +206,25 @@ def build_layer(
     runner(pip_install_command(output_dir, requirements))
     python_dir = output_dir / "python"
     strip_pycache(python_dir)
+    strip_console_scripts(python_dir)
     assert_size(python_dir, LAYER_MAX_BYTES, "Lambda dependency layer")
+
+
+def strip_console_scripts(python_dir: Path) -> None:
+    """Remove ``python/bin`` and its entries from every ``*.dist-info/RECORD``.
+
+    Console-script launchers embed the invoking interpreter's path (and, on
+    Windows, per-build launcher bytes), so their contents -- and therefore the
+    sha256 pip writes for them into RECORD -- differ from run to run. Lambda never
+    runs them. Dropping both keeps the OUTPUT asset hash stable across synths
+    and machines (verified 2026-10-05: two synths differed ONLY in these lines).
+    """
+    shutil.rmtree(python_dir / "bin", ignore_errors=True)
+    for record in python_dir.glob("*.dist-info/RECORD"):
+        lines = record.read_text(encoding="utf-8").splitlines(keepends=True)
+        kept = [line for line in lines if not line.startswith("../../bin/")]
+        if len(kept) != len(lines):
+            record.write_text("".join(kept), encoding="utf-8")
 
 
 def read_layer_requirements(repo_root: Path | None = None) -> list[str]:
@@ -249,15 +277,26 @@ def code_asset() -> lambda_.Code:
 
 
 def deps_layer(scope: Construct, construct_id: str) -> lambda_.LayerVersion:
-    """The shared dependency layer. CUSTOM hash -> rebuilt only when deps change."""
+    """The dependency layer for one stack.
+
+    Call once PER STACK (like ``code_asset``): a LayerVersion ARN imported across
+    stacks is a CloudFormation export, and every dependency bump would replace the
+    layer and fail ``cdk deploy --all`` with "Cannot update export ... in use".
+    Two stacks building the same content produce one staged asset / one upload.
+
+    OUTPUT hash (spec §3.2): pip runs on every synth (~1-2 min) and the hash is
+    taken from the installed tree, so a transitive-dependency change (e.g. a CVE
+    fix in urllib3) is picked up and deployed without touching pyproject -- and
+    the Trivy scan in CI sees the same resolve that ships. A CUSTOM hash keyed on
+    the requirement list would freeze the deployed layer at first publish.
+    """
     requirements = read_layer_requirements()
     return lambda_.LayerVersion(
         scope,
         construct_id,
         code=lambda_.Code.from_asset(
             str(REPO_ROOT / "infrastructure"),
-            asset_hash_type=AssetHashType.CUSTOM,
-            asset_hash=layer_asset_hash(requirements),
+            asset_hash_type=AssetHashType.OUTPUT,
             bundling=BundlingOptions(
                 image=RUNTIME.bundling_image, local=_LayerBundler(requirements)
             ),

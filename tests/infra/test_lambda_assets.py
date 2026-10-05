@@ -8,6 +8,7 @@ uses). No pip, no network, no AWS: pip is injected as a fake runner.
 from __future__ import annotations
 
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -171,7 +172,7 @@ def _fake_pip(files: dict[str, int]) -> Callable[[list[str]], None]:
     return run
 
 
-def test_build_layer_strips_nested_pycache(tmp_path: Path) -> None:
+def test_build_layer_strips_nested_pycache_and_console_scripts(tmp_path: Path) -> None:
     out = tmp_path / "layer"
     out.mkdir()
     runner = _fake_pip(
@@ -179,13 +180,28 @@ def test_build_layer_strips_nested_pycache(tmp_path: Path) -> None:
             "pkg/__init__.py": 10,
             "pkg/sub/__pycache__/m.cpython-311.pyc": 10,
             "pkg/sub/m.py": 10,
+            # pip --target writes console scripts here with the INVOKING python's
+            # shebang path -> machine-specific bytes that would change the layer
+            # hash per machine. Not needed at Lambda runtime.
+            "bin/some-cli": 10,
         }
+    )
+    # pip also lists those launchers (with a per-build hash) in each package's
+    # RECORD; the line must go too or the layer hash still varies per run.
+    record = out / "python" / "pkg-1.0.dist-info" / "RECORD"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        "../../bin/some-cli,sha256=VARIES,108420\n"
+        "pkg/__init__.py,sha256=abc,10\n"
+        "pkg-1.0.dist-info/RECORD,,\n"
     )
 
     la.build_layer(out, ["pkg>=1"], runner=runner)
 
     assert (out / "python" / "pkg" / "sub" / "m.py").exists()
     assert not (out / "python" / "pkg" / "sub" / "__pycache__").exists()
+    assert not (out / "python" / "bin").exists()
+    assert record.read_text() == "pkg/__init__.py,sha256=abc,10\npkg-1.0.dist-info/RECORD,,\n"
 
 
 def test_build_layer_rejects_oversized_layer_and_names_top_packages(
@@ -214,6 +230,21 @@ def test_build_layer_propagates_pip_failure(tmp_path: Path) -> None:
 
     with pytest.raises(subprocess.CalledProcessError):
         la.build_layer(out, ["foo>=1"], runner=failing)
+
+
+def test_run_pip_failure_message_includes_pips_stderr() -> None:
+    # The default runner must surface pip's own diagnostic (which names the
+    # package) -- CalledProcessError's str() only repeats the command line, and
+    # jsii shows only str(exc) during `cdk synth`.
+    cmd = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stderr.write('ERROR: No matching distribution found for foo'); "
+        "sys.exit(1)",
+    ]
+
+    with pytest.raises(RuntimeError, match="No matching distribution found for foo"):
+        la.run_pip(cmd)
 
 
 # ---------------------------------------------------------------------------

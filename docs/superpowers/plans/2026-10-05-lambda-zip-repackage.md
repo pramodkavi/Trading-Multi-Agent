@@ -1349,44 +1349,33 @@ git commit -m "docs: zip + layer packaging, console editing runbook, SPEC §2.4/
 
 ---
 
-### Task 6: Cutover + live verification (operator-run; destructive on three stateless stacks)
+### Task 6: Cutover + live verification (GitHub Actions only; destructive on three stateless stacks)
+
+> **Hard rule (operator, 2026-10-05): this machine has no AWS CLI, no CDK CLI and no AWS
+> credentials, by design. Every AWS operation runs in GitHub Actions.** The original
+> laptop-side steps were replaced by a `workflow_dispatch` input on `deploy-dev.yml`
+> (`recreate_stateless_stacks`), added in the review fix pass.
 
 **Files:**
 - Modify (after deploy): `docs/PROJECT_STATE.md:89, 93` (new function name + log group), §2 status paragraph.
 
-**Interfaces:** none. Requires AWS credentials for account `097853039368`, region `ap-south-1`, CDK CLI `2.1126.0`, the project `.venv` on `PATH`.
+**Interfaces:** `.github/workflows/deploy-dev.yml` `workflow_dispatch` input `recreate_stateless_stacks: boolean` → step "Recreate stateless stacks (manual cutover only)" runs `cdk destroy CryptoSignals-Monitoring CryptoSignals-Scheduling CryptoSignals-Compute --force` before `cdk deploy --all`.
 
-> This task deletes the Compute, Scheduling and Monitoring stacks and recreates them. It does **not** touch `CryptoSignals-Data` (Aurora, S3, DB secret), `CryptoSignals-Network`, or the SSM parameters. CloudWatch log history for the two functions (2-week retention) is lost. Spec §6. **Get an explicit "go" from the operator before Step 2.**
+> The manual run deletes the Compute, Scheduling and Monitoring stacks and recreates them. It does **not** touch `CryptoSignals-Data` (Aurora, S3, DB secret), `CryptoSignals-Network`, or the SSM parameters. CloudWatch log history for the two functions (2-week retention) is lost. Spec §6 / §11.
 
-- [ ] **Step 1: Pre-flight (read-only)**
+- [ ] **Step 1: Merge the PR (`feat/lambda-zip-repackage` → `main`)**
 
-```powershell
-cd infrastructure
-aws sts get-caller-identity --query Account --output text        # expect 097853039368
-cdk diff CryptoSignals-Compute 2>&1 | Select-String -Pattern "PackageType|Layers|AWS::Lambda::LayerVersion|replace"
-cd ..
-```
+Expected: CI green; then the **automatic** Deploy (dev) run goes **red** on `CryptoSignals-Compute` with "Cannot update export ... in use by CryptoSignals-Scheduling/Monitoring" (CloudFormation rolls back; nothing changes). This one red run is accepted (operator decision 2026-10-05).
 
-Expected: the diff shows the function being replaced (`PackageType` removed, `Layers` added) and a new `AWS::Lambda::LayerVersion`. Confirm the operator has said "go".
+- [ ] **Step 2: Operator triggers the cutover from the GitHub UI**
 
-- [ ] **Step 2: Destroy the three stateless stacks (dependents first — CDK orders it)**
+GitHub → Actions → **Deploy (dev)** → **Run workflow** → branch `main` → tick **recreate_stateless_stacks** → Run.
 
-```powershell
-cd infrastructure
-cdk destroy CryptoSignals-Monitoring CryptoSignals-Scheduling CryptoSignals-Compute --force
-```
+Expected in the log: the "Recreate stateless stacks" step prints three `destroyed` lines, then `cdk deploy --all` reports Network and Data `(no changes)` and creates Compute, Scheduling, Monitoring. The `ScanFunctionName` and `AlarmNotifierName` outputs are printed at the end of the Compute / Monitoring deploys.
 
-Expected: three `destroyed` lines. If Compute fails with "Export ... in use", Monitoring/Scheduling were not fully deleted yet — re-run the same command.
+- [ ] **Step 3: Operator pastes the outputs into chat**
 
-- [ ] **Step 3: Deploy everything**
-
-```powershell
-$env:JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION="1"
-cdk deploy --all --require-approval never
-cd ..
-```
-
-Expected: Network and Data report `(no changes)`; Compute, Scheduling, Monitoring are created. Note the `ScanFunctionName` and `AlarmNotifierName` outputs.
+`ScanFunctionName`, `AlarmNotifierName`, and the scan log group name (Lambda console → the scan function → Monitor → the CloudWatch log group link). The assistant cannot query AWS.
 
 - [ ] **Step 4: Verify in the console (the whole point of the change)**
 
@@ -1395,17 +1384,17 @@ Expected: Network and Data report `(no changes)`; Compute, Scheduling, Monitorin
    - `{}` → `{"ok": true, ...}` and a Telegram message.
    - `{"symbols": ["BTCUSDT"]}` → `{"ok": true, ...}`.
    - `{"mode": "forecaster"}` → `{"ok": true, "mode": "forecaster", ...}`.
-   - `{"mode": "resolve", "chunk_size": 25}` → `{"ok": true, "mode": "resolve", ...}`.
+   - `{"mode": "resolve", "chunk_size": 25}` → `{"ok": true, "mode": "resolve", ...}` — **skip on this branch**: the resolver lives on `feat/slice-2-step-2.14-critic-v0`; here an unknown mode falls through to a full scan (real Telegram + LLM spend).
    - `{"mode": "migrate"}` → `{"ok": true, "mode": "migrate", "statements": N}`.
 3. Make a trivial console edit (add one `logger.info("console-edit smoke")` to `scripts/run_scan.py` → `lambda_handler`), Deploy, Test `{}` again, and confirm the line appears in CloudWatch logs. Then remove it and Deploy again.
-4. Notifier: `aws sns publish --topic-arn <AlarmTopicArn output> --message '{"AlarmName":"cutover-test","NewStateValue":"ALARM","NewStateReason":"runbook"}' --region ap-south-1` → Telegram message arrives.
-5. EventBridge Scheduler console: 6 schedules present and ENABLED (4 scan windows, forecaster sweep, resolver — or 5 if this branch predates the resolver schedule; record which).
+4. Notifier (no CLI): SNS console → Topics → the `crypto-signals alarms` topic → **Publish message** → body `{"AlarmName":"cutover-test","NewStateValue":"ALARM","NewStateReason":"runbook"}` → Telegram message arrives.
+5. EventBridge Scheduler console: 5 schedules present and ENABLED (4 scan windows + forecaster sweep; the `rate(2 days)` resolver schedule arrives with the Critic v0 merge).
 
 - [ ] **Step 5: Record the new live IDs**
 
-Update `docs/PROJECT_STATE.md`:
+Update `docs/PROJECT_STATE.md` from the values the operator pasted in Step 3:
 - line 89 `**Lambda function**` → the new `ScanFunctionName` output.
-- line 93 `**Lambda log group**` → the new log group name (`aws logs describe-log-groups --log-group-name-prefix CryptoSignals-Compute --region ap-south-1 --query 'logGroups[].logGroupName'`).
+- line 93 `**Lambda log group**` → the new log group name.
 - §2 status: add one sentence `**Repackaged 2026-10-0X:** zip + layer, console editing verified (scan/forecaster/resolve/migrate events + notifier).`
 
 ```powershell
@@ -1415,4 +1404,4 @@ git commit -m "docs(state): live IDs after the zip + layer cutover; console edit
 
 - [ ] **Step 6: Finish the branch**
 
-Run the universal checkpoints one last time, then use `superpowers:finishing-a-development-branch` to open the PR `feat/lambda-zip-repackage → main`. Note in the PR body that the branch does not include the unmerged Critic v0 work and that `infrastructure/stacks/*.py` / `tests/infra/test_stacks.py` will need a small merge with `feat/slice-2-step-2.14-critic-v0` (which adds the `rate(2 days)` schedule and its tests; no overlap with the packaging changes).
+(The PR is opened BEFORE Step 1 of this task via `superpowers:finishing-a-development-branch`; this step is the post-cutover wrap-up.) Note in the PR body: (a) the expected red automatic deploy and the manual `recreate_stateless_stacks` run that follows; (b) the branch does not include the unmerged Critic v0 work, and `infrastructure/stacks/*.py` / `tests/infra/test_stacks.py` will need a small merge with `feat/slice-2-step-2.14-critic-v0` (which adds the `rate(2 days)` schedule and its tests; no overlap with the packaging changes).

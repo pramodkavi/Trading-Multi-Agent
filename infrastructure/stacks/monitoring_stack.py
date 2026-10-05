@@ -21,9 +21,11 @@ Alarms:
 
 The notifier Lambda ships as a zip of the same ``src/`` + ``scripts/`` code asset
 as the scan Lambda (handler overridden to ``scripts.alarm_notifier.lambda_handler``)
-and attaches the scan's dependency layer, so there is one artifact set to build and
-patch (design 2026-10-03 §3.3). It reads the Telegram token/chat from the same SSM
-SecureString parameter the scan uses.
+with its own copy of the dependency LayerVersion built from the same content, so
+there is one artifact set to build and patch (design 2026-10-03 §3.3, amended after
+review: importing Compute's layer ARN would make every dependency bump fail
+``cdk deploy --all`` on the cross-stack export). It reads the Telegram token/chat
+from the same SSM SecureString parameter the scan uses.
 
 Budget alarms for AWS infra / Anthropic spend are deferred (NFR-5.1/5.2 land
 with the cost-tracking work in Slice 3's Critic).
@@ -50,7 +52,7 @@ from aws_cdk import aws_sns as sns
 from aws_cdk import aws_sns_subscriptions as subscriptions
 from cdk_nag import NagSuppressions
 from constructs import Construct
-from lambda_assets import ARCHITECTURE, RUNTIME, code_asset
+from lambda_assets import ARCHITECTURE, RUNTIME, code_asset, deps_layer
 
 from stacks.parameters import TELEGRAM_PARAM_ENV, TELEGRAM_PARAM_NAME
 
@@ -77,7 +79,6 @@ class MonitoringStack(Stack):
         *,
         scan_function: lambda_.IFunction,
         scan_log_group: logs.ILogGroup,
-        deps_layer: lambda_.ILayerVersion,
         cluster: rds.DatabaseCluster,
         **kwargs: Any,
     ) -> None:
@@ -90,7 +91,7 @@ class MonitoringStack(Stack):
             display_name="crypto-signals alarms",
             enforce_ssl=True,
         )
-        self.notifier = self._build_notifier(deps_layer)
+        self.notifier = self._build_notifier()
         self.topic.add_subscription(subscriptions.LambdaSubscription(self.notifier))
 
         # ---- Alarms (NFR-2.2) ------------------------------------------------
@@ -116,13 +117,16 @@ class MonitoringStack(Stack):
     # Notifier Lambda
     # ------------------------------------------------------------------
 
-    def _build_notifier(self, deps_layer: lambda_.ILayerVersion) -> lambda_.Function:
+    def _build_notifier(self) -> lambda_.Function:
         """A small Lambda that posts CloudWatch alarms to Telegram.
 
-        Same zip code asset as the scan Lambda (a FRESH AssetCode instance -- CDK
-        refuses to bind one instance in two stacks; staging dedupes the upload),
-        handler overridden, scan dependency layer attached by reference.
+        Same zip code asset and the same dependency-layer content as the scan
+        Lambda, each built in THIS stack (fresh AssetCode / own LayerVersion:
+        CDK refuses to bind one AssetCode in two stacks, and a cross-stack layer
+        import would break on every dependency bump). Staging dedupes identical
+        assets, so each is uploaded once.
         """
+        layer = deps_layer(self, "DepsLayer")
         log_group = logs.LogGroup(
             self,
             "AlarmNotifierLogs",
@@ -136,7 +140,7 @@ class MonitoringStack(Stack):
             architecture=ARCHITECTURE,
             handler="scripts.alarm_notifier.lambda_handler",
             code=code_asset(),
-            layers=[deps_layer],
+            layers=[layer],
             memory_size=256,
             timeout=Duration.seconds(30),
             log_group=log_group,

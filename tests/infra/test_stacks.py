@@ -134,8 +134,12 @@ def test_monitoring_notifier_is_a_zip_function_sharing_the_layer(
     templates: dict[str, Any],
 ) -> None:
     # Design 2026-10-03 §3.3: same zip code asset shape as the scan Lambda,
-    # handler overridden, layer IMPORTED from Compute (no LayerVersion here).
-    templates["monitoring"].resource_count_is("AWS::Lambda::LayerVersion", 0)
+    # handler overridden. The layer is built in THIS stack too (same asset
+    # content -> one upload) rather than imported from Compute: an imported
+    # LayerVersion ARN is a CloudFormation export, and every dependency bump
+    # would replace the layer and break `cdk deploy --all` with
+    # "Cannot update export ... in use by CryptoSignals-Monitoring".
+    templates["monitoring"].resource_count_is("AWS::Lambda::LayerVersion", 1)
     templates["monitoring"].has_resource_properties(
         "AWS::Lambda::Function",
         {
@@ -143,8 +147,7 @@ def test_monitoring_notifier_is_a_zip_function_sharing_the_layer(
             "Handler": "scripts.alarm_notifier.lambda_handler",
             "Architectures": ["x86_64"],
             "PackageType": assertions.Match.absent(),
-            # Cross-stack reference to Compute's DepsLayer.
-            "Layers": [{"Fn::ImportValue": assertions.Match.any_value()}],
+            "Layers": [{"Ref": assertions.Match.string_like_regexp("^DepsLayer")}],
             "MemorySize": 256,
             "Timeout": 30,
         },

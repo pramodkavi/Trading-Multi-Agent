@@ -140,14 +140,16 @@ if present, or these keys): `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM
 ### Deploy / invoke recipes (Windows, from repo root)
 
 ```bash
-# Deploy (no Docker: cdk builds the zip code asset + dependency layer with pip)
+# Deploy: NOT from this machine (hard rule: no AWS CLI / CDK / credentials locally).
+#   Merge to main -> Deploy (dev) runs in GitHub Actions; or Actions -> Deploy (dev)
+#   -> Run workflow (tick recreate_stateless_stacks only when a function must be
+#   replaced). No Docker: the runner builds the zip code asset + layer with pip.
+# Local synth only (no credentials; runs cdk-nag + the asset size guards):
 cd infrastructure
 export PATH="/<drive>/.../Trading Multi Agent/.venv/Scripts:$PATH"   # so `python app.py` finds aws-cdk-lib
 export JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION=1                  # silence Node-version banner
-cdk deploy --all --require-approval never
-#   ^ first synth pip-installs the ~130 MB layer (1-2 min); later synths reuse it
-#     from cdk.out until pyproject dependencies change. Code-only deploys ship 0.4 MB.
-#   ^ `cdk deploy --hotswap CryptoSignals-Compute` pushes a code-only change in seconds.
+python app.py
+#   ^ pip-installs the ~130 MB layer each synth (1-2 min); the code asset is 0.4 MB.
 
 # DB migration over the Data API (idempotent).
 #   NOTE: as of Slice 2 the CD workflows run this AUTOMATICALLY before `cdk deploy`

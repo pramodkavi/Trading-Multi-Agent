@@ -28,6 +28,21 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
+  # Manual run from the Actions UI. The operator's machine has NO AWS CLI / CDK /
+  # credentials by rule, so every AWS operation -- including the one-off
+  # destroy+recreate below -- is a workflow step triggered from GitHub.
+  workflow_dispatch:
+    inputs:
+      recreate_stateless_stacks:
+        description: >-
+          DESTROY and recreate CryptoSignals-Monitoring, -Scheduling and -Compute
+          before deploying (Data/Network untouched). Needed once for the
+          2026-10-03 image->zip repackage: CloudFormation cannot replace the
+          function while its ARN is an export still imported by the other two
+          stacks. Loses the two Lambda log groups (2-week retention).
+        type: boolean
+        default: false
+        required: false
 
 # Never run two dev deploys at once; let an in-flight deploy finish.
 concurrency:
@@ -41,15 +56,16 @@ permissions:
 jobs:
   deploy:
     name: cdk deploy (dev)
-    # Only deploy if the CI run actually succeeded.
-    if: github.event.workflow_run.conclusion == 'success'
+    # Auto path: only deploy if the CI run actually succeeded. Manual path: always.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     environment: dev
     steps:
       - uses: actions/checkout@v4
         with:
-          # Deploy exactly the commit CI validated, not the branch tip.
-          ref: ${{ github.event.workflow_run.head_sha }}
+          # Auto path: deploy exactly the commit CI validated, not the branch tip.
+          # Manual path (workflow_dispatch): the ref the operator chose in the UI.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - uses: actions/setup-python@v5
         with:
@@ -113,9 +129,25 @@ jobs:
           echo "::error::Migration failed after 5 attempts."
           exit 1
 
+      - name: Recreate stateless stacks (manual cutover only)
+        # Runs ONLY when the operator ticked the box on a manual run. Destroys the
+        # three stateless stacks so the next step can create the zip-packaged
+        # functions with fresh ARNs/exports. CDK orders the destroys dependents-
+        # first (Monitoring, Scheduling import Compute's function ARN). Aurora,
+        # S3, the DB secret (Data) and the VPC (Network) are not touched.
+        if: github.event_name == 'workflow_dispatch' && inputs.recreate_stateless_stacks == true
+        working-directory: infrastructure
+        env:
+          JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION: "1"
+        run: |
+          set -euo pipefail
+          echo "::warning::Destroying CryptoSignals-Monitoring, CryptoSignals-Scheduling, CryptoSignals-Compute (Data/Network untouched)."
+          cdk destroy CryptoSignals-Monitoring CryptoSignals-Scheduling CryptoSignals-Compute --force
+          echo "::notice::Stateless stacks destroyed; recreating with cdk deploy --all."
+
       - name: Deploy all stacks
         # The Step 2.12 "Compute-first" export transition is complete: the
-        # 2026-10-03 zip repackage cutover recreated Compute/Scheduling/Monitoring,
+        # 2026-10-03 zip repackage cutover recreates Compute/Scheduling/Monitoring,
         # so there are no stale cross-stack exports left to release.
         working-directory: infrastructure
         env:
