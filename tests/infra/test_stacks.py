@@ -81,6 +81,39 @@ def test_compute_role_can_get_ssm_parameters(templates: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# ComputeStack: zip packaging + dependency layer (design 2026-10-03 §3.1-3.2)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_lambda_is_a_zip_function_on_python311(templates: dict[str, Any]) -> None:
+    templates["compute"].resource_count_is("AWS::Lambda::Function", 1)
+    templates["compute"].has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Runtime": "python3.11",
+            "Handler": "scripts.run_scan.lambda_handler",
+            "Architectures": ["x86_64"],
+            "PackageType": assertions.Match.absent(),
+            # The layer lives in this stack, so it renders as a plain Ref.
+            "Layers": [{"Ref": assertions.Match.string_like_regexp("^DepsLayer")}],
+            "MemorySize": 1024,
+            "Timeout": 600,
+        },
+    )
+
+
+def test_compute_stack_owns_the_dependency_layer(templates: dict[str, Any]) -> None:
+    templates["compute"].resource_count_is("AWS::Lambda::LayerVersion", 1)
+    templates["compute"].has_resource_properties(
+        "AWS::Lambda::LayerVersion",
+        {
+            "CompatibleRuntimes": ["python3.11"],
+            "CompatibleArchitectures": ["x86_64"],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # MonitoringStack: 4 alarms + SNS -> notifier Lambda + provider-error filter
 # ---------------------------------------------------------------------------
 
