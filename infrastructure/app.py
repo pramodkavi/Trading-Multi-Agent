@@ -70,6 +70,7 @@ MonitoringStack(
     env=env,
     scan_function=compute.function,
     scan_log_group=compute.log_group,
+    deps_layer=compute.deps_layer,
     cluster=data.cluster,
 )
 

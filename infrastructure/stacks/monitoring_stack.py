@@ -19,10 +19,11 @@ Alarms:
      The scan logs a ``PROVIDER_ERROR`` marker (scripts/run_scan.py) which the
      filter counts. Richer provider-error tracking lands in Step 2.13.
 
-The notifier Lambda reuses the scan container image (same asset, CMD overridden
-to ``scripts.alarm_notifier.lambda_handler``) so there is one image to build and
-patch. It reads the Telegram token/chat from the same SSM SecureString parameter
-the scan uses.
+The notifier Lambda ships as a zip of the same ``src/`` + ``scripts/`` code asset
+as the scan Lambda (handler overridden to ``scripts.alarm_notifier.lambda_handler``)
+and attaches the scan's dependency layer, so there is one artifact set to build and
+patch (design 2026-10-03 §3.3). It reads the Telegram token/chat from the same SSM
+SecureString parameter the scan uses.
 
 Budget alarms for AWS infra / Anthropic spend are deferred (NFR-5.1/5.2 land
 with the cost-tracking work in Slice 3's Critic).
@@ -30,7 +31,6 @@ with the cost-tracking work in Slice 3's Critic).
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from aws_cdk import (
@@ -50,12 +50,9 @@ from aws_cdk import aws_sns as sns
 from aws_cdk import aws_sns_subscriptions as subscriptions
 from cdk_nag import NagSuppressions
 from constructs import Construct
+from lambda_assets import ARCHITECTURE, RUNTIME, code_asset
 
 from stacks.parameters import TELEGRAM_PARAM_ENV, TELEGRAM_PARAM_NAME
-
-# Repo root is the Docker build context (holds Dockerfile.lambda); parents[2]
-# from infrastructure/stacks/monitoring_stack.py.
-REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Custom metric the provider-error log metric filter publishes into.
 PROVIDER_ERROR_NAMESPACE = "CryptoSignals"
@@ -80,6 +77,7 @@ class MonitoringStack(Stack):
         *,
         scan_function: lambda_.IFunction,
         scan_log_group: logs.ILogGroup,
+        deps_layer: lambda_.ILayerVersion,
         cluster: rds.DatabaseCluster,
         **kwargs: Any,
     ) -> None:
@@ -92,7 +90,7 @@ class MonitoringStack(Stack):
             display_name="crypto-signals alarms",
             enforce_ssl=True,
         )
-        self.notifier = self._build_notifier()
+        self.notifier = self._build_notifier(deps_layer)
         self.topic.add_subscription(subscriptions.LambdaSubscription(self.notifier))
 
         # ---- Alarms (NFR-2.2) ------------------------------------------------
@@ -118,12 +116,12 @@ class MonitoringStack(Stack):
     # Notifier Lambda
     # ------------------------------------------------------------------
 
-    def _build_notifier(self) -> lambda_.DockerImageFunction:
+    def _build_notifier(self, deps_layer: lambda_.ILayerVersion) -> lambda_.Function:
         """A small Lambda that posts CloudWatch alarms to Telegram.
 
-        Reuses the scan container image (same asset hash -> one ECR image) with
-        the CMD overridden to the alarm handler. It reads the Telegram token/chat
-        from the same SSM SecureString parameter the scan Lambda uses.
+        Same zip code asset as the scan Lambda (a FRESH AssetCode instance -- CDK
+        refuses to bind one instance in two stacks; staging dedupes the upload),
+        handler overridden, scan dependency layer attached by reference.
         """
         log_group = logs.LogGroup(
             self,
@@ -131,14 +129,14 @@ class MonitoringStack(Stack):
             retention=logs.RetentionDays.TWO_WEEKS,
             removal_policy=RemovalPolicy.DESTROY,
         )
-        notifier = lambda_.DockerImageFunction(
+        notifier = lambda_.Function(
             self,
             "AlarmNotifier",
-            code=lambda_.DockerImageCode.from_image_asset(
-                directory=str(REPO_ROOT),
-                file="Dockerfile.lambda",
-                cmd=["scripts.alarm_notifier.lambda_handler"],
-            ),
+            runtime=RUNTIME,
+            architecture=ARCHITECTURE,
+            handler="scripts.alarm_notifier.lambda_handler",
+            code=code_asset(),
+            layers=[deps_layer],
             memory_size=256,
             timeout=Duration.seconds(30),
             log_group=log_group,
@@ -273,7 +271,14 @@ class MonitoringStack(Stack):
                         "for CloudWatch Logs write only; its only other grant is "
                         "ssm:GetParameter on one exact parameter ARN."
                     ),
-                }
+                },
+                {
+                    "id": "AwsSolutions-L1",
+                    "reason": (
+                        "python3.11 is deliberate and matches the scan Lambda and the shared "
+                        "dependency layer's cp311 wheels; a runtime bump is its own step."
+                    ),
+                },
             ],
             apply_to_children=True,
         )

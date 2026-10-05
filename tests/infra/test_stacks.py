@@ -130,6 +130,27 @@ def test_monitoring_has_sns_topic_and_lambda_subscription(templates: dict[str, A
     )
 
 
+def test_monitoring_notifier_is_a_zip_function_sharing_the_layer(
+    templates: dict[str, Any],
+) -> None:
+    # Design 2026-10-03 §3.3: same zip code asset shape as the scan Lambda,
+    # handler overridden, layer IMPORTED from Compute (no LayerVersion here).
+    templates["monitoring"].resource_count_is("AWS::Lambda::LayerVersion", 0)
+    templates["monitoring"].has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Runtime": "python3.11",
+            "Handler": "scripts.alarm_notifier.lambda_handler",
+            "Architectures": ["x86_64"],
+            "PackageType": assertions.Match.absent(),
+            # Cross-stack reference to Compute's DepsLayer.
+            "Layers": [{"Fn::ImportValue": assertions.Match.any_value()}],
+            "MemorySize": 256,
+            "Timeout": 30,
+        },
+    )
+
+
 def test_monitoring_notifier_reads_telegram_param(templates: dict[str, Any]) -> None:
     templates["monitoring"].has_resource_properties(
         "AWS::Lambda::Function",
