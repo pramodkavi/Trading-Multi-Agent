@@ -5,8 +5,9 @@
 # GitHub Environment, whose protection rule (required reviewers) blocks the run
 # until a human approves. The approval is configured in repo settings, not here.
 #
-# As with dev, `cdk deploy` builds and pushes the Lambda image asset itself, and
-# the DB schema migration runs automatically BEFORE `cdk deploy` (additive +
+# As with dev, `cdk deploy` builds the zip code asset + dependency layer itself
+# (python + pip, no Docker), and the DB schema migration runs automatically
+# BEFORE `cdk deploy` (additive +
 # idempotent; ARNs discovered from the DataStack's CloudFormation outputs).
 #
 # One-time prerequisites (configured outside this repo):

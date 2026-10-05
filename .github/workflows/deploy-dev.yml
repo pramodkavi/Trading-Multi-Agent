@@ -3,9 +3,9 @@
 # Triggered when the CI workflow completes successfully on main (workflow_run is
 # the faithful "after CI passes" trigger). Deploys all stacks to the dev account.
 #
-# Why no separate docker-build / ECR-push step: ComputeStack uses
-# DockerImageCode.from_image_asset, so `cdk deploy` builds the Lambda image and
-# pushes it to the CDK-managed ECR asset repo itself (ubuntu-latest has Docker).
+# Why no docker / ECR step: ComputeStack and MonitoringStack package the Lambdas
+# as a zip code asset + a dependency layer built by infrastructure/lambda_assets.py
+# with pip's manylinux flags, so `cdk deploy` needs only python + pip (no Docker).
 #
 # DB schema migration runs automatically BEFORE `cdk deploy` (Slice 2): the
 # schema is additive + idempotent and must exist before the new Lambda code
@@ -114,32 +114,10 @@ jobs:
           exit 1
 
       - name: Deploy all stacks
+        # The Step 2.12 "Compute-first" export transition is complete: the
+        # 2026-10-03 zip repackage cutover recreated Compute/Scheduling/Monitoring,
+        # so there are no stale cross-stack exports left to release.
         working-directory: infrastructure
-        run: |
-          set -euo pipefail
-          # One-time cross-stack export transition (Step 2.12). Step 2.12 moved the
-          # Anthropic/Telegram API keys from Secrets Manager to SSM, which removed
-          # the secret-ARN CloudFormation *exports* DataStack published and
-          # ComputeStack imported. CloudFormation cannot delete an export that is
-          # still imported, and `cdk deploy --all` updates the producer (Data)
-          # BEFORE the consumer (Compute) -- so a plain `--all` fails with
-          # "Export ... cannot be deleted as it is in use by CryptoSignals-Compute".
-          # Fix: deploy Compute FIRST (dropping the imports) so the subsequent
-          # `--all` lets Data drop the now-unused exports.
-          #
-          # Run Compute-first UNCONDITIONALLY and tolerate failure: `cdk` deploys to
-          # the region PINNED in app.py (ap-south-1) no matter the CLI default
-          # region, so we must not gate on `aws cloudformation describe-stacks` --
-          # that queries the CLI default region (vars.AWS_REGION) and silently skips
-          # the step when that differs from the pinned deploy region (which is what
-          # made the first attempt at this fix a no-op). On a first-ever (fresh)
-          # deploy Compute cannot precede Data, so the command fails harmlessly and
-          # we fall through to `--all`, which creates everything.
-          # TRANSITIONAL: revert to a plain `cdk deploy --all` once dev is on 2.12
-          # (a permanent Compute-first would break a FUTURE new Data->Compute ref).
-          if cdk deploy CryptoSignals-Compute --exclusively --require-approval never; then
-            echo "::notice::Deployed CryptoSignals-Compute first; cross-stack secret imports released."
-          else
-            echo "::warning::Compute-first deploy did not succeed (fresh environment, or see the error above) -- continuing with --all."
-          fi
-          cdk deploy --all --require-approval never
+        env:
+          JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION: "1"
+        run: cdk deploy --all --require-approval never
