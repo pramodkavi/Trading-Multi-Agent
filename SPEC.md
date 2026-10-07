@@ -136,8 +136,8 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 | Component | Technology | Rationale |
 |---|---|---|
-| Agent compute | AWS Lambda (container image) | Event-driven, scale-to-zero, no cluster to manage; one scan finishes in seconds |
-| Packaging | Container image in Amazon ECR | Reuse the project Dockerfile (deps too large for a zip); Lambda pulls the image |
+| Agent compute | AWS Lambda (zip + dependency layer) | Event-driven, scale-to-zero, no cluster to manage; one scan finishes in seconds. Zip packaging keeps the source readable/editable in the Lambda console (2026-10-03 repackage; was a container image) |
+| Packaging | Zip code asset (`src/` + `scripts/`, ~0.4 MB, <3 MB console-editor cap) + one Lambda Layer (~130 MB unzipped of the 250 MB cap) built by `infrastructure/lambda_assets.py` with pip manylinux wheels — **no Docker** | The earlier "deps too large for a zip" held for a single zip; with a layer the measured set fits. Size guards fail synth before either cap |
 | Scheduling | EventBridge Scheduler → Lambda | Cron rules invoke the scan Lambda directly |
 | DB connectivity | RDS Data API (boto3 `rds-data`) | Lambda queries Aurora over HTTPS — no VPC attachment, therefore no NAT |
 | Future fan-out | AWS Step Functions (deferred) | If a later slice needs per-symbol parallelism beyond one Lambda's budget; not needed at Slice 1-2 scale |
@@ -164,7 +164,7 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 | Local dev | LocalStack + docker-compose | Tight Claude Code iteration loop despite production complexity |
 | Version control | GitHub | Standard |
 | CI/CD | GitHub Actions | Tag-based production deploys |
-| Container scanning | Trivy (in CI) | Catches base image vulnerabilities |
+| Dependency scanning | Trivy `fs` over the pinned layer requirement set (in CI) | Catches vulnerable Python dependencies; replaced the container-image scan when the image was dropped (2026-10-03) |
 
 ### 2.7 Notifications
 
@@ -512,8 +512,9 @@ The build is organized into **four vertical slices**. Each slice goes through th
 
 #### Step 1.18: LambdaStack implementation
 
-- Build the scan **Lambda from a container image** (a Lambda-runtime Dockerfile
-  using the AWS base image / runtime interface client) pushed to **ECR**
+- Build the scan **Lambda as a zip code asset + dependency layer** (originally a
+  container image; repackaged 2026-10-03 for console editability, see
+  `docs/superpowers/specs/2026-10-03-lambda-zip-repackage-design.md`)
 - Lambda runs **outside any VPC** (free internet egress to Binance/Anthropic/Telegram)
 - Least-privilege execution role (NFR-3.2): `rds-data` to the one cluster,
   read of the Aurora DB credential secret, `ssm:GetParameter` on the required
@@ -535,15 +536,15 @@ The build is organized into **four vertical slices**. Each slice goes through th
 
 - Create `.github/workflows/ci.yml`
 - On every push and PR: ruff check, mypy strict, pytest with coverage report
-- On every push to main: run full test suite, build the Lambda container image,
-  scan with Trivy
+- On every push to main: run full test suite, build the Lambda dependency layer,
+  scan its pinned requirements with Trivy
 - Verify CI passes
 
 #### Step 1.21: GitHub Actions CD
 
 - Create `.github/workflows/deploy-dev.yml` — triggered on push to `main` after CI passes
-  - Build the Lambda container image
-  - Push to ECR (dev account)
+  - `cdk deploy` synthesises the zip code asset + dependency layer (no Docker,
+    no ECR push)
   - Run `cdk deploy` for the dev stacks
 - Create `.github/workflows/deploy-prod.yml` — triggered on git tag push
   - Same flow but to the production account

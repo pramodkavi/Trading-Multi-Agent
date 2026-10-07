@@ -102,13 +102,23 @@ leading `/`.)
 ## 2. Deploy
 
 CD deploys on merge to `main` (dev) and on a `v*.*.*` tag (prod, with a manual
-approval gate). To deploy by hand from the repo root (Docker Desktop must be
-running — the Lambda image builds locally):
+approval gate). **Hard rule: the dev machine has no AWS CLI, CDK CLI or AWS
+credentials — every deploy and every one-off AWS operation runs in GitHub Actions.**
+No Docker is needed anywhere: CDK builds the zip code asset and the dependency
+layer with pip on the runner.
 
-```bash
-cd infrastructure
-cdk deploy --all --region ap-south-1
-```
+Manual deploy (same workflow, from the GitHub UI): Actions → **Deploy (dev)** →
+**Run workflow** → branch `main`. Tick **recreate_stateless_stacks** ONLY when a
+function must be replaced (e.g. the 2026-10-03 image→zip repackage): it destroys
+`CryptoSignals-Monitoring`, `-Scheduling`, `-Compute` and recreates them (Data and
+Network untouched; the two Lambda log groups are lost).
+
+Locally you can only synthesise (no credentials needed) to check cdk-nag and the
+asset size guards: `cd infrastructure && python app.py`.
+
+If synth fails with `AssetTooLargeError`, a dependency pushed the layer over the
+240 MB guard (or the code over 2.5 MB); the message names the largest packages.
+Trim the dependency or move it to an optional extra — do not raise the guard.
 
 Stacks (dependency order): `Network → Data → Compute → Scheduling → Monitoring`.
 First-time-on-this-account only: `cdk bootstrap` (already done for ap-south-1).
@@ -147,7 +157,7 @@ on the DB secret — see PROJECT_STATE §7).
 ## 3. Alarms (NFR-2.2)
 
 CloudWatch alarms publish to an SNS topic, which a small **notifier Lambda**
-(`AlarmNotifier`, reuses the scan image) forwards to the operator's Telegram bot.
+(`AlarmNotifier`, same zip code asset + layer as the scan Lambda) forwards to the operator's Telegram bot.
 No manual SNS subscription is needed — CDK wires it.
 
 | Alarm | Fires when | Source |
@@ -186,6 +196,40 @@ the scan a few times so it errors, and watch `ScanFailureRateAlarm` /
 ---
 
 ## 4. Routine operations
+
+### 4.1 Editing and testing in the Lambda console
+
+Both Lambdas are zip-packaged, so the console shows the full `src/` and
+`scripts/` tree (design 2026-10-03). Workflow:
+
+1. Lambda console → the scan function → **Code** tab. Edit any file (agent
+   prompts, the watchlist default in `src/config/settings.py`, risk gates in
+   `src/agents/orchestration/risk_gates.py`, pipeline logic, extra logging).
+2. **Deploy** (console button, a few seconds).
+3. **Test** tab. Useful saved events:
+
+   | Event | What it runs |
+   |---|---|
+   | `{}` | full watchlist scan |
+   | `{"symbols": ["BTCUSDT"]}` | one symbol |
+   | `{"mode": "forecaster"}` | Forecaster sweep over open setups |
+   | `{"mode": "resolve", "chunk_size": 25}` | Critic v0 outcome resolver — **only after the Critic v0 branch (Step 2.14) is merged**; on earlier code an unknown `mode` falls through to a full scan |
+   | `{"mode": "migrate"}` | apply the DB schema over the Data API |
+
+   The JSON summary appears inline; logs under **Monitor → View CloudWatch logs**.
+   First call after idle may hit Aurora resuming — retry after ~8 s.
+
+**Caveats**
+- **Every `cdk deploy` (manual, or the push-to-main auto-deploy) replaces the
+  function code with the git contents.** Copy anything you want to keep into the
+  repo by hand first. Git is the source of truth for deploys; the console is a
+  scratchpad.
+- A new third-party import that is not in the dependency layer fails at init
+  (`ImportError`) and trips `ScanFailureRateAlarm` → Telegram. Add it to
+  `pyproject.toml` and deploy from git instead.
+- A syntax error behaves the same way; fix it in the console or redeploy.
+
+### 4.2 CLI equivalents
 
 ```bash
 # Manually invoke the scan Lambda (empty payload = full watchlist).

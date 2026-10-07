@@ -29,7 +29,7 @@ It never places trades — it sends **Telegram alerts** the user acts on manuall
 UTC cron (crypto never closes). Full detail in `SPEC.md`; quick index in `CLAUDE.md`.
 
 - **Language/stack:** Python 3.11, Anthropic SDK (Claude Sonnet 4.5 for agents), LangGraph,
-  Pydantic v2, AWS Lambda (container image, **outside any VPC**) + Aurora Serverless v2
+  Pydantic v2, AWS Lambda (zip + dependency layer, console-editable, **outside any VPC**) + Aurora Serverless v2
   (PostgreSQL 16 + pgvector) reached via the **RDS Data API**, EventBridge Scheduler,
   Secrets Manager, S3, CDK (Python) + cdk-nag.
 - **Persistence is dual-backend** behind one `SignalStore` interface: `AsyncpgSignalStore`
@@ -48,7 +48,7 @@ Aurora, and Telegram delivered. (Slice-1 Telegram first confirmed 2026-06-12.)
 What runs end-to-end now:
 ```
 EventBridge Scheduler (08:03 / 13:03 / 15:03 / 22:03 UTC)
-  → Lambda (container, ap-south-1) — scans the watchlist IN PARALLEL (Step 2.13)
+  → Lambda (zip + layer, ap-south-1) — scans the watchlist IN PARALLEL (Step 2.13)
     → Binance market data (ccxt)
     → full SMC Analyzer (2.1) → §1.6 risk gates (2.11) → Historian (2.4b)
       → Skeptic (2.5) → Judge (2.6)          [LangGraph pipeline, 2.7]
@@ -91,6 +91,7 @@ skipping (then `{"mode":"migrate"}` is no longer needed). See §7.
 | **DB secret ARN** | `arn:aws:secretsmanager:ap-south-1:097853039368:secret:crypto-signals/db-a3zZGW` |
 | **DB name** | `signals` |
 | **Lambda log group** | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-YGmufZcOKKgE` |
+| **Console editing** | The scan + notifier functions are zip-packaged: open **Code** in the Lambda console to read/edit `src/` and `scripts/`, Deploy, then Test (`docs/operations.md §4.1`). **Any `cdk deploy` overwrites console edits.** |
 | **Schedule** | EventBridge Scheduler `cron(3 8 * * ? *)` Etc/UTC, **ENABLED** (London open). NY/overlap/wrap/Critic windows added in later steps. |
 | **App secrets** | **Step 2.12 (code; activates on next deploy):** moved to **SSM Parameter Store SecureString** — `/crypto-signals/anthropic-api-key` (plain key string) and `/crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). Created out-of-band via `aws ssm put-parameter --type SecureString` (CFN can't create SecureString) — see `docs/operations.md §1`. Pre-2.12 these were Secrets Manager secrets (no leading slash); the 2.12 deploy removes them. The Aurora DB credential stays in Secrets Manager. |
 | **Estimated cost** | ~$5–9/month (Aurora scales to zero when idle). |
@@ -105,7 +106,8 @@ skipping (then `{"mode":"migrate"}` is no longer needed). See §7.
 
 ## 4. Setting up a new machine
 
-Prereqs: **Python 3.11+, Docker Desktop, Node 20+ (for the CDK CLI), AWS CLI v2, git.**
+Prereqs: **Python 3.11+, Node 20+ (for the CDK CLI), AWS CLI v2, git.** (Docker Desktop only
+for the local docker-compose Postgres; deploys no longer need it.)
 
 ```bash
 # 1. Clone
@@ -138,12 +140,16 @@ if present, or these keys): `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM
 ### Deploy / invoke recipes (Windows, from repo root)
 
 ```bash
-# Deploy (Docker Desktop must be running — the Lambda image builds locally)
+# Deploy: NOT from this machine (hard rule: no AWS CLI / CDK / credentials locally).
+#   Merge to main -> Deploy (dev) runs in GitHub Actions; or Actions -> Deploy (dev)
+#   -> Run workflow (tick recreate_stateless_stacks only when a function must be
+#   replaced). No Docker: the runner builds the zip code asset + layer with pip.
+# Local synth only (no credentials; runs cdk-nag + the asset size guards):
 cd infrastructure
 export PATH="/<drive>/.../Trading Multi Agent/.venv/Scripts:$PATH"   # so `python app.py` finds aws-cdk-lib
 export JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION=1                  # silence Node-version banner
-cdk deploy --all --require-approval never
-#   ^ if an ECR push hits "TLS handshake timeout", just re-run — the image is cached.
+python app.py
+#   ^ pip-installs the ~130 MB layer each synth (1-2 min); the code asset is 0.4 MB.
 
 # DB migration over the Data API (idempotent).
 #   NOTE: as of Slice 2 the CD workflows run this AUTOMATICALLY before `cdk deploy`
@@ -454,7 +460,7 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > (Lambda Errors/Invocations 24h), latency p95>2min (Duration), Aurora CPU>80%, and provider-errors as a
 > COUNT alarm (≥3/1h) via a Logs **metric filter** on a new `PROVIDER_ERROR` marker logged by
 > `run_scan.run_one_symbol`. All route to **Telegram**: alarm → SNS topic (enforce_ssl) → a small
-> **notifier Lambda** (`scripts/alarm_notifier.py`, reuses the scan image w/ CMD override, reads the
+> **notifier Lambda** (`scripts/alarm_notifier.py`, shares the scan Lambda's code asset + layer — was a CMD override on the scan image before the 2026-10-03 zip repackage — reads the
 > Telegram param from SSM) — no manual SNS subscription. **First infra tests:** `tests/infra/` synth-asserts
 > the stacks (jsii→Node; CI now `pip install -r infrastructure/requirements.txt`). cdk-nag clean (SNS2
 > suppressed: alarm metadata only, KMS CMK cost-prohibitive; enforce_ssl satisfies SNS3). Checkpoints

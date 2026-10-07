@@ -55,7 +55,7 @@ Risk gates live in `src/agents/orchestration/risk_gates.py` as pure functions in
 | Observability | Langfuse (self-hosted) — every LLM/tool call traced from day one |
 | DB | Aurora Serverless v2 PostgreSQL 16+ with pgvector (scale-to-zero). Cloud access via RDS Data API; local dev via asyncpg → Docker. Dual-backend repositories. |
 | Storage | S3 (versioning on, Glacier after 90 days) |
-| Compute | **AWS Lambda** (container image, outside VPC) for the agent pipeline — revised from ECS Fargate, see SPEC §2.4. Dashboard (Slice 4) is a separate long-running Fargate/App Runner service. |
+| Compute | **AWS Lambda** (zip code asset + dependency layer, outside VPC, **source editable in the console**) for the agent pipeline — revised from ECS Fargate, repackaged from a container image 2026-10-03, see SPEC §2.4. Dashboard (Slice 4) is a separate long-running Fargate/App Runner service. |
 | Scheduling | EventBridge Scheduler → Lambda |
 | Secrets | SSM Parameter Store (SecureString) for API keys; AWS Secrets Manager for the Aurora DB credential (Step 2.12) |
 | IaC | AWS CDK (Python) + cdk-nag + `aws-cdk@aws-skills` plugin |
@@ -101,7 +101,7 @@ Minutes are `:03` deliberately — avoids clock-jitter on `:00`.
 
 ## 7. Current Build Status
 
-- **Slice 1 (Weeks 1-3): ✅ COMPLETE & DEPLOYED LIVE** (Steps 1.1–1.22). End-to-end substrate — multi-symbol watchlist, SMC-stub Analyzer, Telegram delivery from a scheduled **Lambda** (container image, **ap-south-1**) + Aurora Serverless v2 via the RDS Data API. Verified end-to-end (Telegram confirmed 2026-06-12). **See [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md) for live resource IDs, gotchas, and open items.**
+- **Slice 1 (Weeks 1-3): ✅ COMPLETE & DEPLOYED LIVE** (Steps 1.1–1.22). End-to-end substrate — multi-symbol watchlist, SMC-stub Analyzer, Telegram delivery from a scheduled **Lambda** (zip + layer, **ap-south-1**) + Aurora Serverless v2 via the RDS Data API. Verified end-to-end (Telegram confirmed 2026-06-12). **See [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md) for live resource IDs, gotchas, and open items.**
 - **Slice 2 (Weeks 4-7): ⬅️ NEXT.** Full 4-agent pipeline + Forecaster + risk gates + multi-symbol + **real** SMC Analyzer (replaces the Slice-1 stub at Step 2.1).
 - **Slice 3 (Weeks 8-11):** Strategy registry + embeddings + Critic with PR opening.
 - **Slice 4 (Weeks 12-15):** FastAPI + React dashboard, Cognito auth, WebSocket real-time.

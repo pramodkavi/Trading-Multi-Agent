@@ -1,9 +1,13 @@
-"""ComputeStack: the scan Lambda (container image) and its least-privilege role.
+"""ComputeStack: the scan Lambda (zip + dependency layer) and its least-privilege role.
 
-Implemented in Step 1.18 for the serverless architecture (SPEC §2.4 / §3.3.3):
+Implemented in Step 1.18 as a container image; repackaged per the 2026-10-03 design
+(docs/superpowers/specs/2026-10-03-lambda-zip-repackage-design.md) so the source is
+readable and editable in the Lambda console:
 
-- A **Lambda built from a container image** (``Dockerfile.lambda``, AWS base
-  image + Runtime Interface Client), pushed to ECR by CDK at deploy time.
+- A **zip-packaged Lambda** whose code asset is exactly ``src/`` + ``scripts/``
+  (~0.4 MB, under the console editor's 3 MB cap) plus one **dependency layer**
+  (~130 MB unzipped) built by ``infrastructure/lambda_assets.py`` with pip's
+  manylinux flags -- no Docker anywhere.
 - The function runs **outside any VPC**, so its egress to the non-AWS APIs it
   calls (Binance / Anthropic / Telegram) is free over the public internet and
   Aurora is reached over the RDS Data API (HTTPS) -- no VPC attachment, no NAT.
@@ -15,6 +19,10 @@ Implemented in Step 1.18 for the serverless architecture (SPEC §2.4 / §3.3.3):
   NOT baked into the template; the function is given the SSM parameter *names*
   and reads the values from Parameter Store at runtime (src/config/secrets.py).
 
+Operator note: edits made in the console are REPLACED by the next ``cdk deploy``
+(manual or the push-to-main auto-deploy). Git is the source of truth for deploys;
+the console is the scratchpad. See docs/operations.md §4.1.
+
 Step 2.12 moved the third-party API keys from Secrets Manager to SSM Parameter
 Store SecureString (free standard tier; see stacks/parameters.py). The cluster's
 own credential secret stays in Secrets Manager and is granted via
@@ -23,11 +31,15 @@ own credential secret stays in Secrets Manager and is granted via
 The cluster / bucket live in the DataStack and are passed in, so those grants are
 cross-stack references (CDK emits the exports/imports). The SSM parameters are
 provisioned out-of-band (docs/operations.md) and referenced here only by ARN.
+
+The MonitoringStack notifier builds its OWN code asset and LayerVersion from the
+same content (CDK refuses to bind one AssetCode in two stacks, and a cross-stack
+layer import would break ``cdk deploy --all`` on every dependency bump); the
+staged assets are identical, so each uploads once.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from aws_cdk import (
@@ -44,6 +56,7 @@ from aws_cdk import aws_rds as rds
 from aws_cdk import aws_s3 as s3
 from cdk_nag import NagSuppressions
 from constructs import Construct
+from lambda_assets import ARCHITECTURE, RUNTIME, code_asset, deps_layer
 
 from stacks.parameters import (
     ANTHROPIC_PARAM_ENV,
@@ -52,18 +65,13 @@ from stacks.parameters import (
     TELEGRAM_PARAM_NAME,
 )
 
-# This file is infrastructure/stacks/compute_stack.py; parents[2] is the repo
-# root, which is the Docker build context for the Lambda image (it holds
-# Dockerfile.lambda, pyproject.toml, src/, scripts/). .dockerignore trims it.
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
 # The Lambda may write raw kline snapshots / large reasoning blobs here for audit
 # (FR-6.3). Scoped so the grant is to this prefix only, not the whole bucket.
 S3_AUDIT_PREFIX = "audit/*"
 
 
 class ComputeStack(Stack):
-    """The scan Lambda (container image) + its least-privilege execution role."""
+    """The scan Lambda (zip + layer) + its least-privilege execution role."""
 
     def __init__(
         self,
@@ -90,14 +98,18 @@ class ComputeStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
-        # ---- The scan Lambda (container image) -------------------------------
-        self.function = lambda_.DockerImageFunction(
+        # ---- Dependency layer (MonitoringStack builds its own identical one) --
+        self.deps_layer = deps_layer(self, "DepsLayer")
+
+        # ---- The scan Lambda (zip code asset + layer) -------------------------
+        self.function = lambda_.Function(
             self,
             "ScanLambda",
-            code=lambda_.DockerImageCode.from_image_asset(
-                directory=str(REPO_ROOT),
-                file="Dockerfile.lambda",
-            ),
+            runtime=RUNTIME,
+            architecture=ARCHITECTURE,
+            handler="scripts.run_scan.lambda_handler",
+            code=code_asset(),
+            layers=[self.deps_layer],
             memory_size=1024,
             # One scan finishes in well under 5 min (NFR-4.1); 10 min leaves
             # headroom for a multi-symbol watchlist run, still under the 15 cap.
@@ -117,7 +129,8 @@ class ComputeStack(Stack):
             },
             description=(
                 "Crypto-signals scan: runs one scheduled SMC scan per invocation "
-                "(Slice 1, signal-only). Invoked by EventBridge Scheduler."
+                "(signal-only). Invoked by EventBridge Scheduler. Zip-packaged so the "
+                "source is editable in the console; deps live in the DepsLayer."
             ),
         )
 
@@ -183,6 +196,14 @@ class ComputeStack(Stack):
                         "Data-API grants generate; every statement is scoped to the one "
                         "cluster, the one bucket prefix, or the two named SSM parameters "
                         "(exact ARNs) -- no account-wide or service-wide access."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-L1",
+                    "reason": (
+                        "python3.11 is deliberate: the project toolchain, tests, mypy and the "
+                        "layer's manylinux wheels are pinned to 3.11 (pyproject requires-python, "
+                        "CI matrix). A runtime bump is its own step, re-validating the wheel set."
                     ),
                 },
             ],
