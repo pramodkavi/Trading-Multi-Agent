@@ -20,7 +20,9 @@ from src.persistence import dataapi_migrate as migrate
 # extension. Pinned so a future schema.sql change that breaks the simple
 # splitter (e.g. a function body with embedded semicolons) fails loudly here.
 # Step 2.8 added active_setups (1 table + 2 indexes): 18 -> 21.
-EXPECTED_STATEMENT_COUNT = 21
+# Step 2.14 (Critic v0) added decision_resolutions / decision_reviews /
+# critic_reports (3 tables + 2 indexes): 21 -> 26.
+EXPECTED_STATEMENT_COUNT = 26
 
 CLUSTER_ARN = "arn:aws:rds:us-east-1:123456789012:cluster:crypto"
 SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:crypto-signals/db"

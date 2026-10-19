@@ -11,7 +11,13 @@ Implemented in Step 1.19 for the serverless architecture (SPEC §2.4 / §5):
   after each scan -- invokes the SAME Lambda with a ``{"mode": "forecaster"}``
   payload. CLAUDE.md keeps a single scan Lambda at this scale, so the "clean
   separation" the SPEC calls for is a dedicated schedule + event flag, not a
-  second function. The weekly Critic (Sun 21:00) arrives in Slice 3.
+  second function.
+- The Critic v0 outcome resolver (Step 2.14, design 2026-09-22 §7.2):
+  ``rate(2 days)`` invokes the SAME Lambda with ``{"mode": "resolve",
+  "chunk_size": 25}`` to replay unresolved decisions against real 5m candles.
+  It is the steady-state drain that keeps outcomes flowing even when the
+  GitHub Actions ``critic.yml`` workflow (Layer 2) is unavailable. The full
+  weekly Critic with PR opening arrives in Slice 3.
 
 The ``:03`` minute is deliberate (SPEC §5): it dodges the clock-jitter spike that
 hits every cron at ``:00``. The L2 ``LambdaInvoke`` target provisions a dedicated
@@ -28,6 +34,7 @@ from typing import Any
 
 from aws_cdk import (
     CfnOutput,
+    Duration,
     Stack,
     Tags,
     TimeZone,
@@ -122,6 +129,36 @@ class SchedulingStack(Stack):
             self,
             "ForecasterScheduleName",
             value=self.forecaster_schedule.schedule_name,
+        )
+
+        # Critic v0 Layer 1 (design 2026-09-22 §7.2): every 2 days, resolve
+        # unresolved decisions against real price action. Same Lambda, resolve
+        # mode. chunk_size=25 mirrors scripts/run_scan.py::RESOLVE_CHUNK_DEFAULT
+        # (one chunk of 25 seven-day 5m-candle replays fits the Lambda timeout).
+        # A rate() rather than a cron: the resolver is a steady-state drain of
+        # the queue-is-the-data backlog, so it needs no clock alignment with
+        # the scan windows. The Actions critic workflow runs its own resolve
+        # loop and simply finds ``remaining == 0`` when this schedule is ahead.
+        self.resolver_schedule = scheduler.Schedule(
+            self,
+            "OutcomeResolver",
+            schedule=scheduler.ScheduleExpression.rate(Duration.days(2)),
+            target=scheduler_targets.LambdaInvoke(
+                scan_function,
+                input=scheduler.ScheduleTargetInput.from_object(
+                    {"mode": "resolve", "chunk_size": 25}
+                ),
+            ),
+            description=(
+                "Critic v0 outcome resolver: replays unresolved decisions against 5m "
+                "candles every 2 days (design 2026-09-22 §7.2)."
+            ),
+        )
+
+        CfnOutput(
+            self,
+            "ResolverScheduleName",
+            value=self.resolver_schedule.schedule_name,
         )
 
         Tags.of(self).add("project", "crypto-signals")

@@ -206,7 +206,7 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 #### 3.1.2 Background Loops
 
-**FR-2.1** The Forecaster shall run at every scheduled scan and re-evaluate every signal in the `active_setups` table. For each setup, it produces one of three outcomes: STILL_VALID (no action), AT_RISK (send Telegram update), or INVALIDATED (close setup with outcome logged).
+**FR-2.1** The Forecaster shall run at every scheduled scan and re-evaluate every signal in the `active_setups` table. For each setup, it produces one of three outcomes: STILL_VALID (no action), AT_RISK (send Telegram update), or INVALIDATED (close setup with outcome logged). *Since Critic v0 (Step 2.14): the deterministic `OutcomeResolver` is the source of truth for `WIN / LOSS / EXPIRED` (`signals.outcome`, `decision_resolutions`); the Forecaster remains the source of `INVALIDATED` and of intra-trade alerts.*
 
 **FR-2.2** The Critic shall run weekly (Sunday 21:00 UTC) and analyze the full week's journal. It produces a markdown report identifying patterns in decision-making errors and proposes specific rule changes. The Critic shall not modify rules directly — it shall open a GitHub Pull Request against a `claude/proposed-rules` branch for human review.
 
@@ -683,6 +683,19 @@ The build is organized into **four vertical slices**. Each slice goes through th
 - Tune prompts as needed
 - Verify journal accumulation, Forecaster updates, Telegram delivery all work
 
+> **Delivered by Critic v0 (2026-09-22).** The manual review is automated by the Decision
+> Review System — design `docs/superpowers/specs/2026-09-22-decision-review-critic-v0-design.md`,
+> plan `docs/superpowers/plans/2026-09-22-decision-review-critic-v0.md`. Layer 1
+> (`OutcomeResolver`, scan Lambda `{"mode":"resolve"}`, EventBridge `rate(2 days)`) replays every
+> decision against real 5m candles into `decision_resolutions`; Layer 2 (`DecisionReviewer` +
+> `CriticReport`, GitHub Actions `.github/workflows/critic.yml`, every 2 days) grades each decision
+> with Claude and opens a report PR on `claude/proposed-rules-<date>`. **This step closes with the
+> first `mode=backfill` report**; its "Slice 2 exit gate" section is the §5.3 End-of-Slice-2
+> evidence (criteria computed from `scan_runs` / `signals` / `active_setups` by
+> `src/agents/critic/exit_gate.py`). Findings recorded for follow-up steps, not fixed here: Judge
+> vetoes are stored as `signals.status = PUBLISHED`; `session` is hardcoded `AD_HOC` so hard rule 7
+> never fires live; the risk gates log nothing to CloudWatch (see `docs/PROJECT_STATE.md §7`).
+
 ---
 
 ### Slice 3: Multi-Strategy Architecture + Critic + Embeddings (Weeks 8-11)
@@ -718,6 +731,16 @@ The build is organized into **four vertical slices**. Each slice goes through th
 - Add embedding column to `signals` table (`narrative_embedding vector(1536)`)
 - Add pgvector HNSW index for efficient similarity search
 - Backfill embeddings for existing journal entries
+
+> **Steps 3.5–3.7 — pulled forward as Critic v0 (Step 2.14, 2026-09-22).** Delivered early
+> **without pgvector clustering** (Step 3.4 stays in Slice 3; its embeddings plug into
+> `src/agents/critic/report.py` later), running in **GitHub Actions** (`critic.yml`) rather than a
+> Lambda, on a **2-day cadence** (`30 22 */2 * *`) rather than Sunday 21:00 UTC, and opening the PR
+> with the job's **`GITHUB_TOKEN`** — so the Secrets-Manager GitHub token and its IAM line in Step 3.6
+> are dropped. What remains for Slice 3 under these steps: pgvector loss-cluster discovery (needs 3.4),
+> and the weekly cadence decision once the 2-day reports have been reviewed for a few cycles.
+> Outcome ownership: the resolver is the source of truth for `WIN / LOSS / EXPIRED`; the Forecaster
+> remains the source of `INVALIDATED` and of intra-trade alerts (FR-2.1).
 
 #### Step 3.5: Critic implementation
 
@@ -931,6 +954,12 @@ These are out of scope for the current build but should not require rework of Sl
 - At least 5 signals published, at least 5 skipped
 - Forecaster has updated at least one active setup
 - Risk gates have prevented at least one rule-violating signal (verified in logs)
+- Evidence: `docs/critic-reports/<date>.md` §Slice 2 exit gate — the first `mode=backfill` run of
+  `.github/workflows/critic.yml` (Critic v0, Step 2.14). Each criterion is PASS / FAIL with evidence
+  counts from `scan_runs` / `signals` / `active_setups`. Two corrections vs. the literal wording:
+  "published" means *has an `active_setups` row* (Judge vetoes are also stored `PUBLISHED`), and the
+  rule-4 log verification is not possible until the gates log rule ids (standing finding) — the
+  `SKIPPED` row's `violated_rule` is the evidence.
 
 **End of Slice 3:**
 - Critic has produced its first weekly report as a PR

@@ -166,3 +166,65 @@ CREATE INDEX IF NOT EXISTS idx_active_setups_status
 
 CREATE INDEX IF NOT EXISTS idx_active_setups_signal_id
     ON active_setups (signal_id);
+
+
+-- ---------------------------------------------------------------------------
+-- Slice 2 Step 2.14 -- Critic v0 (design 2026-09-22 §8).
+--   decision_resolutions: deterministic price-path replay per decision -- the
+--                         journal's ground truth. One row per signal; the
+--                         resolver upserts on signal_id so re-runs are idempotent.
+--   decision_reviews:     Claude's graded judgement per decision. error is set
+--                         when the call failed; the reviewer retries once
+--                         (attempts is bumped on the upsert, capped by the queue).
+--   critic_reports:       one aggregate report per Critic run (JSONB + markdown,
+--                         plus the proposed-rules PR URL once opened).
+-- All three cascade from signals so deleting a signal removes its Critic rows.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS decision_resolutions (
+    signal_id                   UUID        PRIMARY KEY
+                                            REFERENCES signals(id) ON DELETE CASCADE,
+    decision_kind               TEXT        NOT NULL
+                                            CHECK (decision_kind IN ('PUBLISHED', 'VETOED', 'GATE_REJECTED')),
+    outcome                     TEXT        NOT NULL
+                                            CHECK (outcome IN ('WIN', 'LOSS', 'EXPIRED', 'UNRESOLVABLE')),
+    decided_at                  TIMESTAMPTZ NOT NULL,
+    entered_at                  TIMESTAMPTZ,
+    resolved_at                 TIMESTAMPTZ NOT NULL,
+    realized_r                  DOUBLE PRECISION NOT NULL,
+    max_adverse_excursion_r     DOUBLE PRECISION,
+    max_favorable_excursion_r   DOUBLE PRECISION,
+    tp2_reached                 BOOLEAN     NOT NULL DEFAULT FALSE,
+    candles_used                INTEGER     NOT NULL CHECK (candles_used >= 0),
+    engine_version              TEXT        NOT NULL,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_decision_resolutions_outcome
+    ON decision_resolutions (outcome);
+
+CREATE TABLE IF NOT EXISTS decision_reviews (
+    signal_id       UUID        PRIMARY KEY
+                                REFERENCES signals(id) ON DELETE CASCADE,
+    decision_kind   TEXT        NOT NULL
+                                CHECK (decision_kind IN ('PUBLISHED', 'VETOED', 'GATE_REJECTED', 'NO_SETUP')),
+    review          JSONB       NOT NULL DEFAULT '{}'::JSONB,
+    model           TEXT        NOT NULL,
+    token_usage     JSONB       NOT NULL DEFAULT '{}'::JSONB,
+    cost_usd        NUMERIC(12, 6),
+    error           TEXT,
+    attempts        INTEGER     NOT NULL DEFAULT 1 CHECK (attempts >= 1),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS critic_reports (
+    id              UUID        PRIMARY KEY,
+    period_start    TIMESTAMPTZ NOT NULL,
+    period_end      TIMESTAMPTZ NOT NULL,
+    report          JSONB       NOT NULL,
+    markdown        TEXT        NOT NULL,
+    pr_url          TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_critic_reports_created_at
+    ON critic_reports (created_at DESC);

@@ -1,0 +1,213 @@
+# Critic v0 -- decision review (Slice 2 Step 2.14; design
+# docs/superpowers/specs/2026-09-22-decision-review-critic-v0-design.md §7.1).
+#
+# Runs every other day after the 22:03 UTC wrap scan, and on demand. One job,
+# four phases, all idempotent and chunked (the queue is the data itself):
+#
+#   1. Resolve loop  -- `aws lambda invoke {"mode":"resolve"}` on the scan Lambda
+#                       in ap-south-1 until `remaining == 0`. Layer 1 runs in the
+#                       Lambda because Binance geofences GitHub's runners (451).
+#   2. Review loop   -- `python -m scripts.run_critic review` (one Claude call per
+#                       resolved decision, via the RDS Data API) until it prints
+#                       `remaining=0`.
+#   3. Report        -- `python -m scripts.run_critic report` writes
+#                       docs/critic-reports/<date>.md, commits it to
+#                       `claude/proposed-rules-<date>`, opens/updates the PR with
+#                       the report as body and posts the Telegram summary.
+#   4. Artifact      -- the markdown is uploaded even when a later step fails.
+#
+# Cost guard (design §7.3): `mode=backfill` stops after the FIRST review chunk
+# and prints the observed cost per review + the extrapolated total. Re-dispatch
+# with `confirm_cost=true` to continue. Incremental runs never stop for cost.
+#
+# Auth is keyless via GitHub OIDC -> the deploy role. On top of what the deploy
+# workflows need, the role must be allowed to invoke the scan Lambda, call the
+# Data API on the cluster, read the DB secret and the two SSM parameters. The
+# exact policy is in docs/operations.md §7.
+#
+# `gh` and `git push` use the job's GITHUB_TOKEN: a push made with it does NOT
+# trigger CI on the proposed-rules branch (GitHub rule), which is fine -- the
+# branch only ever carries one markdown file.
+#
+# Operator prerequisites (outside this repo): repo secret AWS_DEPLOY_ROLE_ARN,
+# repo variable AWS_REGION = ap-south-1, and the IAM grants above.
+
+name: Critic
+
+on:
+  schedule:
+    - cron: "30 22 */2 * *" # every other day, after the 22:03 UTC wrap scan
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [incremental, backfill]
+        default: incremental
+        description: "incremental = last 14 days; backfill = everything since go-live (2026-06-12) + Slice 2 exit gate"
+      confirm_cost:
+        type: boolean
+        default: false
+        description: "backfill only: continue past the first review chunk"
+      max_chunks:
+        default: "40"
+        description: "upper bound on resolve / review chunks (25 decisions each) per run"
+      period_start:
+        default: ""
+        description: "ISO date YYYY-MM-DD (taken as 00:00 UTC) or full YYYY-MM-DDTHH:MM:SSZ; empty = 14 days ago (incremental) or 2026-06-12 (backfill)"
+
+permissions:
+  id-token: write # OIDC
+  contents: write # push claude/proposed-rules-<date>
+  pull-requests: write # gh pr create / edit
+
+# Never run two critic jobs at once (they share the review queue); let an
+# in-flight run finish rather than cancelling it mid-chunk.
+concurrency:
+  group: critic
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  # Physical name of the scan Lambda (docs/PROJECT_STATE.md §3). The cfg step
+  # prefers the CryptoSignals-Compute `ScanFunctionName` stack output and only
+  # falls back to this when that lookup is denied or empty.
+  SCAN_FUNCTION_FALLBACK: CryptoSignals-Compute-ScanLambdaDD7505A5-4lsj9dosUzzT
+  # Settings (src/config/settings.py) for scripts.run_critic: Data API backend;
+  # DB_CLUSTER_ARN / DB_SECRET_ARN and the secret values are exported by `cfg`.
+  PERSISTENCE_BACKEND: dataapi
+  DB_NAME: signals
+
+jobs:
+  critic:
+    name: resolve -> review -> report
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the report branch is created from a full clone
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install the project (runtime deps only)
+        run: pip install -e .
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Resolve ARNs + secrets
+        id: cfg
+        run: |
+          set -euo pipefail
+          q() { aws cloudformation describe-stacks --stack-name "$1" \
+                --query "Stacks[0].Outputs[?OutputKey=='$2'].OutputValue | [0]" --output text; }
+          CLUSTER_ARN=$(q CryptoSignals-Data ClusterArn)
+          SECRET_ARN=$(q CryptoSignals-Data DbSecretArn)
+          if [ -z "$CLUSTER_ARN" ] || [ "$CLUSTER_ARN" = "None" ] || [ -z "$SECRET_ARN" ] || [ "$SECRET_ARN" = "None" ]; then
+            echo "::error::Could not resolve ClusterArn/DbSecretArn from the CryptoSignals-Data outputs."
+            exit 1
+          fi
+          echo "DB_CLUSTER_ARN=$CLUSTER_ARN" >> "$GITHUB_ENV"
+          echo "DB_SECRET_ARN=$SECRET_ARN" >> "$GITHUB_ENV"
+          # Prefer the stack output for the Lambda name; tolerate a denied/empty lookup.
+          FN=$(q CryptoSignals-Compute ScanFunctionName 2>/dev/null || true)
+          if [ -z "$FN" ] || [ "$FN" = "None" ]; then
+            echo "::notice::ScanFunctionName output unavailable; using the fallback name."
+            FN="$SCAN_FUNCTION_FALLBACK"
+          fi
+          echo "SCAN_FUNCTION=$FN" >> "$GITHUB_ENV"
+          echo "Scan Lambda: $FN"
+          ANTH=$(aws ssm get-parameter --with-decryption --name /crypto-signals/anthropic-api-key --query Parameter.Value --output text)
+          TG=$(aws ssm get-parameter --with-decryption --name /crypto-signals/telegram-bot-token --query Parameter.Value --output text)
+          echo "::add-mask::$ANTH"; echo "ANTHROPIC_API_KEY=$ANTH" >> "$GITHUB_ENV"
+          BOT=$(echo "$TG" | python -c 'import json,sys;print(json.load(sys.stdin)["bot_token"])')
+          CHAT=$(echo "$TG" | python -c 'import json,sys;print(json.load(sys.stdin)["chat_id"])')
+          echo "::add-mask::$BOT"; echo "TELEGRAM_BOT_TOKEN=$BOT" >> "$GITHUB_ENV"; echo "TELEGRAM_CHAT_ID=$CHAT" >> "$GITHUB_ENV"
+
+      - name: Apply schema (idempotent, via Lambda migrate mode)
+        # The Lambda's own role has Data API + DB-secret access; this guarantees
+        # the Critic tables exist before the first resolve (docs/operations.md §2.1).
+        run: |
+          set -euo pipefail
+          aws lambda invoke --function-name "$SCAN_FUNCTION" --cli-binary-format raw-in-base64-out \
+            --payload '{"mode":"migrate"}' out.json && cat out.json && grep -q '"ok": true' out.json
+
+      - name: Resolve loop (Lambda, Mumbai)
+        run: |
+          set -euo pipefail
+          MAX=${{ inputs.max_chunks || '40' }}
+          for i in $(seq 1 "$MAX"); do
+            aws lambda invoke --function-name "$SCAN_FUNCTION" --cli-binary-format raw-in-base64-out \
+              --payload '{"mode":"resolve","chunk_size":25}' out.json >/dev/null
+            cat out.json
+            REMAINING=$(python -c 'import json;print(json.load(open("out.json"))["remaining"])')
+            RESOLVED=$(python -c 'import json;print(json.load(open("out.json"))["resolved"])')
+            if [ "$REMAINING" = "0" ]; then echo "resolve queue drained"; break; fi
+            if [ "$RESOLVED" = "0" ]; then echo "::warning::no progress; stopping resolve loop"; break; fi
+          done
+
+      - name: Review loop (Claude)
+        id: review
+        run: |
+          set -euo pipefail
+          MODE=${{ inputs.mode || 'incremental' }}
+          CONFIRM=${{ inputs.confirm_cost || 'false' }}
+          MAX=${{ inputs.max_chunks || '40' }}
+          for i in $(seq 1 "$MAX"); do
+            LINE=$(python -m scripts.run_critic review --chunk-size 25 | tail -n 1); echo "$LINE"
+            REMAINING=$(echo "$LINE" | sed -E 's/.*remaining=([0-9]+).*/\1/')
+            COST=$(echo "$LINE" | sed -E 's/.*cost_usd=([0-9.]+).*/\1/')
+            if [ "$MODE" = "backfill" ] && [ "$CONFIRM" != "true" ]; then
+              python - "$COST" "$REMAINING" <<'PY'
+          import sys; cost, rem = float(sys.argv[1]), int(sys.argv[2])
+          per = cost / 25 if cost else 0.0
+          print(f"::notice::first backfill chunk cost ${cost:.4f} (~${per:.4f}/review); ~{rem} remaining -> est ${per*rem:.2f}. Re-dispatch with confirm_cost=true to continue.")
+          PY
+              echo "stopped_for_cost=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            if [ "$REMAINING" = "0" ]; then break; fi
+          done
+
+      - name: Report + PR + Telegram
+        if: steps.review.outputs.stopped_for_cost != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MODE=${{ inputs.mode || 'incremental' }}
+          START="${{ inputs.period_start }}"
+          if [ -z "$START" ]; then
+            if [ "$MODE" = "backfill" ]; then START=2026-06-12T00:00:00Z; else START=$(date -u -d '14 days ago' +%Y-%m-%dT00:00:00Z); fi
+          fi
+          # `run_critic report --since` rejects a naive timestamp (period bounds must be
+          # unambiguous), while the input is documented as an ISO *date*: widen a bare
+          # YYYY-MM-DD to UTC midnight and pass a full timestamp through untouched.
+          case "$START" in
+            *T*) ;;
+            *) START="${START}T00:00:00Z" ;;
+          esac
+          echo "period: $START -> now"
+          UNTIL=$(date -u +%Y-%m-%dT%H:%M:%SZ); DAY=$(date -u +%Y-%m-%d)
+          GATE=""; [ "$MODE" = "backfill" ] && GATE="--exit-gate"
+          OUT="docs/critic-reports/$DAY.md"
+          python -m scripts.run_critic report --since "$START" --until "$UNTIL" $GATE --out "$OUT" --notify | tail -n 1
+          git config user.name "critic-bot"; git config user.email "critic-bot@users.noreply.github.com"
+          BR="claude/proposed-rules-$DAY"
+          git checkout -B "$BR"; git add "$OUT"
+          git commit -m "critic: report $DAY" -m "Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>" || { echo "nothing to commit"; exit 0; }
+          git push -f origin "$BR"
+          gh pr create --base main --head "$BR" --title "Critic report $DAY" --body-file "$OUT" \
+            || gh pr edit "$BR" --body-file "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: critic-report
+          path: docs/critic-reports/*.md
+          if-no-files-found: ignore

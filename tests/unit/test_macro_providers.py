@@ -8,6 +8,7 @@ market-snapshot path, lifecycle, and httpx-error translation.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -16,6 +17,7 @@ from src.providers import (
     FREDProvider,
     MacroContext,
     NoMacroData,
+    ProviderError,
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -131,6 +133,19 @@ class TestInterfaceAndLifecycle:
             provider = FREDProvider(api_key="k", client=client)
             with pytest.raises(NotImplementedError, match="macro provider"):
                 await provider.fetch_market_snapshot("BTCUSDT", [Timeframe.H4])
+
+    async def test_fetch_klines_unsupported(self) -> None:
+        # Macro providers satisfy the DataProvider ABC but serve no candles;
+        # the Critic's resolver must see a typed ProviderError, not a TypeError.
+        start = datetime(2026, 7, 1, tzinfo=UTC)
+        for provider_cls in (FREDProvider, TwelveDataProvider):
+            async with _client(_fred_handler({})) as client:
+                provider = provider_cls(api_key="k", client=client)
+                with pytest.raises(ProviderError, match="fetch_klines not supported") as info:
+                    await provider.fetch_klines(
+                        "BTCUSDT", Timeframe.M5, start=start, end=start + timedelta(hours=1)
+                    )
+                assert info.value.provider == provider.name
 
     async def test_injected_client_not_closed_by_aclose(self) -> None:
         async with _client(_fred_handler({})) as client:

@@ -185,3 +185,42 @@ def test_monitoring_provider_error_metric_filter(templates: dict[str, Any]) -> N
             }
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# SchedulingStack: Critic v0 outcome resolver runs on rate(2 days) (Step 2.14)
+# ---------------------------------------------------------------------------
+
+
+def test_scheduling_forecaster_sweep_passes_mode_input(templates: dict[str, Any]) -> None:
+    # Pre-existing Step 2.10 schedule; pinned here so the resolver test below
+    # cannot pass by accident against the wrong schedule's Input.
+    templates["scheduling"].has_resource_properties(
+        "AWS::Scheduler::Schedule",
+        {
+            "ScheduleExpression": "cron(5 8,13,15,22 * * ? *)",
+            "Target": assertions.Match.object_like({"Input": '{"mode":"forecaster"}'}),
+        },
+    )
+
+
+def test_scheduling_stack_has_resolver_rate_schedule(templates: dict[str, Any]) -> None:
+    # Design 2026-09-22 §7.2: every 2 days the SAME scan Lambda is invoked in
+    # resolve mode with the default chunk size, keeping outcomes flowing even
+    # when the GitHub Actions critic workflow is unavailable.
+    templates["scheduling"].has_resource_properties(
+        "AWS::Scheduler::Schedule",
+        {
+            "ScheduleExpression": "rate(2 days)",
+            "Target": assertions.Match.object_like({"Input": '{"mode":"resolve","chunk_size":25}'}),
+        },
+    )
+
+
+def test_scheduling_stack_exports_resolver_schedule_name(templates: dict[str, Any]) -> None:
+    templates["scheduling"].has_output("ResolverScheduleName", assertions.Match.any_value())
+
+
+def test_scheduling_stack_schedule_count(templates: dict[str, Any]) -> None:
+    # 4 scan windows + forecaster sweep + outcome resolver.
+    templates["scheduling"].resource_count_is("AWS::Scheduler::Schedule", 6)

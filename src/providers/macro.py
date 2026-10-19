@@ -27,9 +27,11 @@ import httpx
 
 from src.providers.base import (
     DataProvider,
+    Kline,
     MacroContext,
     MarketSnapshot,
     NoMacroData,
+    ProviderError,
     ProviderRateLimitError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -50,8 +52,9 @@ class MacroProvider(DataProvider):
     """Shared base for REST macro providers: httpx plumbing + error translation.
 
     Concrete subclasses set `name`, the API base URL, and implement
-    `fetch_macro_context`. `fetch_market_snapshot` is unsupported here (macro
-    providers do not serve klines) and raises NotImplementedError.
+    `fetch_macro_context`. Macro providers do not serve candles:
+    `fetch_market_snapshot` raises NotImplementedError and `fetch_klines`
+    raises ProviderError so the class still satisfies the DataProvider ABC.
     """
 
     base_url: str
@@ -85,6 +88,16 @@ class MacroProvider(DataProvider):
         include_derivatives: bool = False,
     ) -> MarketSnapshot:
         raise NotImplementedError(f"{self.name} is a macro provider; it has no market snapshots")
+
+    async def fetch_klines(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[Kline]:
+        raise ProviderError("fetch_klines not supported", provider=self.name)
 
     async def _get_json(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
         """GET `path` and return parsed JSON, mapping httpx failures to ProviderError."""

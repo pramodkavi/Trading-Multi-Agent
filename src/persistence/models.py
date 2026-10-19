@@ -234,3 +234,115 @@ class StoredActiveSetup(BaseModel):
         if v is not None and v.tzinfo is None:
             raise ValueError("last_evaluated_at must be timezone-aware (use UTC)")
         return v
+
+
+# ---------------------------------------------------------------------------
+# Critic v0 (Step 2.14) -- decision_resolutions / decision_reviews / critic_reports
+# ---------------------------------------------------------------------------
+
+
+class DecisionSummary(BaseModel):
+    """Light row for Critic aggregates (Step 2.14, design §6.3).
+
+    Projection of ``signals LEFT JOIN decision_resolutions LEFT JOIN
+    decision_reviews`` -- one row per decision, carrying just the columns the
+    report's counts, win rates and per-rule/per-hour tables need. The resolution
+    and review columns are all NULL for decisions that have not been resolved /
+    reviewed yet, and ``review`` is NULL for a review row whose call errored.
+    ``decision_kind`` / ``resolution_outcome`` are kept as raw strings (not the
+    critic enums) so persistence never imports agent packages.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID = Field(description="signals.id.")
+    scan_id: UUID = Field(description="signals.scan_id.")
+    symbol: str = Field(min_length=1, max_length=20)
+    direction: SignalDirection | None = Field(
+        description="LONG / SHORT when a proposal existed; NULL for skips."
+    )
+    status: SignalStatus = Field(description="signals.status (PUBLISHED or SKIPPED).")
+    created_at: datetime = Field(description="signals.created_at (the decision time, UTC).")
+    violated_rule: str | None = Field(
+        description="signals.payload->>'violated_rule'; set on gate-rejected skips."
+    )
+    outcome: SignalOutcome | None = Field(description="signals.outcome (published rows only).")
+    decision_kind: str | None = Field(
+        description="decision_resolutions.decision_kind; NULL until resolved."
+    )
+    resolution_outcome: str | None = Field(
+        description="decision_resolutions.outcome (WIN/LOSS/EXPIRED/UNRESOLVABLE)."
+    )
+    realized_r: float | None = Field(description="decision_resolutions.realized_r.")
+    entered_at: datetime | None = Field(description="decision_resolutions.entered_at.")
+    review: dict[str, Any] | None = Field(
+        description="decision_reviews.review JSONB; NULL when unreviewed or errored."
+    )
+    review_error: str | None = Field(description="decision_reviews.error.")
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_must_be_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("created_at must be timezone-aware (use UTC)")
+        return v
+
+    @field_validator("entered_at")
+    @classmethod
+    def _entered_must_be_aware(cls, v: datetime | None) -> datetime | None:
+        if v is not None and v.tzinfo is None:
+            raise ValueError("entered_at must be timezone-aware (use UTC)")
+        return v
+
+
+class StoredReview(BaseModel):
+    """Read-side projection of one row in the ``decision_reviews`` table (Step 2.14).
+
+    ``review`` is the raw JSONB of the Claude ``DecisionReview`` (empty dict when
+    the call errored -- then ``error`` is set and ``attempts`` counts the tries).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    signal_id: UUID = Field(description="Primary key; FK to signals.id.")
+    decision_kind: str = Field(min_length=1, max_length=20)
+    review: dict[str, Any] = Field(description="Raw JSONB of the DecisionReview.")
+    model: str = Field(min_length=1, max_length=64)
+    token_usage: dict[str, Any] = Field(description="Raw JSONB token accounting.")
+    cost_usd: float | None = Field(description="Call cost; NULL when the call errored.")
+    error: str | None = Field(description="Failure text when the review call failed.")
+    attempts: int = Field(ge=1, description="Review attempts so far (bumped on retry).")
+    created_at: datetime = Field(description="When the latest attempt was written (UTC).")
+
+    @field_validator("created_at")
+    @classmethod
+    def _created_must_be_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("created_at must be timezone-aware (use UTC)")
+        return v
+
+
+class StoredCriticReport(BaseModel):
+    """One row of the ``critic_reports`` table (Step 2.14): a Critic run's output.
+
+    Used on both the write side (``SignalStore.save_critic_report``) and the
+    read side; ``report`` is the ``CriticReport`` JSONB and ``markdown`` the
+    rendered report body posted to the proposed-rules PR.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID = Field(description="Primary key (critic_reports.id).")
+    period_start: datetime = Field(description="Start of the reviewed window (UTC).")
+    period_end: datetime = Field(description="End of the reviewed window (UTC).")
+    report: dict[str, Any] = Field(description="Raw JSONB of the CriticReport.")
+    markdown: str = Field(description="Rendered markdown report.")
+    pr_url: str | None = Field(description="Proposed-rules PR URL; NULL until opened.")
+    created_at: datetime = Field(description="When the report was written (UTC).")
+
+    @field_validator("period_start", "period_end", "created_at")
+    @classmethod
+    def _must_be_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("datetime must be timezone-aware (use UTC)")
+        return v

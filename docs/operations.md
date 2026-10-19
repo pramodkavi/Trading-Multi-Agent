@@ -9,8 +9,8 @@
 | | |
 |---|---|
 | Account / Region | `097853039368` / `ap-south-1` (Mumbai — pinned in `infrastructure/app.py`) |
-| Scan Lambda | `CryptoSignals-Compute-ScanLambdaDD7505A5-rfFwKEhPAnlo` |
-| Scan log group | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-YGmufZcOKKgE` |
+| Scan Lambda | `CryptoSignals-Compute-ScanLambdaDD7505A5-4lsj9dosUzzT` (zip + layer; replaced at the 2026-10-10 cutover) |
+| Scan log group | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-H5rf5DCKJt4n` |
 | Aurora cluster ARN | `arn:aws:rds:ap-south-1:097853039368:cluster:cryptosignals-data-aurora2cbab212-s1pyvq9ztgdm` |
 | DB secret ARN (Secrets Manager) | `arn:aws:secretsmanager:ap-south-1:097853039368:secret:crypto-signals/db-a3zZGW` |
 
@@ -269,6 +269,170 @@ See `SPEC.md §6.7` for the broader failure-mode table.
 
 Targets: ~$5–9/month (tight). Drivers: Aurora ACU-hours (scale-to-zero keeps this
 near zero when idle), Anthropic tokens (~5 scans/day), Lambda (negligible), S3.
-SSM standard parameters and the SNS/alarm path are free. Anthropic spend tracking
-+ a budget alarm land with the Critic in Slice 3 (NFR-5.1/5.2). Watch the AWS
-Billing console; investigate if the monthly run-rate exceeds ~$10.
+SSM standard parameters and the SNS/alarm path are free. Critic v0 (§7) records
+every review call's cost in `agent_runs` (`agent_role = 'critic'`) and stops a
+backfill after its first chunk until the operator confirms the extrapolated
+spend; the budget *alarm* (NFR-5.2) is still Slice 3. Watch the AWS Billing
+console; investigate if the monthly run-rate exceeds ~$10.
+
+---
+
+## 7. Critic v0 (decision review) — Step 2.14
+
+Design: [`superpowers/specs/2026-09-22-decision-review-critic-v0-design.md`](superpowers/specs/2026-09-22-decision-review-critic-v0-design.md).
+Critic v0 scores every decision the pipeline has made against real price action,
+grades the reasoning with Claude, and delivers a report + proposed-rules PR. It is
+**all-cloud**: nothing runs on a laptop.
+
+### 7.1 What runs where
+
+| Layer | Runs in | Trigger | Writes |
+|---|---|---|---|
+| **OutcomeResolver** (deterministic replay of entry / stop / target on 5m Binance candles) | the scan Lambda, `{"mode":"resolve","chunk_size":25}` (Mumbai — Binance geofences GitHub runners with HTTP 451) | EventBridge `rate(2 days)` **and** the resolve loop in `critic.yml` | `decision_resolutions`, `signals.outcome` (published only), `active_setups.latest_evaluation` (`"source":"resolver"`) |
+| **DecisionReviewer** (one Claude call per resolved decision) | GitHub Actions, `python -m scripts.run_critic review --chunk-size 25` | `.github/workflows/critic.yml` — cron `30 22 */2 * *` (every other day, after the 22:03 UTC wrap scan) or `workflow_dispatch` | `decision_reviews`, `agent_runs` (`agent_role='critic'`, cost) |
+| **CriticReporter** (period aggregates + one Claude `CriticReport` call + markdown) | GitHub Actions, `python -m scripts.run_critic report` | same workflow, after the review loop | `critic_reports`, `docs/critic-reports/<date>.md`, PR on `claude/proposed-rules-<date>`, Telegram summary |
+
+Both layers are idempotent and chunked (25 decisions per chunk, at most
+`max_chunks` = 40 chunks per run); the queue is the data itself, so an
+interrupted run simply continues on the next one.
+
+Workflow phases, in order: resolve ARNs + read the two SSM secrets → apply the
+schema via the Lambda `{"mode":"migrate"}` → resolve loop until `remaining == 0`
+→ review loop until `remaining=0` → report + PR + Telegram → upload the markdown
+as the `critic-report` artifact (even on failure).
+
+### 7.2 Dispatching a backfill (first run / Slice 2 exit gate)
+
+The scheduled run is `mode=incremental` (period = last 14 days, no exit gate).
+The **first** run should be a backfill over everything since go-live:
+
+```bash
+# 1. First chunk only: stops after 25 reviews and prints the observed cost/review
+#    plus the extrapolated total for the remaining queue (cost guard, design §7.3).
+gh workflow run critic.yml -f mode=backfill
+
+# 2. Read the ::notice:: in the run log. If the estimate is acceptable
+#    (design §7.3: <= 25% of the $200/month LLM ceiling), continue:
+gh workflow run critic.yml -f mode=backfill -f confirm_cost=true
+
+# Optional: narrower period, or a bigger chunk budget for a long queue.
+gh workflow run critic.yml -f mode=backfill -f confirm_cost=true \
+  -f period_start=2026-07-01 -f max_chunks=80
+```
+
+`mode=backfill` sets the period start to `2026-06-12T00:00:00Z` (go-live) and
+adds `--exit-gate`, so the report's first section is the **Slice 2 exit gate**
+(SPEC §5 "End of Slice 2") with PASS / FAIL per criterion and evidence counts.
+
+Inputs: `mode` (`incremental` | `backfill`), `confirm_cost` (bool, backfill
+only), `max_chunks` (default `40`), `period_start` (ISO date `YYYY-MM-DD`, taken
+as 00:00 UTC, or a full `YYYY-MM-DDTHH:MM:SSZ`; empty = 14 days ago for
+incremental, 2026-06-12 for backfill). The workflow widens a bare date to
+`T00:00:00Z` before calling `run_critic report --since`, which rejects any
+timestamp without a `Z` / offset — the period bounds decide which decisions a
+report covers, so an ambiguous bound is an error rather than "assume UTC".
+
+### 7.3 Where reports land
+
+- `docs/critic-reports/<YYYY-MM-DD>.md` on branch `claude/proposed-rules-<YYYY-MM-DD>`,
+  force-pushed by `critic-bot`; a PR against `main` titled `Critic report <date>` carries
+  the report as its body (re-runs on the same day update the same PR).
+- The `critic-report` workflow artifact (same markdown), uploaded even when a later step fails.
+- The `critic_reports` table (JSON + markdown) — the source of truth if the PR is closed.
+- A Telegram summary (first 300 characters + proposed-change count + gate verdict).
+
+Pushes made with `GITHUB_TOKEN` do **not** trigger CI on the report branch; that is
+expected (the branch only carries one markdown file). Review the PR, then merge or
+close it — merging only adds the report file; proposed rule changes are text for a
+human to implement in a follow-up step.
+
+### 7.4 IAM — the OIDC deploy role (operator action, outside the repo)
+
+`critic.yml` assumes the same role as `deploy-dev.yml` (`AWS_DEPLOY_ROLE_ARN`). On
+top of the CDK deploy permissions it needs the statements below. Attach as an inline
+policy (account `097853039368`, region `ap-south-1`); this also unblocks the CD
+pre-deploy migration, which today silently skips because the role cannot
+`DescribeStacks` (§2.1).
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadStackOutputs",
+      "Effect": "Allow",
+      "Action": "cloudformation:DescribeStacks",
+      "Resource": [
+        "arn:aws:cloudformation:ap-south-1:097853039368:stack/CryptoSignals-Data/*",
+        "arn:aws:cloudformation:ap-south-1:097853039368:stack/CryptoSignals-Compute/*"
+      ]
+    },
+    {
+      "Sid": "InvokeScanLambda",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:ap-south-1:097853039368:function:CryptoSignals-Compute-ScanLambdaDD7505A5-4lsj9dosUzzT"
+    },
+    {
+      "Sid": "AuroraDataApi",
+      "Effect": "Allow",
+      "Action": ["rds-data:ExecuteStatement", "rds-data:BatchExecuteStatement"],
+      "Resource": "arn:aws:rds:ap-south-1:097853039368:cluster:cryptosignals-data-aurora2cbab212-s1pyvq9ztgdm"
+    },
+    {
+      "Sid": "ReadDbCredential",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:ap-south-1:097853039368:secret:crypto-signals/db-a3zZGW"
+    },
+    {
+      "Sid": "ReadApiKeys",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": [
+        "arn:aws:ssm:ap-south-1:097853039368:parameter/crypto-signals/anthropic-api-key",
+        "arn:aws:ssm:ap-south-1:097853039368:parameter/crypto-signals/telegram-bot-token"
+      ]
+    }
+  ]
+}
+```
+
+The SSM parameters use the AWS-managed `aws/ssm` key, so no `kms:Decrypt`
+statement is needed. If they are ever moved to a customer-managed key, add
+`kms:Decrypt` on that key's ARN. If the Lambda is ever replaced, update the
+`InvokeScanLambda` resource (the workflow reads the current name from the
+`CryptoSignals-Compute` `ScanFunctionName` output and falls back to the name above).
+
+Also required (GitHub side): repo secret `AWS_DEPLOY_ROLE_ARN`, repo variable
+`AWS_REGION = ap-south-1`. The PR is opened with the job's `GITHUB_TOKEN`; no
+GitHub PAT is stored anywhere.
+
+### 7.5 Cost guard
+
+Anthropic spend for a backfill is unknown until measured. With `mode=backfill` and
+`confirm_cost=false` (default) the job exits **0** after the first 25 reviews and
+prints `::notice::first backfill chunk cost $X (~$Y/review); ~N remaining -> est $Z`.
+The report step is skipped on that run. Nothing is lost: the reviews already made are
+in `decision_reviews`, and the next run continues from the queue. Every review's
+`cost_usd` also lands in `agent_runs` (`agent_role = 'critic'`), so spend can be
+audited with:
+
+```sql
+SELECT date_trunc('day', created_at) AS day, count(*) AS reviews, sum(cost_usd) AS usd
+FROM agent_runs WHERE agent_role = 'critic' GROUP BY 1 ORDER BY 1;
+```
+
+### 7.6 Troubleshooting
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| `cfg` step: `AccessDenied` on `DescribeStacks` / `ssm:GetParameter` | IAM grants from §7.4 missing | Attach the policy; re-run |
+| `Apply schema` step fails (`grep "ok": true`) | Lambda migrate returned an error (Aurora resuming beyond the retry budget, or the dataapi backend not configured) | `cat out.json` in the log; re-run — migrate is idempotent |
+| Resolve loop: `remaining` never reaches 0, `resolved=0` → `::warning::no progress` | every remaining decision is deferred — usually Binance `PROVIDER_ERROR` (rate limit / outage) or candles not yet available for very recent decisions | `aws logs tail <scan-log-group> --since 1h --filter-pattern PROVIDER_ERROR`; recent decisions resolve on the next run; a persistent 451 means the Lambda region changed |
+| Resolve loop stops at `max_chunks` | large backfill queue | re-dispatch with `-f max_chunks=80`; the loop is idempotent |
+| Review loop: `REVIEW ... failed=N` | Claude call errors after retries; the rows carry `decision_reviews.error` | they are retried automatically once older than 1 day; persistent failures show up in the report's failure table |
+| Review loop exits 2 immediately | store / API unreachable (bad `DB_*` env, expired Anthropic key) | check the `cfg` step output; rotate the key (§1.2) |
+| No PR, but the report is in the artifact | `gh pr create`/`push` failed — branch protection or missing `contents: write` | the job fails so it is visible; the report is also in `critic_reports`; fix and re-run (same-day re-run updates the same PR) |
+| No Telegram message but the PR exists | notifier failure is non-fatal by design | see the `telegram summary failed` traceback in the report step log; usually a bad `/crypto-signals/telegram-bot-token` |
+| Two runs at once | impossible by design (`concurrency: critic`) — the EventBridge resolver *may* overlap the Actions resolve loop | harmless: resolution is idempotent per decision |

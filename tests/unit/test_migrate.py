@@ -203,9 +203,9 @@ class TestSchemaContent:
         for stmt in ("CREATE TABLE", "CREATE EXTENSION", "CREATE INDEX"):
             count_total = sql.count(stmt)
             count_guarded = sql.count(f"{stmt} IF NOT EXISTS")
-            assert (
-                count_total == count_guarded
-            ), f"Non-idempotent '{stmt}' statement detected; all DDL must use IF NOT EXISTS"
+            assert count_total == count_guarded, (
+                f"Non-idempotent '{stmt}' statement detected; all DDL must use IF NOT EXISTS"
+            )
 
     def test_signals_status_constrained_to_known_values(self) -> None:
         sql = self._schema()
@@ -233,6 +233,21 @@ class TestSchemaContent:
         assert "'OPEN'" in sql
         assert "REFERENCES signals(id) ON DELETE CASCADE" in sql
 
+    def test_critic_tables_constrained_and_cascade_from_signals(self) -> None:
+        # Critic v0 (Step 2.14): resolutions/reviews key on signal_id and cascade
+        # from the parent signal; kind/outcome vocabularies are CHECK-constrained.
+        sql = self._schema()
+        assert "CREATE TABLE IF NOT EXISTS decision_resolutions" in sql
+        assert "CREATE TABLE IF NOT EXISTS decision_reviews" in sql
+        assert "CREATE TABLE IF NOT EXISTS critic_reports" in sql
+        # active_setups + decision_resolutions + decision_reviews all cascade from signals.
+        assert sql.count("REFERENCES signals(id) ON DELETE CASCADE") == 3
+        assert "decision_kind IN ('PUBLISHED', 'VETOED', 'GATE_REJECTED')" in sql
+        assert "decision_kind IN ('PUBLISHED', 'VETOED', 'GATE_REJECTED', 'NO_SETUP')" in sql
+        assert "outcome IN ('WIN', 'LOSS', 'EXPIRED', 'UNRESOLVABLE')" in sql
+        assert "CHECK (attempts >= 1)" in sql
+        assert "CHECK (candles_used >= 0)" in sql
+
     def test_pgvector_extension_enabled(self) -> None:
         # Slice 3 Step 3.4 adds a vector(1536) column; we want the extension
         # in place now so that migration ordering is clean.
@@ -246,8 +261,22 @@ class TestSchemaContent:
 
 class TestPersistenceConstants:
     def test_expected_tables_match_schema_scope(self) -> None:
-        # Slice 1 shipped scan_runs/signals/agent_runs; Step 2.8 added active_setups.
-        assert frozenset({"scan_runs", "signals", "agent_runs", "active_setups"}) == EXPECTED_TABLES
+        # Slice 1 shipped scan_runs/signals/agent_runs; Step 2.8 added active_setups;
+        # Step 2.14 (Critic v0) added decision_resolutions/decision_reviews/critic_reports.
+        assert (
+            frozenset(
+                {
+                    "scan_runs",
+                    "signals",
+                    "agent_runs",
+                    "active_setups",
+                    "decision_resolutions",
+                    "decision_reviews",
+                    "critic_reports",
+                }
+            )
+            == EXPECTED_TABLES
+        )
 
     def test_schema_sql_path_resolves(self) -> None:
         assert SCHEMA_SQL_PATH.exists()

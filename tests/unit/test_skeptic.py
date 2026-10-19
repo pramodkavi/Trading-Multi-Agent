@@ -41,9 +41,11 @@ from src.config import Settings
 from src.providers import (
     DataProvider,
     FREDProvider,
+    Kline,
     MacroContext,
     MarketSnapshot,
     NoMacroData,
+    ProviderError,
     ProviderUnavailableError,
     Timeframe,
     TwelveDataProvider,
@@ -71,6 +73,16 @@ class FakeMacroProvider(DataProvider):
         include_derivatives: bool = False,
     ) -> MarketSnapshot:
         raise NotImplementedError
+
+    async def fetch_klines(
+        self,
+        symbol: str,
+        timeframe: Timeframe,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[Kline]:
+        raise ProviderError("fetch_klines not supported", provider=self.name)
 
     async def fetch_macro_context(self) -> MacroContext | NoMacroData:
         self.calls += 1

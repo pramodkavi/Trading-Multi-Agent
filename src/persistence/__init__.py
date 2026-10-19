@@ -11,6 +11,10 @@ Public API:
     StoredSignal        -- read-side wrapper for a signals row.
     StoredScanRun       -- read-side wrapper for a scan_runs row.
     StoredAgentRun      -- read-side wrapper for an agent_runs row.
+    StoredActiveSetup   -- read-side wrapper for an active_setups row (Step 2.8).
+    DecisionSummary     -- Critic aggregate row: signals + resolution + review (Step 2.14).
+    StoredReview        -- read-side wrapper for a decision_reviews row (Step 2.14).
+    StoredCriticReport  -- critic_reports row, read and write side (Step 2.14).
     SignalRepository    -- async CRUD over signals.
     AgentRunRepository  -- async writes for agent_runs.
     ScanRunRepository   -- async lifecycle ops for scan_runs.
@@ -29,8 +33,11 @@ from src.persistence.dataapi_migrate import (
 )
 from src.persistence.factory import create_store
 from src.persistence.models import (
+    DecisionSummary,
     StoredActiveSetup,
     StoredAgentRun,
+    StoredCriticReport,
+    StoredReview,
     StoredScanRun,
     StoredSignal,
 )
@@ -48,7 +55,18 @@ from src.persistence.store import (
 
 SCHEMA_SQL_PATH: Path = Path(__file__).parent / "schema.sql"
 
-EXPECTED_TABLES: frozenset[str] = frozenset({"scan_runs", "signals", "agent_runs", "active_setups"})
+EXPECTED_TABLES: frozenset[str] = frozenset(
+    {
+        "scan_runs",
+        "signals",
+        "agent_runs",
+        "active_setups",
+        # Critic v0 (Step 2.14)
+        "decision_resolutions",
+        "decision_reviews",
+        "critic_reports",
+    }
+)
 EXPECTED_EXTENSIONS: frozenset[str] = frozenset({"vector"})
 
 __all__ = [
@@ -59,11 +77,14 @@ __all__ = [
     "AgentRunRepository",
     "AsyncpgSignalStore",
     "DataApiSignalStore",
+    "DecisionSummary",
     "ScanRunRepository",
     "SignalRepository",
     "SignalStore",
     "StoredActiveSetup",
     "StoredAgentRun",
+    "StoredCriticReport",
+    "StoredReview",
     "StoredScanRun",
     "StoredSignal",
     "apply_schema_via_data_api",

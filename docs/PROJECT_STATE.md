@@ -6,7 +6,7 @@
 > **not** cloned, so everything durable has been written here instead. Read this file
 > first; it points to everything else.
 >
-> **Last updated:** 2026-06-27 (Slice 2 build complete through Step 2.13; live-verified).
+> **Last updated:** 2026-09-23 (Slice 2 live through Step 2.13; Step 2.14 automated by Critic v0 on `feat/slice-2-step-2.14-critic-v0`).
 > **Authority order:** `SPEC.md` (authoritative spec) → `CLAUDE.md` (index/rules) → this file (current state).
 
 ---
@@ -69,10 +69,25 @@ that adds tables/columns (`docs/operations.md §2.1`); (5) `::text` casts on Dat
 `string_to_array` params (NULL type inference, 42P18). Known-benign leftover: cold-start
 `INIT_REPORT … Status: timeout` (suppressed-init; non-fatal).
 
-**Next: Step 2.14** — let it run on the crons ~1 week and review signals (observation, no code).
-**Open follow-up (AWS-side, not in repo):** grant the OIDC deploy role `cloudformation:DescribeStacks`
-+ `rds-data:ExecuteStatement` + `secretsmanager:GetSecretValue` so the CD migration stops
-skipping (then `{"mode":"migrate"}` is no longer needed). See §7.
+**Step 2.14 — automated by Critic v0 (this branch, `feat/slice-2-step-2.14-critic-v0`).**
+The manual "review every signal" step became a **Decision Review System**: design
+`docs/superpowers/specs/2026-09-22-decision-review-critic-v0-design.md`, plan
+`docs/superpowers/plans/2026-09-22-decision-review-critic-v0.md` (15 tasks, all landed).
+```
+EventBridge rate(2 days) ──► scan Lambda {"mode":"resolve"}  (Layer 1: OutcomeResolver)
+                               replays entry/stop/target on 5m Binance candles
+                               → decision_resolutions, signals.outcome
+GitHub Actions critic.yml (cron 30 22 */2 * *, or workflow_dispatch)
+  → resolve loop (same Lambda) → review loop (Claude, one call per decision → decision_reviews)
+  → CriticReport (aggregates + Claude) → docs/critic-reports/<date>.md
+  → PR on claude/proposed-rules-<date> + Telegram summary
+```
+The **Slice 2 exit gate is the first section of the backfill report** (`mode=backfill`
+→ `--exit-gate`): four PASS/FAIL criteria computed from `scan_runs` / `signals` /
+`active_setups` (`src/agents/critic/exit_gate.py`). Runbook: `docs/operations.md §7`.
+**Not yet run live** — the first backfill needs the IAM grants in §7 below, then
+`gh workflow run critic.yml -f mode=backfill` (stops after one chunk for the cost check),
+then again with `-f confirm_cost=true`.
 
 ---
 
@@ -213,7 +228,11 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 |---|---|
 | 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. As of Step 2.12 these live in **SSM Parameter Store**: `aws ssm put-parameter --overwrite --type SecureString --name /crypto-signals/anthropic-api-key --value '<key>'` and `... --name /crypto-signals/telegram-bot-token --value '{"bot_token":"<t>","chat_id":"8300889332"}'` (region ap-south-1). Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. Full procedure: `docs/operations.md §1.2`. |
 | 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. **(done for dev — OIDC live.)** |
-| 🟠 Infra/CD | **Auto-migration IAM (Slice 2):** the deploy workflows now run the DB migration before `cdk deploy` using the OIDC deploy role. That role must allow `cloudformation:DescribeStacks` (already has it), `rds-data:ExecuteStatement` on the cluster, and `secretsmanager:GetSecretValue` on the DB secret. If the role is admin-ish this is already covered; if it's scoped, attach the policy in §4 / the deploy notes or the migration step fails with `AccessDenied`. |
+| 🟠 Infra/CD | **OIDC deploy-role grants (blocks the first Critic run AND the CD auto-migration):** the role behind `AWS_DEPLOY_ROLE_ARN` needs `cloudformation:DescribeStacks` on `CryptoSignals-Data` + `CryptoSignals-Compute`; `lambda:InvokeFunction` on the scan Lambda; `rds-data:ExecuteStatement` + `rds-data:BatchExecuteStatement` on the cluster ARN; `secretsmanager:GetSecretValue` on the DB secret; `ssm:GetParameter` on `/crypto-signals/anthropic-api-key` and `/crypto-signals/telegram-bot-token` (no `kms:Decrypt` needed with the default `aws/ssm` key). **Exact JSON policy: `docs/operations.md §7.4`.** Until attached, `critic.yml` fails in its `cfg` step and the deploy migration keeps silently skipping (`{"mode":"migrate"}` escape hatch). |
+| 🟠 Critic v0 | **Run the first backfill** once the grants are in: `gh workflow run critic.yml -f mode=backfill` → read the `::notice::` cost estimate → re-dispatch with `-f confirm_cost=true` → review the `Critic report <date>` PR; its first section is the Slice 2 exit gate. Then merge `feat/slice-2-step-2.14-critic-v0` (deploys the `rate(2 days)` resolver schedule). |
+| 🟡 Finding (2.14) | **Judge vetoes are stored as `signals.status = 'PUBLISHED'`.** `run_scan._persist` writes `PUBLISHED` for any proposal payload; only the presence of an `active_setups` row says whether it was actually published. Critic v0 works around it (`inventory.classify` is Judge-veto aware; the gate counts published = has setup row). Fix: a `VETOED` status (or set `SKIPPED` on `ruling == SKIP`) in a follow-up step; the schema/gate read paths must keep accepting the historical rows. |
+| 🟡 Finding (2.14) | **`session` is hardcoded to `AD_HOC` in every scan**, so hard rule 7 (no new signals in Asian / Cooldown sessions) can never fire in production — the scan windows happen to be inside London/NY hours, but the gate is dead code live. Fix: derive `TradingSession` from the scan's UTC start time in `run_scan` (and store it in `scan_runs.session`). |
+| 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |
 | ✅ Done | ~~Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking.~~ **Shipped (`fix/aurora-resume-retry`):** `_execute` retries `DatabaseResumingException` up to 6× with linear backoff (5/10/15/20/25s, ≤75s, well under the 10-min Lambda timeout). This was the production failure — every scheduled scan was dying on its first DB call (`start_scan`) because Aurora had scaled to zero, so no Telegram ever fired. Verified in the live Lambda logs (`log-events-viewer-result.csv`). |
 
 ---

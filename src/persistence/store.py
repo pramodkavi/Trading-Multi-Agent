@@ -10,8 +10,9 @@ local Docker dev loop still uses asyncpg, so persistence is expressed once as a
 - ``AsyncpgSignalStore`` (Step 1.17 Part B) -- thin facade over the existing
   asyncpg repositories for local dev / integration tests.
 
-Both expose the same nine async methods (mirroring ScanRunRepository /
-SignalRepository / AgentRunRepository) plus ``aclose``. A ``create_store``
+Both expose the same async methods (mirroring ScanRunRepository /
+SignalRepository / AgentRunRepository / ActiveSetupRepository /
+DecisionRepository) plus ``aclose``. A ``create_store``
 factory (Part B) selects the backend from settings.
 
 Why the Data API surface looks the way it does
@@ -53,14 +54,17 @@ from src.common.models import (
     SkipDecision,
 )
 from src.persistence.models import (
+    DecisionSummary,
     StoredActiveSetup,
     StoredAgentRun,
+    StoredCriticReport,
     StoredScanRun,
     StoredSignal,
 )
 from src.persistence.repositories import (
     ActiveSetupRepository,
     AgentRunRepository,
+    DecisionRepository,
     ScanRunRepository,
     SignalRepository,
     _assert_safe_feature_key,
@@ -71,6 +75,11 @@ from src.persistence.repositories import (
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import AsyncIterator, Mapping, Sequence
     from datetime import datetime
+
+    # Typing-only: ``src.agents.critic.models`` itself imports
+    # ``src.persistence.models`` (-> this package's __init__ -> this module), so a
+    # runtime import here would be a cycle whenever the critic package loads first.
+    from src.agents.critic.models import Resolution
 
 # A boto3 ``rds-data`` client. botocore ships no usable static types under
 # --strict, so it is opaque here; the store's only contact surface is
@@ -133,11 +142,91 @@ def _double_param(name: str, value: float | None) -> dict[str, Any]:
     return {"name": name, "value": {"doubleValue": value}}
 
 
+def _bool_param(name: str, value: bool | None) -> dict[str, Any]:
+    if value is None:
+        return {"name": name, "value": {"isNull": True}}
+    return {"name": name, "value": {"booleanValue": value}}
+
+
 def _array_param(name: str, values: Sequence[str] | None) -> dict[str, Any]:
     """Build a string-array parameter for a ``text[]`` column."""
     if values is None:
         return {"name": name, "value": {"isNull": True}}
     return {"name": name, "value": {"arrayValue": {"stringValues": list(values)}}}
+
+
+def _cursor_params(after: tuple[datetime, UUID] | None) -> list[dict[str, Any]]:
+    """Keyset cursor as the ``after_ts`` / ``after_id`` params (both NULL == first page).
+
+    Pairs with the SQL predicate
+    ``(:after_ts::timestamptz IS NULL OR (ts_col, id) > (:after_ts::timestamptz, :after_id::uuid))``
+    so one statement serves both the first page and every later one.
+    """
+    if after is None:
+        return [_str_param("after_ts", None), _str_param("after_id", None)]
+    return [
+        _str_param("after_ts", after[0].isoformat()),
+        _str_param("after_id", str(after[1])),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Critic v0 (Step 2.14) SQL fragments -- Data API flavour of the asyncpg
+# constants in repositories.py (named params + explicit casts).
+# ---------------------------------------------------------------------------
+
+# Native-typed ``signals`` columns (alias ``s``) for the inner legs of a UNION:
+# sorting must happen on the real timestamptz / uuid, so the to_char / ::text
+# stringification is applied by the *outer* SELECT (see _signal_projection).
+_SIGNAL_RAW_COLUMNS_S = (
+    "s.id, s.scan_id, s.symbol, s.strategy, s.direction, s.status, s.created_at, "
+    "s.payload, s.tags, s.features, s.outcome, s.outcome_metadata"
+)
+
+
+def _signal_projection(prefix: str) -> str:
+    """Data-API-friendly SELECT list for a ``signals`` row (uuid / JSONB as text, tz as ISO)."""
+    q = f"{prefix}."
+    return f"""{q}id::text AS id, {q}scan_id::text AS scan_id, {q}symbol, {q}strategy,
+                   {q}direction, {q}status,
+                   {_utc_iso(f"{q}created_at", alias="created_at")},
+                   {q}payload::text AS payload,
+                   {q}tags, {q}features::text AS features, {q}outcome,
+                   {q}outcome_metadata::text AS outcome_metadata"""
+
+
+# Unresolved decision (design §5.1): a proposal (direction set) or a gate-rejected
+# skip (payload.violated_rule set) with no decision_resolutions row yet, old enough
+# that its resolution window has elapsed. NO_SETUP skips never need a replay.
+_UNRESOLVED_FROM_WHERE = """
+            FROM signals s
+            LEFT JOIN decision_resolutions r ON r.signal_id = s.id
+            WHERE r.signal_id IS NULL
+              AND (s.direction IS NOT NULL OR s.payload->>'violated_rule' IS NOT NULL)
+              AND s.created_at < :decided_before::timestamptz
+"""
+
+# Pending review (design §6.1): no review row, or an errored one still under the
+# retry cap (attempts < 2) and old enough to retry. Branch (a): resolved
+# decisions. Branch (b): NO_SETUP skips, reviewed once ``no_setup_before`` old.
+_REVIEW_MISSING_OR_RETRYABLE = """(v.signal_id IS NULL
+                     OR (v.error IS NOT NULL AND v.attempts < 2
+                         AND v.created_at < :retry_before::timestamptz))"""
+
+_PENDING_REVIEWS_UNION = f"""
+                SELECT {_SIGNAL_RAW_COLUMNS_S}
+                FROM signals s
+                JOIN decision_resolutions r ON r.signal_id = s.id
+                LEFT JOIN decision_reviews v ON v.signal_id = s.id
+                WHERE {_REVIEW_MISSING_OR_RETRYABLE}
+                UNION ALL
+                SELECT {_SIGNAL_RAW_COLUMNS_S}
+                FROM signals s
+                LEFT JOIN decision_reviews v ON v.signal_id = s.id
+                WHERE s.direction IS NULL AND s.payload->>'violated_rule' IS NULL
+                  AND s.created_at < :no_setup_before::timestamptz
+                  AND {_REVIEW_MISSING_OR_RETRYABLE}
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +373,98 @@ class SignalStore(Protocol):
         evaluated_at: datetime | None = None,
     ) -> None:
         """Record an evaluation + status on a setup (keeps OPEN, or closes it)."""
+        ...
+
+    # ---- Critic v0 (Step 2.14) -- Layer 1: OutcomeResolver queue ---------------
+
+    async def list_unresolved_decisions(
+        self, *, limit: int, decided_before: datetime
+    ) -> list[StoredSignal]:
+        """Decisions (proposals or gate-rejected skips) with no resolution row, oldest first."""
+        ...
+
+    async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
+        """Size of the unresolved-decision queue whose ``created_at < decided_before``."""
+        ...
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        """Every agent_runs row for one scan (one scan == one decision), oldest first."""
+        ...
+
+    async def save_resolution(self, resolution: Resolution) -> None:
+        """Upsert a ``decision_resolutions`` row keyed on ``signal_id``."""
+        ...
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        """The resolution for a signal, or None when unresolved."""
+        ...
+
+    async def close_active_setup_for_signal(
+        self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
+    ) -> None:
+        """Close the OPEN active_setups row of a signal (no-op when none is open)."""
+        ...
+
+    # ---- Critic v0 (Step 2.14) -- Layer 2: DecisionReviewer queue --------------
+
+    async def list_pending_reviews(
+        self, *, limit: int, no_setup_before: datetime, retry_before: datetime
+    ) -> list[StoredSignal]:
+        """Resolved (or aged NO_SETUP) decisions lacking a successful review, oldest first."""
+        ...
+
+    async def count_pending_reviews(
+        self, *, no_setup_before: datetime, retry_before: datetime
+    ) -> int:
+        """Size of the pending-review queue (same predicate as ``list_pending_reviews``)."""
+        ...
+
+    async def save_review(
+        self,
+        *,
+        signal_id: UUID,
+        decision_kind: str,
+        review: Mapping[str, Any],
+        model: str,
+        token_usage: Mapping[str, Any],
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        """Upsert a ``decision_reviews`` row; a conflict bumps ``attempts`` and ``created_at``."""
+        ...
+
+    # ---- Critic v0 (Step 2.14) -- report reads (keyset-paginated) --------------
+
+    async def list_decision_summaries(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[DecisionSummary]:
+        """Decisions in ``[since, until)`` joined to resolution/review, by (created_at, id)."""
+        ...
+
+    async def list_scan_runs_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[StoredScanRun]:
+        """scan_runs started in ``[since, until)``, ordered by (started_at, id)."""
+        ...
+
+    async def list_active_setups(
+        self, *, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[StoredActiveSetup]:
+        """All active_setups rows (any status), ordered by (opened_at, id)."""
+        ...
+
+    async def save_critic_report(self, report: StoredCriticReport) -> None:
+        """Insert one ``critic_reports`` row."""
         ...
 
     async def aclose(self) -> None: ...
@@ -780,7 +961,22 @@ class DataApiSignalStore:
         rows = _parse_records(response)
         if not rows:
             return None
-        row = rows[0]
+        return self._row_to_agent_run(rows[0])
+
+    @staticmethod
+    def _select_agent_runs(where: str) -> str:
+        return f"""
+            SELECT id::text AS id, scan_id::text AS scan_id, agent_role, strategy,
+                   input_hash, output::text AS output, latency_ms,
+                   token_usage::text AS token_usage,
+                   cost_usd::double precision AS cost_usd,
+                   {_utc_iso("created_at", alias="created_at")}
+            FROM agent_runs
+            {where}
+        """
+
+    @staticmethod
+    def _row_to_agent_run(row: dict[str, Any]) -> StoredAgentRun:
         row["output"] = _parse_jsonb_field(row["output"])
         row["token_usage"] = _parse_jsonb_field(row["token_usage"])
         return StoredAgentRun.model_validate(row)
@@ -867,6 +1063,351 @@ class DataApiSignalStore:
         if row.get("latest_evaluation") is not None:
             row["latest_evaluation"] = _parse_jsonb_field(row["latest_evaluation"])
         return StoredActiveSetup.model_validate(row)
+
+    # ---- Critic v0 (Step 2.14) -- Layer 1: OutcomeResolver queue ---------------
+
+    async def list_unresolved_decisions(
+        self, *, limit: int, decided_before: datetime
+    ) -> list[StoredSignal]:
+        response = await self._execute(
+            f"""
+            SELECT {_signal_projection("s")}
+            {_UNRESOLVED_FROM_WHERE}
+            ORDER BY s.created_at ASC, s.id ASC
+            LIMIT :limit
+            """,
+            [
+                _str_param("decided_before", decided_before.isoformat()),
+                _long_param("limit", limit),
+            ],
+            with_metadata=True,
+        )
+        return [self._row_to_signal(row) for row in _parse_records(response)]
+
+    async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
+        response = await self._execute(
+            f"""
+            SELECT count(*) AS n
+            {_UNRESOLVED_FROM_WHERE}
+            """,
+            [_str_param("decided_before", decided_before.isoformat())],
+            with_metadata=True,
+        )
+        return self._scalar_count(response)
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        response = await self._execute(
+            self._select_agent_runs("WHERE scan_id = :scan_id::uuid ORDER BY created_at ASC"),
+            [_str_param("scan_id", str(scan_id))],
+            with_metadata=True,
+        )
+        return [self._row_to_agent_run(row) for row in _parse_records(response)]
+
+    async def save_resolution(self, resolution: Resolution) -> None:
+        """Upsert on ``signal_id`` so re-running the resolver is idempotent."""
+        await self._execute(
+            """
+            INSERT INTO decision_resolutions
+                (signal_id, decision_kind, outcome, decided_at, entered_at, resolved_at,
+                 realized_r, max_adverse_excursion_r, max_favorable_excursion_r,
+                 tp2_reached, candles_used, engine_version)
+            VALUES
+                (:signal_id::uuid, :decision_kind, :outcome, :decided_at::timestamptz,
+                 :entered_at::timestamptz, :resolved_at::timestamptz, :realized_r,
+                 :max_adverse_excursion_r, :max_favorable_excursion_r,
+                 :tp2_reached, :candles_used, :engine_version)
+            ON CONFLICT (signal_id) DO UPDATE SET
+                decision_kind = EXCLUDED.decision_kind,
+                outcome = EXCLUDED.outcome,
+                decided_at = EXCLUDED.decided_at,
+                entered_at = EXCLUDED.entered_at,
+                resolved_at = EXCLUDED.resolved_at,
+                realized_r = EXCLUDED.realized_r,
+                max_adverse_excursion_r = EXCLUDED.max_adverse_excursion_r,
+                max_favorable_excursion_r = EXCLUDED.max_favorable_excursion_r,
+                tp2_reached = EXCLUDED.tp2_reached,
+                candles_used = EXCLUDED.candles_used,
+                engine_version = EXCLUDED.engine_version,
+                created_at = NOW()
+            """,
+            [
+                _str_param("signal_id", str(resolution.signal_id)),
+                _str_param("decision_kind", resolution.decision_kind.value),
+                _str_param("outcome", resolution.outcome.value),
+                _str_param("decided_at", resolution.decided_at.isoformat()),
+                _str_param(
+                    "entered_at",
+                    resolution.entered_at.isoformat() if resolution.entered_at else None,
+                ),
+                _str_param("resolved_at", resolution.resolved_at.isoformat()),
+                _double_param("realized_r", resolution.realized_r),
+                _double_param("max_adverse_excursion_r", resolution.max_adverse_excursion_r),
+                _double_param("max_favorable_excursion_r", resolution.max_favorable_excursion_r),
+                _bool_param("tp2_reached", resolution.tp2_reached),
+                _long_param("candles_used", resolution.candles_used),
+                _str_param("engine_version", resolution.engine_version),
+            ],
+        )
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        # Runtime import: ``src.agents.critic.models`` imports this package's
+        # models (-> __init__ -> this module), so a top-level import would be a
+        # cycle whenever the critic package loads first (see the TYPE_CHECKING
+        # block at the top of the module). Mirrors DecisionRepository.
+        from src.agents.critic.models import Resolution
+
+        response = await self._execute(
+            f"""
+            SELECT signal_id::text AS signal_id, decision_kind, outcome,
+                   {_utc_iso("decided_at", alias="decided_at")},
+                   {_utc_iso("entered_at", alias="entered_at")},
+                   {_utc_iso("resolved_at", alias="resolved_at")},
+                   realized_r, max_adverse_excursion_r, max_favorable_excursion_r,
+                   tp2_reached, candles_used, engine_version
+            FROM decision_resolutions
+            WHERE signal_id = :signal_id::uuid
+            """,
+            [_str_param("signal_id", str(signal_id))],
+            with_metadata=True,
+        )
+        rows = _parse_records(response)
+        if not rows:
+            return None
+        return Resolution.model_validate(rows[0])
+
+    async def close_active_setup_for_signal(
+        self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
+    ) -> None:
+        """Close a signal's OPEN setup with the resolver's verdict; no-op if none is open.
+
+        Guarding on ``status = 'OPEN'`` keeps the Forecaster's own terminal
+        status (and evaluation) intact when it already closed the setup.
+        """
+        await self._execute(
+            """
+            UPDATE active_setups
+            SET status = :status,
+                latest_evaluation = :latest_evaluation::jsonb,
+                last_evaluated_at = NOW()
+            WHERE signal_id = :signal_id::uuid AND status = 'OPEN'
+            """,
+            [
+                _str_param("status", status.value),
+                _str_param("latest_evaluation", _to_jsonb(dict(evaluation))),
+                _str_param("signal_id", str(signal_id)),
+            ],
+        )
+
+    # ---- Critic v0 (Step 2.14) -- Layer 2: DecisionReviewer queue --------------
+
+    async def list_pending_reviews(
+        self, *, limit: int, no_setup_before: datetime, retry_before: datetime
+    ) -> list[StoredSignal]:
+        # The UNION legs keep native types so ORDER BY sorts real timestamps /
+        # uuids (not their text renderings); the outer SELECT stringifies.
+        response = await self._execute(
+            f"""
+            SELECT {_signal_projection("q")}
+            FROM (
+            {_PENDING_REVIEWS_UNION}
+            ) q
+            ORDER BY q.created_at ASC, q.id ASC
+            LIMIT :limit
+            """,
+            [
+                _str_param("no_setup_before", no_setup_before.isoformat()),
+                _str_param("retry_before", retry_before.isoformat()),
+                _long_param("limit", limit),
+            ],
+            with_metadata=True,
+        )
+        return [self._row_to_signal(row) for row in _parse_records(response)]
+
+    async def count_pending_reviews(
+        self, *, no_setup_before: datetime, retry_before: datetime
+    ) -> int:
+        response = await self._execute(
+            f"""
+            SELECT count(*) AS n
+            FROM (
+            {_PENDING_REVIEWS_UNION}
+            ) q
+            """,
+            [
+                _str_param("no_setup_before", no_setup_before.isoformat()),
+                _str_param("retry_before", retry_before.isoformat()),
+            ],
+            with_metadata=True,
+        )
+        return self._scalar_count(response)
+
+    async def save_review(
+        self,
+        *,
+        signal_id: UUID,
+        decision_kind: str,
+        review: Mapping[str, Any],
+        model: str,
+        token_usage: Mapping[str, Any],
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        """Upsert a review; a conflict (retry) bumps ``attempts`` and refreshes ``created_at``.
+
+        ``attempts`` caps retries in the pending-review predicate, so it must
+        count *every* write, including failed ones -- hence the increment lives
+        in the upsert rather than in Python.
+        """
+        await self._execute(
+            """
+            INSERT INTO decision_reviews
+                (signal_id, decision_kind, review, model, token_usage, cost_usd, error, attempts)
+            VALUES
+                (:signal_id::uuid, :decision_kind, :review::jsonb, :model,
+                 :token_usage::jsonb, :cost_usd, :error, 1)
+            ON CONFLICT (signal_id) DO UPDATE SET
+                decision_kind = EXCLUDED.decision_kind,
+                review = EXCLUDED.review,
+                model = EXCLUDED.model,
+                token_usage = EXCLUDED.token_usage,
+                cost_usd = EXCLUDED.cost_usd,
+                error = EXCLUDED.error,
+                attempts = decision_reviews.attempts + 1,
+                created_at = NOW()
+            """,
+            [
+                _str_param("signal_id", str(signal_id)),
+                _str_param("decision_kind", decision_kind),
+                _str_param("review", _to_jsonb(dict(review))),
+                _str_param("model", model),
+                _str_param("token_usage", _to_jsonb(dict(token_usage))),
+                _double_param("cost_usd", cost_usd),
+                _str_param("error", error),
+            ],
+        )
+
+    # ---- Critic v0 (Step 2.14) -- report reads (keyset-paginated) --------------
+
+    async def list_decision_summaries(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[DecisionSummary]:
+        response = await self._execute(
+            f"""
+            SELECT s.id::text AS id, s.scan_id::text AS scan_id, s.symbol, s.direction,
+                   s.status,
+                   {_utc_iso("s.created_at", alias="created_at")},
+                   s.payload->>'violated_rule' AS violated_rule, s.outcome,
+                   r.decision_kind, r.outcome AS resolution_outcome, r.realized_r,
+                   {_utc_iso("r.entered_at", alias="entered_at")},
+                   CASE WHEN v.error IS NULL THEN v.review::text END AS review,
+                   v.error AS review_error
+            FROM signals s
+            LEFT JOIN decision_resolutions r ON r.signal_id = s.id
+            LEFT JOIN decision_reviews v ON v.signal_id = s.id
+            WHERE s.created_at >= :since::timestamptz AND s.created_at < :until::timestamptz
+              AND (:after_ts::timestamptz IS NULL
+                   OR (s.created_at, s.id) > (:after_ts::timestamptz, :after_id::uuid))
+            ORDER BY s.created_at ASC, s.id ASC
+            LIMIT :limit
+            """,
+            [
+                _str_param("since", since.isoformat()),
+                _str_param("until", until.isoformat()),
+                *_cursor_params(after),
+                _long_param("limit", limit),
+            ],
+            with_metadata=True,
+        )
+        return [self._row_to_summary(row) for row in _parse_records(response)]
+
+    async def list_scan_runs_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[StoredScanRun]:
+        response = await self._execute(
+            f"""
+            SELECT id::text AS id,
+                   {_utc_iso("started_at", alias="started_at")},
+                   {_utc_iso("completed_at", alias="completed_at")},
+                   status, error_message, session, strategy, symbols
+            FROM scan_runs
+            WHERE started_at >= :since::timestamptz AND started_at < :until::timestamptz
+              AND (:after_ts::timestamptz IS NULL
+                   OR (started_at, id) > (:after_ts::timestamptz, :after_id::uuid))
+            ORDER BY started_at ASC, id ASC
+            LIMIT :limit
+            """,
+            [
+                _str_param("since", since.isoformat()),
+                _str_param("until", until.isoformat()),
+                *_cursor_params(after),
+                _long_param("limit", limit),
+            ],
+            with_metadata=True,
+        )
+        return [StoredScanRun.model_validate(row) for row in _parse_records(response)]
+
+    async def list_active_setups(
+        self, *, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[StoredActiveSetup]:
+        """Every setup regardless of status (the exit gate counts closed ones too)."""
+        response = await self._execute(
+            self._select_active_setups(
+                """
+                WHERE (:after_ts::timestamptz IS NULL
+                       OR (opened_at, id) > (:after_ts::timestamptz, :after_id::uuid))
+                ORDER BY opened_at ASC, id ASC
+                LIMIT :limit
+                """
+            ),
+            [*_cursor_params(after), _long_param("limit", limit)],
+            with_metadata=True,
+        )
+        return [self._row_to_active_setup(row) for row in _parse_records(response)]
+
+    async def save_critic_report(self, report: StoredCriticReport) -> None:
+        await self._execute(
+            """
+            INSERT INTO critic_reports
+                (id, period_start, period_end, report, markdown, pr_url, created_at)
+            VALUES
+                (:id::uuid, :period_start::timestamptz, :period_end::timestamptz,
+                 :report::jsonb, :markdown, :pr_url, :created_at::timestamptz)
+            """,
+            [
+                _str_param("id", str(report.id)),
+                _str_param("period_start", report.period_start.isoformat()),
+                _str_param("period_end", report.period_end.isoformat()),
+                _str_param("report", _to_jsonb(dict(report.report))),
+                _str_param("markdown", report.markdown),
+                _str_param("pr_url", report.pr_url),
+                _str_param("created_at", report.created_at.isoformat()),
+            ],
+        )
+
+    @staticmethod
+    def _scalar_count(response: Mapping[str, Any]) -> int:
+        """Read ``SELECT count(*) AS n`` (a bigint -> ``longValue``) as an int."""
+        rows = _parse_records(response)
+        if not rows or rows[0].get("n") is None:
+            return 0
+        return int(rows[0]["n"])
+
+    @staticmethod
+    def _row_to_summary(row: dict[str, Any]) -> DecisionSummary:
+        # The SQL CASE already NULLs `review` for errored rows; only parse real JSONB.
+        if row.get("review") is not None:
+            row["review"] = _parse_jsonb_field(row["review"])
+        return DecisionSummary.model_validate(row)
 
     # ---- lifecycle --------------------------------------------------------
 
@@ -1085,6 +1626,116 @@ class AsyncpgSignalStore:
                 evaluation=evaluation,
                 evaluated_at=evaluated_at,
             )
+
+    # ---- Critic v0 (Step 2.14) -- DecisionRepository delegation ----------------
+
+    async def list_unresolved_decisions(
+        self, *, limit: int, decided_before: datetime
+    ) -> list[StoredSignal]:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_unresolved_decisions(
+                limit=limit, decided_before=decided_before
+            )
+
+    async def count_unresolved_decisions(self, *, decided_before: datetime) -> int:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).count_unresolved_decisions(
+                decided_before=decided_before
+            )
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_agent_runs_for_scan(scan_id)
+
+    async def save_resolution(self, resolution: Resolution) -> None:
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).save_resolution(resolution)
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).get_resolution(signal_id)
+
+    async def close_active_setup_for_signal(
+        self, *, signal_id: UUID, status: ActiveSetupStatus, evaluation: Mapping[str, Any]
+    ) -> None:
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).close_active_setup_for_signal(
+                signal_id=signal_id, status=status, evaluation=evaluation
+            )
+
+    async def list_pending_reviews(
+        self, *, limit: int, no_setup_before: datetime, retry_before: datetime
+    ) -> list[StoredSignal]:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_pending_reviews(
+                limit=limit, no_setup_before=no_setup_before, retry_before=retry_before
+            )
+
+    async def count_pending_reviews(
+        self, *, no_setup_before: datetime, retry_before: datetime
+    ) -> int:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).count_pending_reviews(
+                no_setup_before=no_setup_before, retry_before=retry_before
+            )
+
+    async def save_review(
+        self,
+        *,
+        signal_id: UUID,
+        decision_kind: str,
+        review: Mapping[str, Any],
+        model: str,
+        token_usage: Mapping[str, Any],
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).save_review(
+                signal_id=signal_id,
+                decision_kind=decision_kind,
+                review=review,
+                model=model,
+                token_usage=token_usage,
+                cost_usd=cost_usd,
+                error=error,
+            )
+
+    async def list_decision_summaries(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[DecisionSummary]:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_decision_summaries(
+                since=since, until=until, after=after, limit=limit
+            )
+
+    async def list_scan_runs_between(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        after: tuple[datetime, UUID] | None,
+        limit: int,
+    ) -> list[StoredScanRun]:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_scan_runs_between(
+                since=since, until=until, after=after, limit=limit
+            )
+
+    async def list_active_setups(
+        self, *, after: tuple[datetime, UUID] | None, limit: int
+    ) -> list[StoredActiveSetup]:
+        async with self._acquire() as conn:
+            return await DecisionRepository(conn).list_active_setups(after=after, limit=limit)
+
+    async def save_critic_report(self, report: StoredCriticReport) -> None:
+        async with self._acquire() as conn:
+            await DecisionRepository(conn).save_critic_report(report)
 
     # ---- lifecycle --------------------------------------------------------
 
