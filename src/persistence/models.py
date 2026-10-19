@@ -29,6 +29,7 @@ from src.common.models import (
     ActiveSetupStatus,
     AgentRole,
     ScanStatus,
+    SetupEvaluationStatus,
     SignalDirection,
     SignalOutcome,
     SignalProposal,
@@ -233,6 +234,51 @@ class StoredActiveSetup(BaseModel):
     def _evaluated_must_be_aware(cls, v: datetime | None) -> datetime | None:
         if v is not None and v.tzinfo is None:
             raise ValueError("last_evaluated_at must be timezone-aware (use UTC)")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# StoredSetupEvaluation -- mirrors a row of `setup_evaluations`
+# ---------------------------------------------------------------------------
+
+
+class StoredSetupEvaluation(BaseModel):
+    """Read-side projection of one row in the `setup_evaluations` table
+    (Slice 4 Step 4.0, dashboard design §5.2).
+
+    One row per Forecaster look at a setup. `status` is the verdict, or ERROR
+    when the evaluation raised -- then `error` carries the failure text and
+    `reasoning` / `outcome` are NULL. `outcome` is set only when the verdict
+    closed the setup. `latency_ms` / `token_usage` / `cost_usd` mirror the
+    `agent_runs` accounting columns so per-evaluation LLM cost is queryable.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID = Field(description="Primary key (setup_evaluations.id).")
+    setup_id: UUID = Field(description="FK to active_setups.id.")
+    signal_id: UUID = Field(description="FK to signals.id (denormalised for joins).")
+    evaluated_at: datetime = Field(description="When the evaluation ran (UTC).")
+    status: SetupEvaluationStatus = Field(description="Verdict, or ERROR when the eval raised.")
+    outcome: SignalOutcome | None = Field(
+        default=None,
+        description="Terminal outcome when this evaluation closed the setup; else NULL.",
+    )
+    reasoning: str | None = Field(
+        default=None, description="The Forecaster's reasoning text; NULL on ERROR rows."
+    )
+    error: str | None = Field(
+        default=None, description="Failure text when status is ERROR; NULL otherwise."
+    )
+    latency_ms: int = Field(default=0, ge=0)
+    token_usage: dict[str, Any] = Field(default_factory=dict)
+    cost_usd: float | None = None
+
+    @field_validator("evaluated_at")
+    @classmethod
+    def _evaluated_must_be_aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            raise ValueError("evaluated_at must be timezone-aware (use UTC)")
         return v
 
 

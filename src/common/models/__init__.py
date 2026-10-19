@@ -16,6 +16,8 @@ Public API:
     ScanSession     -- which scheduler window triggered the scan
     ScanStatus      -- persisted scan_runs row status (RUNNING/SUCCESS/FAILED)
     ActiveSetupStatus -- OPEN + terminal lifecycle of an active_setups row
+    SetupEvaluationStatus -- ForecastStatus + ERROR for a setup_evaluations row
+                       (Step 4.0, design §5.2)
     AgentRole       -- the six agent roles referenced by agent_runs
     ScanContext     -- per-scan metadata propagated through every agent
     LlmUsage        -- tokens / cost / latency of one agent LLM call, carried
@@ -31,6 +33,7 @@ from src.common.models.enums import (
     ObjectionSeverity,
     ScanSession,
     ScanStatus,
+    SetupEvaluationStatus,
     SignalDirection,
     SignalOutcome,
     SignalStatus,
@@ -51,6 +54,7 @@ __all__ = [
     "ScanContext",
     "ScanSession",
     "ScanStatus",
+    "SetupEvaluationStatus",
     "SignalDirection",
     "SignalOutcome",
     "SignalProposal",

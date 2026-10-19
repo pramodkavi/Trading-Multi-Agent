@@ -12,12 +12,14 @@ Public API:
     StoredScanRun       -- read-side wrapper for a scan_runs row.
     StoredAgentRun      -- read-side wrapper for an agent_runs row.
     StoredActiveSetup   -- read-side wrapper for an active_setups row (Step 2.8).
+    StoredSetupEvaluation -- read-side wrapper for a setup_evaluations row (Step 4.0).
     DecisionSummary     -- Critic aggregate row: signals + resolution + review (Step 2.14).
     StoredReview        -- read-side wrapper for a decision_reviews row (Step 2.14).
     StoredCriticReport  -- critic_reports row, read and write side (Step 2.14).
     SignalRepository    -- async CRUD over signals.
     AgentRunRepository  -- async writes for agent_runs.
     ScanRunRepository   -- async lifecycle ops for scan_runs.
+    SetupEvaluationRepository -- append-only journal of Forecaster evaluations (Step 4.0).
     SignalStore         -- backend-neutral persistence Protocol (Step 1.17).
     AsyncpgSignalStore  -- SignalStore over a local asyncpg connection.
     DataApiSignalStore  -- SignalStore over the Aurora RDS Data API (cloud).
@@ -39,12 +41,14 @@ from src.persistence.models import (
     StoredCriticReport,
     StoredReview,
     StoredScanRun,
+    StoredSetupEvaluation,
     StoredSignal,
 )
 from src.persistence.repositories import (
     ActiveSetupRepository,
     AgentRunRepository,
     ScanRunRepository,
+    SetupEvaluationRepository,
     SignalRepository,
 )
 from src.persistence.store import (
@@ -65,6 +69,8 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "decision_resolutions",
         "decision_reviews",
         "critic_reports",
+        # Forecaster evaluation journal (Slice 4 Step 4.0, design §5.2)
+        "setup_evaluations",
     }
 )
 EXPECTED_EXTENSIONS: frozenset[str] = frozenset({"vector"})
@@ -79,6 +85,7 @@ __all__ = [
     "DataApiSignalStore",
     "DecisionSummary",
     "ScanRunRepository",
+    "SetupEvaluationRepository",
     "SignalRepository",
     "SignalStore",
     "StoredActiveSetup",
@@ -86,6 +93,7 @@ __all__ = [
     "StoredCriticReport",
     "StoredReview",
     "StoredScanRun",
+    "StoredSetupEvaluation",
     "StoredSignal",
     "apply_schema_via_data_api",
     "create_store",

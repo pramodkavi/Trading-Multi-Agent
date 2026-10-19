@@ -22,7 +22,9 @@ from src.persistence import dataapi_migrate as migrate
 # Step 2.8 added active_setups (1 table + 2 indexes): 18 -> 21.
 # Step 2.14 (Critic v0) added decision_resolutions / decision_reviews /
 # critic_reports (3 tables + 2 indexes): 21 -> 26.
-EXPECTED_STATEMENT_COUNT = 26
+# Step 4.0 added setup_evaluations (1 table + 2 indexes) plus the two dashboard
+# read indexes on agent_runs / active_setups (design §5.2): 26 -> 31.
+EXPECTED_STATEMENT_COUNT = 31
 
 CLUSTER_ARN = "arn:aws:rds:us-east-1:123456789012:cluster:crypto"
 SECRET_ARN = "arn:aws:secretsmanager:us-east-1:123456789012:secret:crypto-signals/db"

@@ -26,7 +26,9 @@ from src.common.models import (
     ActiveSetupStatus,
     AgentRole,
     ScanStatus,
+    SetupEvaluationStatus,
     SignalDirection,
+    SignalOutcome,
     SignalProposal,
     SignalStatus,
     SkipDecision,
@@ -35,11 +37,13 @@ from src.common.models import (
 from src.persistence import (
     AgentRunRepository,
     ScanRunRepository,
+    SetupEvaluationRepository,
     SignalRepository,
     StoredActiveSetup,
     StoredAgentRun,
     StoredCriticReport,
     StoredScanRun,
+    StoredSetupEvaluation,
     StoredSignal,
 )
 from src.persistence.repositories import (
@@ -529,6 +533,112 @@ class TestAgentRunRepository:
         repo = AgentRunRepository(conn)
         conn.fetchrow.return_value = None
         assert await repo.get_by_id(uuid4()) is None
+
+
+# ---------------------------------------------------------------------------
+# SetupEvaluationRepository (Slice 4 Step 4.0, design §5.2)
+# ---------------------------------------------------------------------------
+
+
+class TestSetupEvaluationRepository:
+    async def test_setup_evaluation_record_executes_insert(self) -> None:
+        conn = _make_conn_mock()
+        repo = SetupEvaluationRepository(conn)
+        setup_id, signal_id = uuid4(), uuid4()
+        eval_id = await repo.record(
+            setup_id=setup_id,
+            signal_id=signal_id,
+            status=SetupEvaluationStatus.AT_RISK,
+            reasoning="drifting",
+            latency_ms=800,
+            token_usage={"tokens_in": 10},
+            cost_usd=0.001,
+        )
+        assert isinstance(eval_id, UUID)
+        sql, *args = conn.execute.await_args.args
+        assert "INSERT INTO setup_evaluations" in sql
+        assert "COALESCE($4, NOW())" in sql
+        assert args[0] == eval_id
+        assert args[1] == setup_id
+        assert args[2] == signal_id
+        assert args[3] is None  # evaluated_at -> NOW() DB-side
+        assert args[4] == "AT_RISK"
+        assert args[5] is None  # outcome
+        assert args[6] == "drifting"
+        assert args[7] is None  # error
+        assert args[8] == 800
+        assert json.loads(args[9]) == {"tokens_in": 10}
+        assert args[10] == 0.001
+
+    async def test_setup_evaluation_record_error_row_defaults(self) -> None:
+        conn = _make_conn_mock()
+        ts = datetime(2026, 10, 19, 8, 5, tzinfo=UTC)
+        await SetupEvaluationRepository(conn).record(
+            setup_id=uuid4(),
+            signal_id=uuid4(),
+            status=SetupEvaluationStatus.ERROR,
+            error="RuntimeError: boom",
+            evaluated_at=ts,
+        )
+        _, *args = conn.execute.await_args.args
+        assert args[3] == ts
+        assert args[4] == "ERROR"
+        assert args[6] is None  # reasoning
+        assert args[7] == "RuntimeError: boom"
+        assert args[8] == 0
+        assert json.loads(args[9]) == {}
+        assert args[10] is None  # cost_usd
+
+    async def test_setup_evaluation_record_binds_outcome_value(self) -> None:
+        conn = _make_conn_mock()
+        await SetupEvaluationRepository(conn).record(
+            setup_id=uuid4(),
+            signal_id=uuid4(),
+            status=SetupEvaluationStatus.INVALIDATED,
+            outcome=SignalOutcome.WIN,
+        )
+        _, *args = conn.execute.await_args.args
+        assert args[5] == "WIN"
+
+    async def test_setup_evaluation_list_for_setup_maps_rows(self) -> None:
+        conn = _make_conn_mock()
+        eval_id, setup_id, sid = uuid4(), uuid4(), uuid4()
+        ts = datetime(2026, 10, 19, 8, 5, tzinfo=UTC)
+        conn.fetch.return_value = [
+            {
+                "id": eval_id,
+                "setup_id": setup_id,
+                "signal_id": sid,
+                "evaluated_at": ts,
+                "status": "INVALIDATED",
+                "outcome": "WIN",
+                "reasoning": "target hit",
+                "error": None,
+                "latency_ms": 900,
+                "token_usage": json.dumps({"tokens_in": 5}),
+                "cost_usd": 0.002,  # asyncpg hands NUMERIC back as Decimal in prod
+            }
+        ]
+        rows = await SetupEvaluationRepository(conn).list_for_setup(setup_id, limit=999)
+        assert len(rows) == 1
+        assert isinstance(rows[0], StoredSetupEvaluation)
+        assert rows[0].id == eval_id
+        assert rows[0].status is SetupEvaluationStatus.INVALIDATED
+        assert rows[0].outcome is SignalOutcome.WIN
+        assert rows[0].token_usage == {"tokens_in": 5}
+        assert rows[0].cost_usd == 0.002
+        sql, *args = conn.fetch.await_args.args
+        assert "FROM setup_evaluations" in sql
+        assert "WHERE setup_id = $1" in sql
+        assert "ORDER BY evaluated_at DESC" in sql
+        assert args == [setup_id, 200]  # limit clamped to 200
+
+    async def test_setup_evaluation_list_for_setup_floors_limit_at_one(self) -> None:
+        conn = _make_conn_mock()
+        conn.fetch.return_value = []
+        assert await SetupEvaluationRepository(conn).list_for_setup(uuid4(), limit=0) == []
+        _, *args = conn.fetch.await_args.args
+        assert args[1] == 1
 
 
 # ---------------------------------------------------------------------------
