@@ -65,6 +65,7 @@ from src.agents.historian import HistorianRepository
 from src.agents.judge import Judge
 from src.agents.orchestration import ScanReservationLedger, build_pipeline_graph
 from src.agents.skeptic import Skeptic, SkepticObjection, build_macro_providers
+from src.common import session_for
 from src.common.models import (
     AgentRole,
     JudgeRuling,
@@ -84,7 +85,7 @@ from src.persistence import create_store, run_data_api_migration
 from src.providers import BinanceProvider, NoMacroData, ProviderError, Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from pydantic import BaseModel
 
@@ -326,6 +327,9 @@ async def run_one_symbol(
     graph: Any,
     notifier: Notifier | None,
     reservations: ScanReservationLedger | None = None,
+    session: ScanSession | None = None,
+    triggered_by: str = "scheduler",
+    clock: Callable[[], datetime] | None = None,
 ) -> ScanContext:
     """Run one full scan for one symbol through the pipeline; returns its ScanContext.
 
@@ -335,17 +339,27 @@ async def run_one_symbol(
     the caller) holds the Historian / Skeptic / Judge; persistence reaches the
     backend-neutral ``SignalStore`` (Step 1.17) the graph's Historian also uses.
 
+    ``session`` / ``clock`` (Step 4.0, design §14 D1): the ScanContext session
+    is derived from the UTC clock at scan start via ``session_for`` so the risk
+    gate's rule 7 (no new signals in ASIAN / COOLDOWN) sees the real window and
+    ``scan_runs.session`` records it. ``session`` is an explicit override (the
+    Lambda event's ``"session"`` key, e.g. ``AD_HOC`` for a console smoke test);
+    ``clock`` defaults to the real UTC clock and exists so tests can pin the
+    instant. ``started_at`` is taken from the same instant so the two agree.
+
     ``reservations`` (Step 2.13): when the watchlist is scanned in parallel the
     risk gate reserves a §1.6 slot for a proposal that clears the stateful caps.
     If this symbol does not end up publishing (a Judge veto) or the scan fails,
     we release that reservation so it does not wrongly block a sibling symbol. A
     publish keeps the reservation — its active_setups row now reflects it.
     """
+    now = (clock or _utcnow)()
     ctx = ScanContext(
-        session=ScanSession.AD_HOC,
+        session=session if session is not None else session_for(now),
         symbols=[symbol],
         strategy="smc",
-        triggered_by="manual",
+        triggered_by=triggered_by,
+        started_at=now,
     )
     await store.start_scan(
         scan_id=ctx.scan_id,
@@ -426,6 +440,8 @@ async def _scan_symbol_isolated(
     graph: Any,
     notifier: Notifier | None,
     reservations: ScanReservationLedger,
+    session: ScanSession | None,
+    triggered_by: str,
 ) -> dict[str, Any]:
     """Run one symbol and convert its outcome into a result entry, never raising.
 
@@ -433,7 +449,8 @@ async def _scan_symbol_isolated(
     in this symbol's result dict and returned, so ``asyncio.gather`` over the
     watchlist never sees an exception and one symbol failing cannot abort the
     others (``run_one_symbol`` has already flipped that scan's row to FAILED and
-    released its reservation before re-raising).
+    released its reservation before re-raising). ``session`` / ``triggered_by``
+    are passed straight through to ``run_one_symbol`` (Step 4.0 D1).
     """
     try:
         ctx = await run_one_symbol(
@@ -443,6 +460,8 @@ async def _scan_symbol_isolated(
             graph=graph,
             notifier=notifier,
             reservations=reservations,
+            session=session,
+            triggered_by=triggered_by,
         )
         return {"symbol": symbol, "scan_id": str(ctx.scan_id), "status": "ok"}
     except Exception as exc:
@@ -455,6 +474,7 @@ async def _run_symbols(
     settings: Settings,
     symbols: list[str],
     notify: bool,
+    session: ScanSession | None,
 ) -> list[dict[str, Any]]:
     """Scan the watchlist **in parallel**, sharing one store / provider / pipeline.
 
@@ -463,6 +483,10 @@ async def _run_symbols(
     the ``_scan_symbol_isolated`` error boundary so one symbol's failure cannot
     abort the others. ``gather`` preserves input order, so the returned results
     line up with ``symbols``.
+
+    ``session`` (Step 4.0 D1) is the event override; ``None`` (every scheduled
+    invocation) lets each symbol derive its session from the UTC clock. The
+    Lambda path is the scheduler's, so every scan is ``triggered_by="scheduler"``.
 
     A single :class:`ScanReservationLedger` is shared across the batch so the
     §1.6 stateful caps (max concurrent, daily cap, correlated exposure) stay
@@ -503,6 +527,8 @@ async def _run_symbols(
                             graph=graph,
                             notifier=notifier,
                             reservations=reservations,
+                            session=session,
+                            triggered_by="scheduler",
                         )
                         for symbol in symbols
                     )
@@ -650,6 +676,21 @@ def _symbols_from_event(event: dict[str, Any], settings: Settings) -> list[str]:
     return list(settings.scan_symbols)
 
 
+def _session_from_event(event: dict[str, Any]) -> ScanSession | None:
+    """Resolve the optional ``{"session": "..."}`` override (Step 4.0 D1).
+
+    Returns ``None`` when absent (the scheduled EventBridge payload never sets
+    it) so ``run_one_symbol`` derives the session from the UTC clock. The value
+    is case-insensitive. An unknown value raises ``ValueError`` on purpose: an
+    operator typo must fail the invocation loudly rather than silently bypass
+    SPEC §1.6 rule 7.
+    """
+    raw = event.get("session")
+    if raw is None:
+        return None
+    return ScanSession(str(raw).upper())
+
+
 async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str, Any]:
     """Async core of the Lambda handler (the awaitable part, sans event loop).
 
@@ -680,9 +721,15 @@ async def _alambda(event: dict[str, Any] | None, settings: Settings) -> dict[str
         return await _run_migration(settings)
 
     symbols = _symbols_from_event(payload, settings)
-    logger.info("lambda scan starting for %s (notify=%s)", symbols, notify)
+    session = _session_from_event(payload)
+    logger.info(
+        "lambda scan starting for %s (notify=%s, session=%s)",
+        symbols,
+        notify,
+        session.value if session is not None else "from-clock",
+    )
 
-    results = await _run_symbols(settings=settings, symbols=symbols, notify=notify)
+    results = await _run_symbols(settings=settings, symbols=symbols, notify=notify, session=session)
     ok = all(r["status"] == "ok" for r in results)
     return {"ok": ok, "scans": results}
 
@@ -715,6 +762,13 @@ def lambda_handler(event: dict[str, Any] | None, context: object) -> dict[str, A
     ``"migrate"`` applies the DB schema via the Data API (manual escape hatch,
     see ``_run_migration``); absent/any other value runs the per-signal scan
     over the event's symbols (or the watchlist).
+
+    Scan event keys: ``symbols`` | ``symbol`` (default: the watchlist),
+    ``notify`` (default true), ``mode`` (above), and ``session`` (Step 4.0 D1:
+    an explicit ScanSession such as ``"AD_HOC"`` to bypass the rule-7 window
+    for a manual smoke test; absent on every scheduled invocation, in which
+    case the session is derived from the UTC clock; an unknown value fails the
+    invocation).
     """
     return asyncio.run(_alambda(event, _load_settings()))
 
@@ -743,12 +797,16 @@ async def _amain(*, symbol: str | None, notify: bool) -> int:
             else None
         )
         try:
+            # The CLI is a dev tool: it derives the session from the real clock
+            # (no override) so an operator sees the rule-7 window as the Lambda
+            # would, and is labelled as a manual trigger (Step 4.0 D1).
             await run_one_symbol(
                 symbol=target_symbol,
                 provider=provider,
                 store=store,
                 graph=graph,
                 notifier=notifier,
+                triggered_by="manual",
             )
         finally:
             await provider.aclose()

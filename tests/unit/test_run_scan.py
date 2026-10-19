@@ -22,6 +22,7 @@ import scripts.run_scan as run_scan_module
 from scripts.run_scan import (
     _alambda,
     _load_settings,
+    _session_from_event,
     compose_message,
     run_one_symbol,
 )
@@ -36,6 +37,7 @@ from src.common.models import (
     JudgeConfidence,
     JudgeRuling,
     ObjectionSeverity,
+    ScanSession,
     SignalDirection,
     SignalProposal,
     SkipDecision,
@@ -57,6 +59,16 @@ from src.providers import (
 # ---------------------------------------------------------------------------
 
 _ANCHOR = datetime(2026, 5, 1, 0, 0, 0, tzinfo=UTC)
+
+
+def _london_clock() -> datetime:
+    """A fixed 08:03 UTC instant (LONDON) so rule 7 cannot force-skip a test setup.
+
+    Step 4.0 D1: ``run_one_symbol`` now derives the session from its clock, so
+    the publish-path tests pin the clock inside a permitted window instead of
+    depending on the wall-clock hour the suite happens to run at.
+    """
+    return datetime(2026, 10, 19, 8, 3, tzinfo=UTC)
 
 
 def _c(idx: int, *, open_: float, high: float, low: float, close: float) -> Kline:
@@ -439,6 +451,7 @@ class TestRunOneSymbol:
             store=store,
             graph=_publishing_graph(),
             notifier=notifier,
+            clock=_london_clock,
         )
 
         provider.fetch_market_snapshot.assert_awaited_once()
@@ -491,6 +504,7 @@ class TestRunOneSymbol:
             store=store,
             graph=graph,
             notifier=notifier,
+            clock=_london_clock,
         )
 
         # A SKIPPED row is written (FR-1.3) and only the analyzer was journaled.
@@ -516,6 +530,7 @@ class TestRunOneSymbol:
             store=store,
             graph=_vetoing_graph(),
             notifier=_notifier(),
+            clock=_london_clock,
         )
 
         # A real proposal the Judge SKIPs is journaled (4 agents) but NOT tracked.
@@ -533,6 +548,7 @@ class TestRunOneSymbol:
             store=store,
             graph=_publishing_graph(),
             notifier=None,
+            clock=_london_clock,
         )
 
         store.create_signal.assert_awaited_once()
@@ -574,6 +590,48 @@ class TestRunOneSymbol:
 
         store.fail_scan.assert_awaited_once()
         assert "boom" in store.fail_scan.await_args.kwargs["error_message"]
+
+    async def test_session_is_derived_from_clock(self) -> None:
+        # Step 4.0 D1: 22:03 UTC is COOLDOWN -> recorded on scan_runs, and rule 7
+        # force-skips the otherwise-publishing setup (the design §10 checkpoint).
+        store = _store()
+        ctx = await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_bullish_series())),
+            store=store,
+            graph=_publishing_graph(),
+            notifier=None,
+            clock=lambda: datetime(2026, 10, 19, 22, 3, tzinfo=UTC),
+        )
+        assert ctx.session is ScanSession.COOLDOWN
+        assert ctx.started_at == datetime(2026, 10, 19, 22, 3, tzinfo=UTC)
+        assert store.start_scan.await_args.kwargs["session"] == "COOLDOWN"
+        persisted = store.create_signal.call_args.args[0]
+        assert isinstance(persisted, SkipDecision)
+        assert persisted.violated_rule == "RULE_7_SESSION_BLOCK"
+        store.open_active_setup.assert_not_awaited()
+
+    async def test_explicit_session_overrides_clock(self) -> None:
+        store = _store()
+        ctx = await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_bullish_series())),
+            store=store,
+            graph=_publishing_graph(),
+            notifier=None,
+            session=ScanSession.AD_HOC,
+            triggered_by="manual",
+            clock=lambda: datetime(2026, 10, 19, 22, 3, tzinfo=UTC),
+        )
+        assert ctx.session is ScanSession.AD_HOC and ctx.triggered_by == "manual"
+        assert store.start_scan.await_args.kwargs["session"] == "AD_HOC"
+
+
+def test_session_from_event() -> None:
+    assert _session_from_event({}) is None
+    assert _session_from_event({"session": "ad_hoc"}) is ScanSession.AD_HOC
+    with pytest.raises(ValueError):
+        _session_from_event({"session": "LUNCH"})
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +767,21 @@ class TestLambdaHandler:
         await _alambda({"symbol": "BTCUSDT", "notify": False}, _settings())
 
         deps["notifier_factory"].assert_not_called()
+
+    async def test_event_session_override_reaches_run_one_symbol(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Step 4.0 D1: a console Test event may pin the session (bypassing rule 7
+        # for a manual smoke test); the scheduled empty payload passes None so
+        # run_one_symbol derives it from the clock.
+        run = self._ok_run()
+        self._patch(monkeypatch, run=run)
+
+        await _alambda({"symbol": "BTCUSDT", "session": "AD_HOC"}, _settings())
+        assert run.await_args.kwargs["session"] is ScanSession.AD_HOC
+
+        await _alambda({"symbol": "BTCUSDT"}, _settings())
+        assert run.await_args.kwargs["session"] is None
 
     async def test_forecaster_mode_runs_forecaster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         store = MagicMock()
@@ -928,6 +1001,7 @@ class TestParallelScanReservations:
                     graph=graph,
                     notifier=notifier,
                     reservations=ledger,
+                    clock=_london_clock,
                 )
                 for s in symbols
             )
@@ -966,6 +1040,7 @@ class TestParallelScanReservations:
             graph=graph,
             notifier=None,
             reservations=ledger,
+            clock=_london_clock,
         )
 
         # The Judge vetoed -> no setup opened and the reservation was released.

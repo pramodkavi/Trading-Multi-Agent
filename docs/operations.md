@@ -215,9 +215,21 @@ Both Lambdas are zip-packaged, so the console shows the full `src/` and
    | `{"mode": "forecaster"}` | Forecaster sweep over open setups |
    | `{"mode": "resolve", "chunk_size": 25}` | Critic v0 outcome resolver — **only after the Critic v0 branch (Step 2.14) is merged**; on earlier code an unknown `mode` falls through to a full scan |
    | `{"mode": "migrate"}` | apply the DB schema over the Data API |
+   | `{"symbols": ["BTCUSDT"], "session": "AD_HOC"}` | one symbol with the rule-7 session window bypassed (manual smoke test only) |
 
    The JSON summary appears inline; logs under **Monitor → View CloudWatch logs**.
    First call after idle may hit Aurora resuming — retry after ~8 s.
+
+   **Scan session (Step 4.0, design §14 D1).** Since Step 4.0 the scan derives
+   its `ScanSession` from the UTC clock at scan start (Asian 00:00–08:00, London
+   08:00–13:00, NY 13:00–15:00, Overlap 15:00–21:00, Cooldown 21:00–00:00) and
+   records it on `scan_runs.session`, so SPEC §1.6 rule 7 now actually fires:
+   **the 22:03 daily-wrap scan runs inside Cooldown and is review-only** — it
+   still journals and the Forecaster still reviews open setups, but any new
+   proposal is force-skipped with `RULE_7_SESSION_BLOCK`. Scheduled invocations
+   never set `session`. A console Test event may add `"session": "AD_HOC"`
+   (case-insensitive) to bypass the window for a manual smoke test; an unknown
+   value fails the invocation on purpose rather than silently bypassing the rule.
 
 **Caveats**
 - **Every `cdk deploy` (manual, or the push-to-main auto-deploy) replaces the
