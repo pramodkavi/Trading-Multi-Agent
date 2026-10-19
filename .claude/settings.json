@@ -2,8 +2,5 @@
   "enabledPlugins": {
     "aws-common@aws-skills": true,
     "aws-cdk@aws-skills": true
-  },
-  "permissions": {
-    "defaultMode": "bypassPermissions"
   }
 }

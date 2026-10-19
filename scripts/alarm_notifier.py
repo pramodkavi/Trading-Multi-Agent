@@ -5,9 +5,10 @@ state changes to SNS as a JSON string in each record's ``Sns.Message``; this
 handler parses them, formats a short plain-text message, and sends it to the
 operator's existing Telegram bot.
 
-Reuses the scan container image (CMD overridden to this handler) so there is one
-image to build/patch. It reads the Telegram token + chat id from the same SSM
-SecureString parameter the scan Lambda uses (``TELEGRAM_PARAM_NAME``), via the
+Ships in the same zip code asset + dependency layer as the scan Lambda (handler
+overridden to this module) so there is one artifact set to build/patch. It reads
+the Telegram token + chat id from the same SSM SecureString parameter the scan
+Lambda uses (``TELEGRAM_PARAM_NAME``), via the
 shared ``src.config.secrets`` hydration -- it does NOT load full ``Settings``
 (which would require the Anthropic key / DB config the notifier has no business
 holding).

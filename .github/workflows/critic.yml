@@ -71,7 +71,7 @@ env:
   # Physical name of the scan Lambda (docs/PROJECT_STATE.md §3). The cfg step
   # prefers the CryptoSignals-Compute `ScanFunctionName` stack output and only
   # falls back to this when that lookup is denied or empty.
-  SCAN_FUNCTION_FALLBACK: CryptoSignals-Compute-ScanLambdaDD7505A5-rfFwKEhPAnlo
+  SCAN_FUNCTION_FALLBACK: CryptoSignals-Compute-ScanLambdaDD7505A5-4lsj9dosUzzT
   # Settings (src/config/settings.py) for scripts.run_critic: Data API backend;
   # DB_CLUSTER_ARN / DB_SECRET_ARN and the secret values are exported by `cfg`.
   PERSISTENCE_BACKEND: dataapi

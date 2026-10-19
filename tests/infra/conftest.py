@@ -37,7 +37,12 @@ def templates() -> dict[str, Any]:
     from stacks.network_stack import NetworkStack
     from stacks.scheduling_stack import SchedulingStack
 
-    app = core.App()
+    # Skip asset bundling in unit tests: the code/layer bundlers would otherwise
+    # copy src/ and pip-install ~130 MB of wheels on every test run. With an
+    # empty bundling-stacks list CDK stages a placeholder and still renders the
+    # Function/LayerVersion resources we assert on. The real bundling path is
+    # exercised by `python app.py` (cdk synth) in CI's quality job.
+    app = core.App(context={"aws:cdk:bundling-stacks": []})
     network = NetworkStack(app, "Network")
     data = DataStack(
         app,

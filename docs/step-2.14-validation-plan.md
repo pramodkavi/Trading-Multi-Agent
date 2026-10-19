@@ -50,8 +50,8 @@ From `docs/PROJECT_STATE.md §3` (account `097853039368`, region `ap-south-1`):
 
 | Handle | Value |
 |---|---|
-| Scan Lambda | `CryptoSignals-Compute-ScanLambdaDD7505A5-rfFwKEhPAnlo` |
-| Scan log group | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-YGmufZcOKKgE` |
+| Scan Lambda | `CryptoSignals-Compute-ScanLambdaDD7505A5-4lsj9dosUzzT` |
+| Scan log group | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-H5rf5DCKJt4n` |
 | Aurora cluster ARN | `arn:aws:rds:ap-south-1:097853039368:cluster:cryptosignals-data-aurora2cbab212-s1pyvq9ztgdm` |
 | DB secret ARN | `arn:aws:secretsmanager:ap-south-1:097853039368:secret:crypto-signals/db-a3zZGW` |
 | DB name | `signals` |
@@ -175,6 +175,6 @@ published signals from §4.2 each have a corresponding delivery — and if any p
 silent, fire a manual scan and watch it land:
 
 ```bash
-aws lambda invoke --function-name CryptoSignals-Compute-ScanLambdaDD7505A5-rfFwKEhPAnlo \
+aws lambda invoke --function-name CryptoSignals-Compute-ScanLambdaDD7505A5-4lsj9dosUzzT \
   --region ap-south-1 out.json && cat out.json
 ```

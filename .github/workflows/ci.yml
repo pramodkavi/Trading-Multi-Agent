@@ -1,9 +1,12 @@
-# Continuous integration (Slice 1 Step 1.20).
+# Continuous integration (Slice 1 Step 1.20; repackaged 2026-10-03).
 #
 # Two jobs:
-#   quality - lint, format, type-check, and test. Runs on every push and PR.
-#   image   - build the Lambda container image and scan it with Trivy. Runs only
-#             on a push to main (after quality passes), per SPEC §1.20 / §2.6.
+#   quality   - lint, format, type-check, test, and a full `cdk synth` (which runs
+#               the zip/layer bundlers + cdk-nag + the asset size guards). Runs on
+#               every push and PR.
+#   deps-scan - build the Lambda dependency layer, pin it with `pip freeze`, and
+#               scan the pinned set with Trivy. Runs only on a push to main (after
+#               quality passes), replacing the former container-image scan.
 #
 # Lint/format run through pre-commit so CI uses the EXACT pinned tool versions
 # from .pre-commit-config.yaml -- no drift between "passes locally" and "passes
@@ -61,6 +64,14 @@ jobs:
       - name: Tests + coverage
         run: pytest --cov=src --cov-report=term-missing --cov-report=xml
 
+      - name: CDK synth (bundlers + cdk-nag + size guards)
+        # Builds the real code asset and dependency layer with pip (no Docker)
+        # and fails on any cdk-nag finding or asset-size-guard breach.
+        working-directory: infrastructure
+        env:
+          JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION: "1"
+        run: python app.py
+
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,25 +80,36 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
 
-  image:
-    name: Build Lambda image + Trivy scan
+  deps-scan:
+    name: Build dependency layer + Trivy scan
     needs: quality
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Lambda container image
-        run: docker build -f Dockerfile.lambda -t crypto-signals-lambda:${{ github.sha }} .
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
-      - name: Scan image with Trivy
+      - name: Install CDK app deps (lambda_assets imports aws_cdk)
+        run: pip install -r infrastructure/requirements.txt
+
+      - name: Build the layer and pin it
+        # Installs the exact manylinux wheel set the Lambda layer ships, then
+        # `pip freeze`s it so Trivy sees pinned versions (it skips `>=` floors).
+        run: python infrastructure/lambda_assets.py freeze --out layer-scan/requirements.txt
+
+      - name: Scan pinned dependencies with Trivy
         # Pin to a current release: older trivy-action tags (e.g. v0.28.0)
         # internally reference aquasecurity/setup-trivy@v0.2.1, whose tag Aqua
         # has since DELETED, so they fail to resolve. v0.36.0 SHA-pins
         # setup-trivy@v0.2.6, making it immune to that retagging.
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          image-ref: crypto-signals-lambda:${{ github.sha }}
+          scan-type: fs
+          scan-ref: layer-scan
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true

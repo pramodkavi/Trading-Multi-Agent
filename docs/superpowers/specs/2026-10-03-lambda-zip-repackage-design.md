@@ -234,3 +234,33 @@ on the recreated stacks.
 - Fixing the top-level `asyncpg` import in `store.py` to shrink the layer further.
 - Multi-environment / sandbox functions; syncing console edits back to git.
 - Dashboard (Slice 4) packaging.
+
+## 11. Post-review amendments (2026-10-05)
+
+Findings from the whole-branch review, applied before the cutover:
+
+1. **§3.3 — the notifier does NOT import Compute's layer.** A LayerVersion ARN
+   imported across stacks is a CloudFormation export; every dependency bump
+   replaces the (immutable) layer and `cdk deploy --all` fails with "Cannot update
+   export ... in use by CryptoSignals-Monitoring". MonitoringStack now calls
+   `deps_layer(self, "DepsLayer")` itself; identical content stages once.
+2. **§3.2 — the layer asset hash is OUTPUT, as originally written here,** not
+   CUSTOM as the plan had it. A CUSTOM hash keyed on the requirement list would
+   freeze the deployed layer at first publish while CI's Trivy scan passed on a
+   fresh resolve. Cost: pip runs on every synth (~1-2 min). Console scripts
+   (`python/bin`) are stripped so the hash does not vary by deploy machine.
+3. **§4 — pip failures surface pip's stderr** (the "No matching distribution for X"
+   line), not just the command line.
+4. **§3.4 — the `{"mode":"resolve"}` test event is valid only after Critic v0
+   (Step 2.14) merges;** on earlier code an unknown mode falls through to a full scan.
+5. The module is `infrastructure/lambda_assets.py` (the plan's name), not
+   `build_layer.py` as §3.2/§3.5 say; the CLI is `print-requirements | copy-code |
+   build-layer | freeze`.
+6. **§6 — the cutover runs in GitHub Actions, never on the operator's machine.**
+   Operator hard rule (2026-10-05): no AWS CLI / CDK / credentials locally; deploys
+   happen on PR merge. `deploy-dev.yml` gained a `workflow_dispatch` input
+   `recreate_stateless_stacks` that runs `cdk destroy` of Monitoring, Scheduling
+   and Compute before `cdk deploy --all`. Sequence: merge the PR (the automatic
+   deploy goes red on the export-in-use error, accepted) → operator runs Deploy
+   (dev) manually with the box ticked → verify in the console → operator pastes
+   the new function / log-group names for PROJECT_STATE.
