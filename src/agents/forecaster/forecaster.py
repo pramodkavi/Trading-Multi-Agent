@@ -7,16 +7,19 @@ of the per-signal pipeline). Each run it:
     2. For each: re-parses the original proposal, refetches current market data,
        and asks Claude whether the setup is STILL_VALID / AT_RISK / INVALIDATED
        (``ForecasterUpdate``).
-    3. Acts on the verdict:
-         STILL_VALID  -> record the evaluation; the setup stays OPEN.
-         AT_RISK      -> record + send a Telegram warning (FR-5.3).
+    3. Persists the verdict:
+         STILL_VALID  -> the setup stays OPEN; the evaluation is stored on it.
+         AT_RISK      -> same, then a Telegram warning is sent (FR-5.3).
          INVALIDATED  -> close the setup with its terminal outcome, stamp the
-                         same outcome on the signal journal, and notify.
+                         same outcome on the signal journal, then notify.
     4. Records the evaluation -- or the failure -- in ``setup_evaluations``
        (Slice 4 Step 4.0, dashboard design §5.2 "Forecaster writes one row per
-       setup incl. ERROR"). Every setup the sweep looked at leaves exactly one
-       row: the verdict with its LLM latency / tokens / cost, an ERROR row for
-       an orphaned setup, or an ERROR row carrying the exception text.
+       setup incl. ERROR"), BEFORE the Telegram send. Every evaluated setup gets
+       exactly one verdict row (with its LLM latency / tokens / cost); an
+       orphaned setup gets an ERROR row instead; a failure after the verdict
+       was journaled (e.g. Telegram down) ADDS an ERROR row naming the cause,
+       so the verdict can never be masked by a notification failure. Only when
+       the store itself is down may a look leave no row at all.
 
 Per-setup work is isolated in try/except so one bad setup (e.g. an old payload
 that no longer validates) never aborts the rest of the run -- the same
@@ -179,8 +182,11 @@ class Forecaster:
         (a) logged with its traceback, (b) logged again as the
         ``PROVIDER_ERROR provider=forecaster`` marker the CloudWatch metric
         filter counts, and (c) journaled as an ERROR ``setup_evaluations`` row.
-        The journal write is guarded separately: if the store itself is down the
-        failure is logged and the sweep still moves on to the next setup.
+        Because the verdict row is written before the notifier runs, a Telegram
+        failure yields two rows for that look -- the true verdict and the ERROR
+        naming the notifier -- never an ERROR row alone. The ERROR write is
+        guarded separately: if the store itself is down the failure is logged
+        and the sweep still moves on to the next setup.
         """
         setups = await self._store.list_open_active_setups()
         logger.info("forecaster evaluating %d open setup(s)", len(setups))
@@ -233,10 +239,10 @@ class Forecaster:
             proposal.symbol, [Timeframe.H4], limit=CANDLE_LIMIT
         )
         update, usage = await self.evaluate_traced(setup, proposal, snapshot)
-        await self._apply(setup, proposal, update)
-        # Journal after _apply so the row is only written once the verdict has
-        # actually taken effect (design §5.2); if _apply raises, run() journals
-        # the ERROR row instead.
+        await self._persist_verdict(setup, update)
+        # Journal once the verdict has taken effect (design §5.2) but BEFORE the
+        # Telegram send: a notifier failure then propagates to run(), which adds
+        # an ERROR row alongside this one instead of replacing it.
         await self._store.record_setup_evaluation(
             setup_id=setup.id,
             signal_id=setup.signal_id,
@@ -247,6 +253,7 @@ class Forecaster:
             token_usage=usage.token_usage(),
             cost_usd=usage.cost_usd,
         )
+        await self._notify_verdict(proposal, update)
         return update
 
     async def evaluate(
@@ -293,12 +300,8 @@ class Forecaster:
         )
         return result.output, LlmUsage.from_result(result)
 
-    async def _apply(
-        self,
-        setup: StoredActiveSetup,
-        proposal: SignalProposal,
-        update: ForecasterUpdate,
-    ) -> None:
+    async def _persist_verdict(self, setup: StoredActiveSetup, update: ForecasterUpdate) -> None:
+        """Apply the verdict to ``active_setups`` (and the signal journal if terminal)."""
         evaluation = update.model_dump(mode="json")
         if update.status is ForecastStatus.INVALIDATED:
             # Validated on the model: outcome is present for INVALIDATED.
@@ -315,7 +318,6 @@ class Forecaster:
                 outcome=outcome,
                 outcome_metadata=evaluation,
             )
-            await self._notify(proposal, update)
         else:
             # STILL_VALID or AT_RISK: the setup stays OPEN; record the evaluation.
             await self._store.update_active_setup(
@@ -323,9 +325,14 @@ class Forecaster:
                 status=ActiveSetupStatus.OPEN,
                 evaluation=evaluation,
             )
-            if update.status is ForecastStatus.AT_RISK:
-                await self._notify(proposal, update)
 
-    async def _notify(self, proposal: SignalProposal, update: ForecasterUpdate) -> None:
-        if self._notifier is not None:
-            await self._notifier.send(format_forecaster_update(proposal, update))
+    async def _notify_verdict(self, proposal: SignalProposal, update: ForecasterUpdate) -> None:
+        """Send the Telegram message for AT_RISK / INVALIDATED; STILL_VALID is silent.
+
+        Runs last in :meth:`_evaluate_one`, after the verdict row is journaled,
+        and deliberately does not swallow notifier errors -- they propagate to
+        ``run()`` so the outage is alarmed and journaled as an ERROR row.
+        """
+        if self._notifier is None or update.status is ForecastStatus.STILL_VALID:
+            return
+        await self._notifier.send(format_forecaster_update(proposal, update))

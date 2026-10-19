@@ -11,7 +11,9 @@ Covers:
 - a per-setup failure is isolated (the rest of the run continues)
 - Step 4.0 (design §5.2): every evaluation -- verdict, orphan, or exception --
   leaves one `setup_evaluations` row; exceptions also log the `PROVIDER_ERROR`
-  marker; a failure to write the ERROR row itself never aborts the run
+  marker; a failure to write the ERROR row itself never aborts the run; the
+  verdict row is journaled before the Telegram send so a notifier outage adds
+  an ERROR row rather than masking the verdict
 - format_forecaster_update rendering
 """
 
@@ -37,7 +39,7 @@ from src.common.models import (
     SignalProposal,
     SignalStatus,
 )
-from src.notifications import format_forecaster_update
+from src.notifications import NotifierUnavailableError, format_forecaster_update
 from src.persistence.models import StoredActiveSetup, StoredSignal
 from src.providers import Kline, MarketSnapshot, Timeframe
 
@@ -455,6 +457,48 @@ async def test_error_row_write_failure_does_not_abort_run() -> None:
     # Only setup 2's verdict row landed; setup 1's ERROR row failed to write.
     assert [e["status"] for e in store.evaluations] == [SetupEvaluationStatus.STILL_VALID]
     assert store.evaluations[0]["setup_id"] == setup2.id
+
+
+async def test_notifier_failure_cannot_mask_the_journaled_verdict(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Review fix: the verdict row is journaled BEFORE the Telegram send.
+
+    A notifier outage after an INVALIDATED verdict must leave the honest record:
+    the setup closed + outcome stamped + the INVALIDATED row, PLUS an ERROR row
+    naming the notifier (and the alarm marker) -- never an ERROR row alone.
+    """
+    proposal = _proposal()
+    signal = _stored_signal(proposal)
+    setup = _setup(signal.id)
+    store = FakeStore([setup], {signal.id: signal})
+    notifier = _notifier()
+    notifier.send = AsyncMock(
+        side_effect=NotifierUnavailableError("telegram down", notifier="telegram")
+    )
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=notifier,
+        client=_client([_response(_INVALIDATED_LOSS)]),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.agents.forecaster.forecaster"):
+        updates = await forecaster.run()  # must not raise
+
+    # The verdict took effect and was journaled...
+    assert store.updated[0][1] is ActiveSetupStatus.LOSS
+    assert store.outcomes == [(signal.id, SignalOutcome.LOSS)]
+    assert len(store.evaluations) == 2
+    assert store.evaluations[0]["status"] is SetupEvaluationStatus.INVALIDATED
+    assert store.evaluations[0]["outcome"] is SignalOutcome.LOSS
+    # ...and the notifier failure is recorded on its own, alarmed, row.
+    assert store.evaluations[1]["status"] is SetupEvaluationStatus.ERROR
+    assert "NotifierUnavailableError" in store.evaluations[1]["error"]
+    assert "telegram down" in store.evaluations[1]["error"]
+    assert any("PROVIDER_ERROR provider=forecaster" in r.getMessage() for r in caplog.records)
+    # The failed look is not reported as a produced verdict (run() contract unchanged).
+    assert updates == []
 
 
 # ---------------------------------------------------------------------------
