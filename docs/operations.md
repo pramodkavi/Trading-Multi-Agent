@@ -171,6 +171,13 @@ No manual SNS subscription is needed — CDK wires it.
 effectively "any failure/several provider errors today" — intended sensitivity for
 a system the operator trades from. Richer provider-error tracking lands in Step 2.13.
 
+`ProviderErrorAlarm` also fires on Forecaster per-setup failures (Step 4.0): the
+sweep runs in the same Lambda/log group and logs the marker
+`PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` for every setup
+whose evaluation raises (and journals an `ERROR` row in `setup_evaluations`), so a
+dead Anthropic key or exhausted credit is alarmed within the hour instead of
+silently skipping every open setup four times a day.
+
 ### Test alarm firing (deliberate failure)
 
 Set an alarm to ALARM directly and confirm the Telegram message arrives, then

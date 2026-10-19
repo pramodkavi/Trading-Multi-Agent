@@ -12,10 +12,19 @@ of the per-signal pipeline). Each run it:
          AT_RISK      -> record + send a Telegram warning (FR-5.3).
          INVALIDATED  -> close the setup with its terminal outcome, stamp the
                          same outcome on the signal journal, and notify.
+    4. Records the evaluation -- or the failure -- in ``setup_evaluations``
+       (Slice 4 Step 4.0, dashboard design §5.2 "Forecaster writes one row per
+       setup incl. ERROR"). Every setup the sweep looked at leaves exactly one
+       row: the verdict with its LLM latency / tokens / cost, an ERROR row for
+       an orphaned setup, or an ERROR row carrying the exception text.
 
 Per-setup work is isolated in try/except so one bad setup (e.g. an old payload
 that no longer validates) never aborts the rest of the run -- the same
-resilience the multi-symbol scan runner uses.
+resilience the multi-symbol scan runner uses. A failure also logs the
+``PROVIDER_ERROR provider=forecaster`` marker that the MonitoringStack metric
+filter counts into ``ProviderErrorAlarm``, so a dead Anthropic key or exhausted
+credit is alarmed within the hour instead of silently skipping every setup
+(PROJECT_STATE §7 "Forecaster failures are invisible").
 
 This step ships the Forecaster logic only; wiring it to a schedule (a separate
 EventBridge rule -> Lambda) is Step 2.10, so running it live -- and the LLM cost
@@ -29,7 +38,13 @@ from typing import TYPE_CHECKING, Final
 
 from src.agents.forecaster.models import ForecasterUpdate
 from src.common.llm import DEFAULT_MODEL, structured_completion
-from src.common.models import ActiveSetupStatus, ForecastStatus, SignalStatus
+from src.common.models import (
+    ActiveSetupStatus,
+    ForecastStatus,
+    LlmUsage,
+    SetupEvaluationStatus,
+    SignalStatus,
+)
 from src.notifications import format_forecaster_update
 from src.providers import Timeframe
 
@@ -157,7 +172,15 @@ class Forecaster:
 
         Per-setup failures are logged and skipped so one bad setup never aborts
         the run. The returned list lets the caller (Step 2.10's Lambda) summarise
-        how many setups were still valid / at risk / closed.
+        how many setups were still valid / at risk / closed; ERROR rows are
+        journaled but never appear in it.
+
+        Step 4.0 (design §5.2): a failure inside :meth:`_evaluate_one` is
+        (a) logged with its traceback, (b) logged again as the
+        ``PROVIDER_ERROR provider=forecaster`` marker the CloudWatch metric
+        filter counts, and (c) journaled as an ERROR ``setup_evaluations`` row.
+        The journal write is guarded separately: if the store itself is down the
+        failure is logged and the sweep still moves on to the next setup.
         """
         setups = await self._store.list_open_active_setups()
         logger.info("forecaster evaluating %d open setup(s)", len(setups))
@@ -165,8 +188,24 @@ class Forecaster:
         for setup in setups:
             try:
                 update = await self._evaluate_one(setup)
-            except Exception:
+            except Exception as exc:
                 logger.exception("forecaster failed for setup %s", setup.id)
+                logger.warning(
+                    "PROVIDER_ERROR provider=forecaster setup=%s error=%s: %s",
+                    setup.id,
+                    type(exc).__name__,
+                    exc,
+                )
+                try:
+                    await self._store.record_setup_evaluation(
+                        setup_id=setup.id,
+                        signal_id=setup.signal_id,
+                        status=SetupEvaluationStatus.ERROR,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception:
+                    # The journal write must never take the sweep down with it.
+                    logger.exception("failed to record forecaster error row for setup %s", setup.id)
                 continue
             if update is not None:
                 updates.append(update)
@@ -175,18 +214,39 @@ class Forecaster:
     async def _evaluate_one(self, setup: StoredActiveSetup) -> ForecasterUpdate | None:
         signal = await self._store.get_signal(setup.signal_id)
         if signal is None or signal.status is not SignalStatus.PUBLISHED:
+            # Orphan: not an exception, so journal the ERROR row here directly
+            # (design §5.2) -- no LLM call is made and nothing is returned.
             logger.warning(
                 "setup %s references missing/non-published signal %s; skipping",
                 setup.id,
                 setup.signal_id,
+            )
+            await self._store.record_setup_evaluation(
+                setup_id=setup.id,
+                signal_id=setup.signal_id,
+                status=SetupEvaluationStatus.ERROR,
+                error=f"orphan: signal {setup.signal_id} missing or not PUBLISHED",
             )
             return None
         proposal = signal.as_proposal()
         snapshot = await self._provider.fetch_market_snapshot(
             proposal.symbol, [Timeframe.H4], limit=CANDLE_LIMIT
         )
-        update = await self.evaluate(setup, proposal, snapshot)
+        update, usage = await self.evaluate_traced(setup, proposal, snapshot)
         await self._apply(setup, proposal, update)
+        # Journal after _apply so the row is only written once the verdict has
+        # actually taken effect (design §5.2); if _apply raises, run() journals
+        # the ERROR row instead.
+        await self._store.record_setup_evaluation(
+            setup_id=setup.id,
+            signal_id=setup.signal_id,
+            status=SetupEvaluationStatus(update.status.value),
+            outcome=update.outcome,
+            reasoning=update.reasoning,
+            latency_ms=usage.latency_ms,
+            token_usage=usage.token_usage(),
+            cost_usd=usage.cost_usd,
+        )
         return update
 
     async def evaluate(
@@ -195,7 +255,26 @@ class Forecaster:
         proposal: SignalProposal,
         snapshot: MarketSnapshot,
     ) -> ForecasterUpdate:
-        """Ask Claude to re-evaluate one setup against current market data."""
+        """Ask Claude to re-evaluate one setup against current market data.
+
+        Delegates to :meth:`evaluate_traced` and drops the usage -- kept for
+        callers that only need the verdict.
+        """
+        update, _usage = await self.evaluate_traced(setup, proposal, snapshot)
+        return update
+
+    async def evaluate_traced(
+        self,
+        setup: StoredActiveSetup,
+        proposal: SignalProposal,
+        snapshot: MarketSnapshot,
+    ) -> tuple[ForecasterUpdate, LlmUsage]:
+        """:meth:`evaluate` plus the LLM call's usage for ``setup_evaluations``.
+
+        Step 4.0 (design §5.2 / NFR-2.3): the verdict row carries latency,
+        tokens and cost per evaluation, so the verdict is returned alongside an
+        :class:`LlmUsage` -- the same shape as ``Skeptic.evaluate_traced``.
+        """
         result = await structured_completion(
             output_schema=ForecasterUpdate,
             system=FORECASTER_SYSTEM_PROMPT,
@@ -212,7 +291,7 @@ class Forecaster:
             result.output.status.value,
             result.cost_usd,
         )
-        return result.output
+        return result.output, LlmUsage.from_result(result)
 
     async def _apply(
         self,
