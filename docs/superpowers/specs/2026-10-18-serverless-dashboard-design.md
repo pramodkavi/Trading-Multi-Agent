@@ -1,7 +1,7 @@
 # Serverless Web Dashboard — Design
 
-> **Status:** builder-checked 2026-10-19; operator decisions in §14 resolved; awaiting final
-> operator approval of this document before planning. Supersedes the Slice 4 architecture in
+> **Status:** APPROVED by the operator 2026-10-19 (builder-checked; §14 decisions resolved).
+> Implementation plan follows. Supersedes the Slice 4 architecture in
 > SPEC §2.5 / §4 Steps 4.1–4.11; the SPEC amendments in §11 ship with the first
 > implementation PR.
 > **Authority:** `SPEC.md` remains authoritative. Where this design deviates from it, the
@@ -315,6 +315,13 @@ infrastructure/stacks/dashboard_stack.py
 `POST /api/journal/{signal_id}`, `POST /api/controls/{pause|mute}`, tables
 `execution_journal`, `system_flags`. Named here only so Phase 1 route and table names do
 not collide.
+
+**Phase 2 (separate design, starts after Step 4.10):**
+1. **Trade journal first** — did the operator take the signal, fill price, size, real exit,
+   notes; one table, two write routes, no pipeline change; analytics gain "system vs me".
+2. **Operator controls second** — pause publishing, mute Telegram, trigger an ad-hoc scan,
+   edit the watchlist; needs the scan Lambda to read `system_flags` on every run, so it
+   changes live pipeline behaviour and gets its own review.
 
 ## 7. Telegram deep links
 
