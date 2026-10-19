@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Final
 
 from src.agents.skeptic.models import SkepticObjection
 from src.common.llm import DEFAULT_MODEL, structured_completion
-from src.common.models import SignalProposal
+from src.common.models import LlmUsage, SignalProposal
 from src.providers import (
     DataProvider,
     FREDProvider,
@@ -253,11 +253,25 @@ class Skeptic:
 
         Returns ``NoMacroData`` (no LLM call) when macro is wholly unavailable;
         otherwise calls Claude with the ``SkepticObjection`` schema and returns
-        the validated objection.
+        the validated objection. Delegates to :meth:`evaluate_traced` and drops
+        the usage -- kept for callers that only need the verdict.
+        """
+        objection, _usage = await self.evaluate_traced(proposal)
+        return objection
+
+    async def evaluate_traced(
+        self, proposal: SignalProposal
+    ) -> tuple[SkepticObjection | NoMacroData, LlmUsage | None]:
+        """:meth:`evaluate` plus the LLM call's usage for ``agent_runs`` (NFR-2.3).
+
+        Step 4.0 (design §5.2): the node persists latency / tokens / cost per
+        agent, so the verdict is returned alongside an :class:`LlmUsage`. On the
+        ``NoMacroData`` short circuit no LLM call is made, so the usage is
+        ``None`` -- the caller writes 0 / {} / NULL, not a fabricated zero cost.
         """
         macro = await self.gather_macro()
         if isinstance(macro, NoMacroData):
-            return macro
+            return macro, None
 
         result = await structured_completion(
             output_schema=SkepticObjection,
@@ -278,7 +292,7 @@ class Skeptic:
             result.output.severity.value,
             result.cost_usd,
         )
-        return result.output
+        return result.output, LlmUsage.from_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -293,14 +307,18 @@ def make_skeptic_node(skeptic: Skeptic) -> Callable[[AgentState], Awaitable[Agen
     injected via closure rather than living in the checkpointed AgentState. The
     node is a no-op for SkipDecisions: there is no proposal to object to. The
     edge analyzer -> ... -> skeptic is wired in Step 2.7.
+
+    The node owns two state keys: ``skeptic_objection`` and (Step 4.0)
+    ``skeptic_usage`` -- the LLM call's tokens / cost / latency, ``None`` when
+    no call was made, which the scan runner persists to ``agent_runs``.
     """
 
     async def skeptic_node(state: AgentState) -> AgentState:
         proposal = state.get("proposal")
         if not isinstance(proposal, SignalProposal):
-            return {"skeptic_objection": None}
-        objection = await skeptic.evaluate(proposal)
-        return {"skeptic_objection": objection}
+            return {"skeptic_objection": None, "skeptic_usage": None}
+        objection, usage = await skeptic.evaluate_traced(proposal)
+        return {"skeptic_objection": objection, "skeptic_usage": usage}
 
     return skeptic_node
 

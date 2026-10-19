@@ -4,7 +4,10 @@ Covers, all offline (no network):
 - macro merge + parallel gather (success, all-unavailable, exception-tolerant)
 - evaluate(): LLM path with a mocked Anthropic client; macro-unavailable short
   circuit (no LLM call) returning NoMacroData (FR-4.3)
-- the LangGraph node: skip for non-proposals; objection / NoMacroData for proposals
+- evaluate_traced(): the same, plus the LlmUsage carrier (None on the
+  NoMacroData short circuit) that Step 4.0 persists to agent_runs (NFR-2.3)
+- the LangGraph node: skip for non-proposals; objection / NoMacroData for
+  proposals; sets skeptic_usage alongside skeptic_objection
 - prompt construction (proposal + macro + proxy caveats) and system-prompt guards
 - build_macro_providers() wiring from Settings (incl. the SPY / VIXY proxies)
 """
@@ -30,7 +33,9 @@ from src.agents.skeptic.skeptic import (
     _build_user_prompt,
     _merge_macro,
 )
+from src.common.llm import DEFAULT_MODEL
 from src.common.models import (
+    LlmUsage,
     ObjectionSeverity,
     SignalDirection,
     SignalProposal,
@@ -282,6 +287,42 @@ async def test_evaluate_macro_unavailable_skips_llm() -> None:
 
 
 # ---------------------------------------------------------------------------
+# evaluate_traced (Step 4.0: usage carried to agent_runs, NFR-2.3)
+# ---------------------------------------------------------------------------
+
+
+async def test_evaluate_traced_returns_usage() -> None:
+    client = _mock_client([_fake_tool_response(_VALID_OBJECTION, tokens_in=120, tokens_out=30)])
+    skeptic = Skeptic([FakeMacroProvider(_fred_ctx(), name="fred")], client=client)
+    objection, usage = await skeptic.evaluate_traced(make_proposal())
+    assert isinstance(objection, SkepticObjection)
+    assert isinstance(usage, LlmUsage)
+    assert (usage.tokens_in, usage.tokens_out) == (120, 30)
+    assert usage.model == DEFAULT_MODEL
+    assert usage.latency_ms >= 0
+    assert usage.attempts == 1
+    assert usage.cost_usd is not None and usage.cost_usd > 0  # Sonnet 4.5 is priced
+
+
+async def test_evaluate_traced_no_macro_has_no_usage() -> None:
+    client = _mock_client([])
+    skeptic = Skeptic([], client=client)
+    objection, usage = await skeptic.evaluate_traced(make_proposal())
+    assert isinstance(objection, NoMacroData)
+    assert usage is None  # no LLM call -> nothing to account for
+    client.messages.create.assert_not_awaited()
+
+
+async def test_evaluate_delegates_to_evaluate_traced() -> None:
+    # The un-traced entry point keeps its signature and returns the same objection.
+    client = _mock_client([_fake_tool_response(_VALID_OBJECTION)])
+    skeptic = Skeptic([FakeMacroProvider(_fred_ctx(), name="fred")], client=client)
+    result = await skeptic.evaluate(make_proposal())
+    assert isinstance(result, SkepticObjection)
+    assert result.severity is ObjectionSeverity.MEDIUM
+
+
+# ---------------------------------------------------------------------------
 # LangGraph node
 # ---------------------------------------------------------------------------
 
@@ -300,7 +341,7 @@ async def test_node_skips_non_proposal() -> None:
     )
     for proposal in (None, skip):
         out = await node({"proposal": proposal})
-        assert out == {"skeptic_objection": None}
+        assert out == {"skeptic_objection": None, "skeptic_usage": None}
     # Never fetched macro or called the LLM for a non-proposal.
     assert fake.calls == 0
     client.messages.create.assert_not_awaited()
@@ -315,10 +356,21 @@ async def test_node_proposal_with_macro_returns_objection() -> None:
     assert objection.severity is ObjectionSeverity.MEDIUM
 
 
+async def test_node_sets_skeptic_usage() -> None:
+    client = _mock_client([_fake_tool_response(_VALID_OBJECTION, tokens_in=120, tokens_out=30)])
+    node = make_skeptic_node(Skeptic([FakeMacroProvider(_fred_ctx(), name="fred")], client=client))
+    out = await node({"proposal": make_proposal()})
+    usage = out["skeptic_usage"]
+    assert isinstance(usage, LlmUsage)
+    assert usage.tokens_in == 120
+    assert usage.tokens_out == 30
+
+
 async def test_node_proposal_no_macro_returns_nomacrodata() -> None:
     node = make_skeptic_node(Skeptic([]))  # no providers -> NoMacroData
     out = await node({"proposal": make_proposal()})
     assert isinstance(out["skeptic_objection"], NoMacroData)
+    assert out["skeptic_usage"] is None  # no LLM call on the FR-4.3 short circuit
 
 
 # ---------------------------------------------------------------------------

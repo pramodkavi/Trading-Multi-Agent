@@ -2,9 +2,10 @@
 
 Exercises build_pipeline_graph end to end:
 - a publishing snapshot flows analyzer -> historian -> skeptic -> judge and the
-  final state carries every agent's output + decision == the (mocked) ruling
+  final state carries every agent's output + decision == the (mocked) ruling,
+  plus the Skeptic / Judge LlmUsage carriers (Step 4.0, NFR-2.3)
 - a skip snapshot short-circuits at the conditional edge: historian / skeptic /
-  judge are never invoked (no LLM calls), decision == SKIP
+  judge are never invoked (no LLM calls), decision == SKIP, no usage recorded
 - the optional checkpointer seam compiles and persists state (InMemorySaver,
   the bundled saver -- no new dependency)
 - the tracer wraps every node
@@ -26,6 +27,7 @@ from src.agents.orchestration import AgentState, build_pipeline_graph
 from src.agents.skeptic import Skeptic, SkepticObjection
 from src.common.models import (
     JudgeRuling,
+    LlmUsage,
     ScanContext,
     ScanSession,
     SignalProposal,
@@ -225,6 +227,11 @@ async def test_pipeline_publishes_through_all_nodes() -> None:
     assert isinstance(final["skeptic_objection"], SkepticObjection)
     assert isinstance(final["judge_decision"], JudgeDecision)
     assert final["decision"] is JudgeRuling.PUBLISH
+    # Step 4.0: the LLM agents' usage rides along in state for agent_runs (NFR-2.3).
+    assert isinstance(final["skeptic_usage"], LlmUsage)
+    assert isinstance(final["judge_usage"], LlmUsage)
+    assert final["skeptic_usage"].tokens_in == 100  # from _fake_tool_response
+    assert final["judge_usage"].tokens_out == 40
     # Every downstream agent ran exactly once.
     assert len(store.calls) == 1
     skeptic_client.messages.create.assert_awaited_once()
@@ -242,6 +249,9 @@ async def test_pipeline_skip_short_circuits_remaining_agents() -> None:
     assert isinstance(final["proposal"], SkipDecision)
     assert final["decision"] is JudgeRuling.SKIP
     assert final.get("judge_decision") is None
+    # No LLM ran, so no usage was recorded (absent or None).
+    assert final.get("skeptic_usage") is None
+    assert final.get("judge_usage") is None
     # Conditional edge skipped historian / skeptic / judge entirely.
     assert store.calls == []
     skeptic_client.messages.create.assert_not_awaited()
@@ -264,7 +274,9 @@ async def test_pipeline_risk_gate_force_skips_and_short_circuits() -> None:
     # The Analyzer's original proposal is preserved for the journal (FR-1.7).
     assert isinstance(final["rejected_proposal"], SignalProposal)
     assert not final["risk_gate_report"].passed
-    # Downstream agents never ran.
+    # Downstream agents never ran, so no usage was recorded.
+    assert final.get("skeptic_usage") is None
+    assert final.get("judge_usage") is None
     assert store.calls == []
     skeptic_client.messages.create.assert_not_awaited()
     judge_client.messages.create.assert_not_awaited()

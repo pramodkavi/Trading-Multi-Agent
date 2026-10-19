@@ -33,10 +33,15 @@ Telegram trigger:
     Judge veto) so the operator always sees the end-to-end result. The message
     shape is chosen from the Judge's ruling.
 
+Per-agent accounting (Step 4.0, design §5.2 / NFR-2.3):
+    The Skeptic and Judge nodes return an ``LlmUsage`` alongside their output
+    (``skeptic_usage`` / ``judge_usage`` in state); ``_persist`` writes its
+    latency / tokens / cost onto that agent's agent_runs row. The Analyzer and
+    Historian make no LLM call, so their rows carry 0 / {} / NULL.
+
 Deferred (Step 2.7 follow-ups, see docs/PROJECT_STATE.md): a local
-AsyncPostgresSaver checkpointer (the Data API Lambda runs without one),
-per-agent token/cost accounting on the agent_runs rows (Langfuse covers
-observability when enabled), and multi-timeframe / derivatives fetching.
+AsyncPostgresSaver checkpointer (the Data API Lambda runs without one) and
+multi-timeframe / derivatives fetching.
 
 Usage:
     # .env must provide ANTHROPIC_API_KEY, TELEGRAM_*, DATABASE_URL.
@@ -90,6 +95,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from pydantic import BaseModel
 
     from src.agents.orchestration import AgentState
+    from src.common.models import LlmUsage
     from src.config import Settings
     from src.notifications import Notifier
     from src.persistence import SignalStore
@@ -173,13 +179,20 @@ async def _log_agent(
     symbol: str,
     role: AgentRole,
     output: BaseModel,
+    usage: LlmUsage | None = None,
 ) -> None:
-    """Write one agent_run row carrying an agent's structured output.
+    """Write one agent_run row carrying an agent's structured output + LLM usage.
 
-    Token/cost/latency are omitted for now (Langfuse provides per-call
-    observability when enabled); the reasoning itself is what FR-1.7 requires.
-    ``mode="json"`` makes UUIDs / datetimes / enums JSON-safe for the JSONB
-    column.
+    The reasoning itself is what FR-1.7 requires; ``mode="json"`` makes UUIDs /
+    datetimes / enums JSON-safe for the JSONB column.
+
+    ``usage`` (Step 4.0, design §5.2 / NFR-2.3) is the ``LlmUsage`` of the
+    agent's Claude call: ``latency_ms`` and ``cost_usd`` go to their own
+    columns, the rest (model / tokens / attempts) to the ``token_usage`` JSONB.
+    It is ``None`` for the deterministic agents (Analyzer, Historian) and for
+    the Skeptic's NoMacroData short circuit: those rows get ``latency_ms=0``,
+    ``token_usage=None`` (the store writes ``{}``) and ``cost_usd=None`` (SQL
+    NULL -- never 0.0, which would silently under-report spend).
     """
     await store.log_agent_run(
         scan_id=ctx.scan_id,
@@ -187,7 +200,9 @@ async def _log_agent(
         strategy=ctx.strategy,
         input_hash=_input_hash(f"{ctx.scan_id}:{role.value}:{symbol}"),
         output=output.model_dump(mode="json"),
-        latency_ms=0,
+        latency_ms=usage.latency_ms if usage is not None else 0,
+        token_usage=usage.token_usage() if usage is not None else None,
+        cost_usd=usage.cost_usd if usage is not None else None,
     )
 
 
@@ -202,7 +217,8 @@ async def _persist(
 
     The parent scan_runs row is created by the caller before the work starts
     (FK ordering); this writes the signal plus one agent_run per agent that
-    ran. On a skip only the analyzer ran, so only its row is written.
+    ran. On a skip only the analyzer ran, so only its row is written. The
+    Skeptic / Judge rows carry their LLM usage from state (Step 4.0, NFR-2.3).
     """
     proposal = state.get("proposal")
     if proposal is None:
@@ -222,10 +238,14 @@ async def _persist(
         await _log_agent(store, ctx, symbol, AgentRole.HISTORIAN, report)
     objection = state.get("skeptic_objection")
     if objection is not None:
-        await _log_agent(store, ctx, symbol, AgentRole.SKEPTIC, objection)
+        await _log_agent(
+            store, ctx, symbol, AgentRole.SKEPTIC, objection, state.get("skeptic_usage")
+        )
     judge_decision = state.get("judge_decision")
     if judge_decision is not None:
-        await _log_agent(store, ctx, symbol, AgentRole.JUDGE, judge_decision)
+        await _log_agent(
+            store, ctx, symbol, AgentRole.JUDGE, judge_decision, state.get("judge_usage")
+        )
 
     # Step 2.8: a published signal becomes a tracked active setup the Forecaster
     # will follow (only on PUBLISH / PUBLISH_WITH_CAVEAT; skips and vetoes don't).

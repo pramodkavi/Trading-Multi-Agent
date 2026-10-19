@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Final
 from src.agents.judge.models import JudgeDecision
 from src.agents.skeptic import SkepticObjection
 from src.common.llm import DEFAULT_MODEL, structured_completion
-from src.common.models import JudgeConfidence, JudgeRuling, SignalProposal
+from src.common.models import JudgeConfidence, JudgeRuling, LlmUsage, SignalProposal
 from src.providers import NoMacroData
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -199,7 +199,24 @@ class Judge:
         """Produce the terminal ruling for ``proposal``.
 
         Calls Claude with the ``JudgeDecision`` schema, then applies the FR-4.3
-        macro-unavailable confidence cap deterministically.
+        macro-unavailable confidence cap deterministically. Delegates to
+        :meth:`evaluate_traced` and drops the usage -- kept for callers that
+        only need the ruling.
+        """
+        decision, _usage = await self.evaluate_traced(proposal, historian_report, skeptic_objection)
+        return decision
+
+    async def evaluate_traced(
+        self,
+        proposal: SignalProposal,
+        historian_report: HistorianReport | None,
+        skeptic_objection: SkepticInput,
+    ) -> tuple[JudgeDecision, LlmUsage]:
+        """:meth:`evaluate` plus the LLM call's usage for ``agent_runs`` (NFR-2.3).
+
+        Step 4.0 (design §5.2): the node persists latency / tokens / cost per
+        agent. Unlike the Skeptic, the Judge *always* calls Claude for a
+        proposal, so the usage is never ``None`` here.
         """
         result = await structured_completion(
             output_schema=JudgeDecision,
@@ -219,7 +236,7 @@ class Judge:
             decision.confidence.value,
             result.cost_usd,
         )
-        return decision
+        return decision, LlmUsage.from_result(result)
 
 
 def _cap_confidence_if_macro_unavailable(
@@ -250,19 +267,21 @@ def make_judge_node(judge: Judge) -> Callable[[AgentState], Awaitable[AgentState
     is injected via closure. For a non-proposal (SkipDecision / None) there is
     nothing to publish, so the node rules SKIP without an LLM call. Otherwise it
     reads the historian report + skeptic objection already in state, evaluates,
-    and sets BOTH ``judge_decision`` (the full object) and ``decision`` (the
-    ruling enum the existing dispatcher consumes). Edge wiring is Step 2.7.
+    and sets ``judge_decision`` (the full object), ``decision`` (the ruling enum
+    the existing dispatcher consumes) and -- Step 4.0 -- ``judge_usage`` (the
+    LLM call's tokens / cost / latency the scan runner persists to
+    ``agent_runs``; ``None`` on the no-LLM skip path). Edge wiring is Step 2.7.
     """
 
     async def judge_node(state: AgentState) -> AgentState:
         proposal = state.get("proposal")
         if not isinstance(proposal, SignalProposal):
-            return {"judge_decision": None, "decision": JudgeRuling.SKIP}
-        decision = await judge.evaluate(
+            return {"judge_decision": None, "judge_usage": None, "decision": JudgeRuling.SKIP}
+        decision, usage = await judge.evaluate_traced(
             proposal,
             state.get("historian_report"),
             state.get("skeptic_objection"),
         )
-        return {"judge_decision": decision, "decision": decision.ruling}
+        return {"judge_decision": decision, "judge_usage": usage, "decision": decision.ruling}
 
     return judge_node

@@ -22,6 +22,7 @@ import scripts.run_scan as run_scan_module
 from scripts.run_scan import (
     _alambda,
     _load_settings,
+    _log_agent,
     _session_from_event,
     compose_message,
     run_one_symbol,
@@ -33,10 +34,13 @@ from src.agents.judge import Judge, JudgeDecision
 from src.agents.orchestration import ScanReservationLedger, build_pipeline_graph
 from src.agents.skeptic import Skeptic, SkepticObjection
 from src.common.models import (
+    AgentRole,
     ForecastStatus,
     JudgeConfidence,
     JudgeRuling,
+    LlmUsage,
     ObjectionSeverity,
+    ScanContext,
     ScanSession,
     SignalDirection,
     SignalProposal,
@@ -625,6 +629,84 @@ class TestRunOneSymbol:
         )
         assert ctx.session is ScanSession.AD_HOC and ctx.triggered_by == "manual"
         assert store.start_scan.await_args.kwargs["session"] == "AD_HOC"
+
+    async def test_publish_persists_judge_usage(self) -> None:
+        # Step 4.0 (design §5.2, NFR-2.3): the Skeptic / Judge agent_runs carry the
+        # LLM call's latency / tokens / cost; the deterministic Analyzer and
+        # Historian rows stay 0 / NULL / NULL (the store maps a None token_usage
+        # to {}).
+        store = _store()
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_bullish_series())),
+            store=store,
+            graph=_publishing_graph(),
+            notifier=None,
+            clock=_london_clock,
+        )
+        by_role = {c.kwargs["agent_role"]: c.kwargs for c in store.log_agent_run.await_args_list}
+        assert set(by_role) == {
+            AgentRole.ANALYZER,
+            AgentRole.HISTORIAN,
+            AgentRole.SKEPTIC,
+            AgentRole.JUDGE,
+        }
+
+        judge = by_role[AgentRole.JUDGE]
+        assert judge["latency_ms"] >= 0
+        assert judge["token_usage"]["tokens_in"] > 0
+        assert judge["token_usage"]["model"] == "claude-sonnet-4-5"
+        assert judge["cost_usd"] is not None and judge["cost_usd"] > 0
+
+        skeptic = by_role[AgentRole.SKEPTIC]
+        assert skeptic["token_usage"]["tokens_in"] > 0
+        assert skeptic["cost_usd"] is not None and skeptic["cost_usd"] > 0
+
+        for role in (AgentRole.ANALYZER, AgentRole.HISTORIAN):
+            row = by_role[role]
+            assert row["latency_ms"] == 0
+            assert row["token_usage"] is None
+            assert row["cost_usd"] is None
+
+    async def test_log_agent_persists_none_cost_as_null(self) -> None:
+        # Unknown model -> StructuredCompletionResult.cost_usd is None -> must stay
+        # None (SQL NULL), never 0.0, which would silently under-report spend.
+        store = _store()
+        ctx = ScanContext(session=ScanSession.LONDON, symbols=["BTCUSDT"], strategy="smc")
+        decision = JudgeDecision(
+            ruling=JudgeRuling.PUBLISH,
+            confidence=JudgeConfidence.HIGH,
+            reasoning="clean setup, supportive history",
+        )
+        usage = LlmUsage(
+            model="claude-unknown-9",
+            tokens_in=1,
+            tokens_out=1,
+            cost_usd=None,
+            attempts=1,
+            latency_ms=3,
+        )
+        await _log_agent(store, ctx, "BTCUSDT", AgentRole.JUDGE, decision, usage)
+        kwargs = store.log_agent_run.await_args.kwargs
+        assert kwargs["cost_usd"] is None
+        assert kwargs["latency_ms"] == 3
+        assert kwargs["token_usage"] == {
+            "model": "claude-unknown-9",
+            "tokens_in": 1,
+            "tokens_out": 1,
+            "attempts": 1,
+        }
+
+    async def test_log_agent_without_usage_writes_zero_and_nulls(self) -> None:
+        # The Analyzer / Historian make no LLM call: 0 latency, None token_usage
+        # (the store defaults it to {}), None cost.
+        store = _store()
+        ctx = ScanContext(session=ScanSession.LONDON, symbols=["BTCUSDT"], strategy="smc")
+        await _log_agent(store, ctx, "BTCUSDT", AgentRole.ANALYZER, _proposal())
+        kwargs = store.log_agent_run.await_args.kwargs
+        assert kwargs["latency_ms"] == 0
+        assert kwargs["token_usage"] is None
+        assert kwargs["cost_usd"] is None
 
 
 def test_session_from_event() -> None:
