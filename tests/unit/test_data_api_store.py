@@ -662,6 +662,66 @@ async def test_execute_does_not_retry_other_client_errors(monkeypatch: pytest.Mo
     assert client.calls == 1  # non-resume error raises immediately, no retry
 
 
+async def test_execute_single_attempt_raises_without_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Record every backoff sleep instead of collapsing it: a 1-attempt budget must
+    # not sleep at all (design §3.4 -- request-scoped callers sit behind API
+    # Gateway's 30 s cap and cannot wait out an Aurora resume).
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(store_module.asyncio, "sleep", _sleep)
+    client = FlakyRdsDataClient(error=_client_error("DatabaseResumingException"), fail_times=999)
+    store = DataApiSignalStore(
+        client=client,
+        cluster_arn=CLUSTER_ARN,
+        secret_arn=SECRET_ARN,
+        database=DATABASE,
+        resume_attempts=1,
+    )
+
+    with pytest.raises(ClientError):
+        await store.get_scan_run(uuid4())
+
+    assert sleeps == []
+    assert client.calls == 1
+
+
+def test_resume_attempts_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="resume_attempts"):
+        DataApiSignalStore(
+            client=FakeRdsDataClient(),
+            cluster_arn=CLUSTER_ARN,
+            secret_arn=SECRET_ARN,
+            database=DATABASE,
+            resume_attempts=0,
+        )
+
+
+def test_from_arns_passes_resume_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    import boto3
+
+    created: list[tuple[str, str | None]] = []
+
+    def _fake_client(service_name: str, *, region_name: str | None = None) -> FakeRdsDataClient:
+        created.append((service_name, region_name))
+        return FakeRdsDataClient()
+
+    monkeypatch.setattr(boto3, "client", _fake_client)
+
+    store = DataApiSignalStore.from_arns(
+        cluster_arn=CLUSTER_ARN,
+        secret_arn=SECRET_ARN,
+        database=DATABASE,
+        region_name="ap-south-1",
+        resume_attempts=2,
+    )
+
+    assert created == [("rds-data", "ap-south-1")]
+    assert store._resume_attempts == 2
+
+
 # ---------------------------------------------------------------------------
 # lifecycle
 # ---------------------------------------------------------------------------

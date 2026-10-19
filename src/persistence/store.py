@@ -99,6 +99,8 @@ logger = logging.getLogger(__name__)
 # migration step retries for the same reason. Worst-case wait
 # (5+10+15+20+25 = 75s) is well under the 10-minute Lambda timeout. Only the Data
 # API backend needs this -- local asyncpg / Docker Postgres never auto-pauses.
+# _RESUME_MAX_ATTEMPTS is the *default* budget; DataApiSignalStore(resume_attempts=)
+# lets request-scoped callers (API Gateway, 30 s cap) shrink it.
 _RESUME_RETRY_CODES: frozenset[str] = frozenset({"DatabaseResumingException"})
 _RESUME_MAX_ATTEMPTS: int = 6
 _RESUME_BACKOFF_SECONDS: float = 5.0
@@ -511,6 +513,14 @@ class DataApiSignalStore:
     The client is injected (not created here) so the unit tests can pass a
     mock and so the Lambda handler controls client lifetime/reuse across
     invocations. Use :meth:`from_arns` to build one with a real boto3 client.
+
+    ``resume_attempts`` bounds how many times :meth:`_execute` retries Aurora's
+    ``DatabaseResumingException`` (see the module-level ``_RESUME_*`` constants).
+    The default budget (6 attempts, up to ~75 s of backoff) suits the scheduled
+    scan Lambda, which can afford to wait out a scale-from-zero resume.
+    Request-scoped callers behind API Gateway's 30 s cap -- the Slice 4
+    dashboard -- must pass a small budget (``1`` fails fast) rather than let a
+    cold cluster time out the HTTP request (dashboard design §3.4).
     """
 
     def __init__(
@@ -520,11 +530,15 @@ class DataApiSignalStore:
         cluster_arn: str,
         secret_arn: str,
         database: str,
+        resume_attempts: int = _RESUME_MAX_ATTEMPTS,
     ) -> None:
+        if resume_attempts < 1:
+            raise ValueError(f"resume_attempts must be >= 1, got {resume_attempts}")
         self._client = client
         self._cluster_arn = cluster_arn
         self._secret_arn = secret_arn
         self._database = database
+        self._resume_attempts = resume_attempts
 
     @classmethod
     def from_arns(
@@ -534,12 +548,14 @@ class DataApiSignalStore:
         secret_arn: str,
         database: str,
         region_name: str | None = None,
+        resume_attempts: int = _RESUME_MAX_ATTEMPTS,
     ) -> DataApiSignalStore:
         """Construct with a fresh boto3 ``rds-data`` client.
 
         ``boto3`` is imported lazily so importing this module (and the unit
         tests, which inject a mock) never depends on AWS credentials or region
-        resolution.
+        resolution. ``resume_attempts`` is forwarded to the constructor; see the
+        class docstring for when to lower it.
         """
         import boto3
 
@@ -549,6 +565,7 @@ class DataApiSignalStore:
             cluster_arn=cluster_arn,
             secret_arn=secret_arn,
             database=database,
+            resume_attempts=resume_attempts,
         )
 
     # ---- low-level execute ------------------------------------------------
@@ -565,7 +582,9 @@ class DataApiSignalStore:
         Retries ``DatabaseResumingException`` -- Aurora Serverless v2 waking from
         its scale-to-zero auto-pause -- with linear backoff, so a scan that lands
         on a paused cluster rides out the ~20-30s resume instead of failing on its
-        first DB call. Any other error (including a non-resume ``ClientError``)
+        first DB call. The attempt budget is ``self._resume_attempts`` (constructor
+        ``resume_attempts``); with a budget of 1 the first resume error propagates
+        without sleeping. Any other error (including a non-resume ``ClientError``)
         propagates immediately.
         """
 
@@ -580,19 +599,19 @@ class DataApiSignalStore:
             )
             return result
 
-        for attempt in range(1, _RESUME_MAX_ATTEMPTS + 1):
+        for attempt in range(1, self._resume_attempts + 1):
             try:
                 return await asyncio.to_thread(_call)
             except ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code", "")
-                if code not in _RESUME_RETRY_CODES or attempt == _RESUME_MAX_ATTEMPTS:
+                if code not in _RESUME_RETRY_CODES or attempt == self._resume_attempts:
                     raise
                 delay = _RESUME_BACKOFF_SECONDS * attempt
                 logger.warning(
                     "Aurora resuming (%s); retry %d/%d in %.0fs",
                     code,
                     attempt,
-                    _RESUME_MAX_ATTEMPTS,
+                    self._resume_attempts,
                     delay,
                 )
                 await asyncio.sleep(delay)
