@@ -232,8 +232,11 @@ Both Lambdas are zip-packaged, so the console shows the full `src/` and
    08:00–13:00, NY 13:00–15:00, Overlap 15:00–21:00, Cooldown 21:00–00:00) and
    records it on `scan_runs.session`, so SPEC §1.6 rule 7 now actually fires:
    **the 22:03 daily-wrap scan runs inside Cooldown and is review-only** — it
-   still journals and the Forecaster still reviews open setups, but any new
-   proposal is force-skipped with `RULE_7_SESSION_BLOCK`. Scheduled invocations
+   still journals (`scan_runs` / `signals` / `agent_runs`), but any new
+   proposal is force-skipped with `RULE_7_SESSION_BLOCK`. Open setups are still
+   reviewed at daily wrap, but by the **separate 22:05 `{"mode":"forecaster"}`
+   sweep** (the `ForecasterSweep` schedule), not by the 22:03 scan itself; the
+   sweep never proposes, so rule 7 does not touch it. Scheduled invocations
    never set `session`. A console Test event may add `"session": "AD_HOC"`
    (case-insensitive) to bypass the window for a manual smoke test; an unknown
    value fails the invocation on purpose rather than silently bypassing the rule.

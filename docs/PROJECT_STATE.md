@@ -6,7 +6,7 @@
 > **not** cloned, so everything durable has been written here instead. Read this file
 > first; it points to everything else.
 >
-> **Last updated:** 2026-09-23 (Slice 2 live through Step 2.13; Step 2.14 automated by Critic v0 on `feat/slice-2-step-2.14-critic-v0`).
+> **Last updated:** 2026-10-20 (Critic v0 / Step 2.14 merged to `main` via PR #12; **Slice 4 started — Step 4.0 pipeline prerequisites shipped** on `feat/slice-4-step-4.0-pipeline-prereqs`, see §2).
 > **Authority order:** `SPEC.md` (authoritative spec) → `CLAUDE.md` (index/rules) → this file (current state).
 
 ---
@@ -38,7 +38,7 @@ UTC cron (crypto never closes). Full detail in `SPEC.md`; quick index in `CLAUDE
 
 ---
 
-## 2. Current status — **Slice 2 build COMPLETE through Step 2.13, deployed & live-verified**
+## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Step 4.0 shipped (awaiting merge + deploy)**
 
 Slice 1 (1.1 → 1.22) and Slice 2 build steps **2.1 → 2.13** are done, on `main`, and
 **running in production** (ap-south-1). **Live-verified 2026-06-27:** a manual scan returned
@@ -88,6 +88,53 @@ The **Slice 2 exit gate is the first section of the backfill report** (`mode=bac
 **Not yet run live** — the first backfill needs the IAM grants in §7 below, then
 `gh workflow run critic.yml -f mode=backfill` (stops after one chunk for the cost check),
 then again with `-f confirm_cost=true`.
+
+**Step 4.0 shipped — dashboard pipeline prerequisites** (branch
+`feat/slice-4-step-4.0-pipeline-prereqs`; design
+`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md` §5.2 / §9 / §10 row 4.0 /
+§14 D1; plan `docs/superpowers/plans/2026-10-19-slice-4-step-4.0-pipeline-prereqs.md`). Six
+pipeline-side changes the serverless dashboard needs before Step 4.1 builds the `DashboardStack`:
+
+1. **Scan session derived from the UTC clock** — `src/common/sessions.py::session_for`
+   (Asian 00–08, London 08–13, NY 13–15, Overlap 15–21, Cooldown 21–00) replaces the hardcoded
+   `AD_HOC`; `run_one_symbol(..., session=None, triggered_by="scheduler", clock=None)` records it
+   on `scan_runs.session`. A Lambda Test event may carry `"session": "AD_HOC"` to bypass rule 7
+   for a console smoke test (unknown values fail the invocation). **⚠️ LIVE BEHAVIOUR CHANGE
+   (design §14 D1): SPEC §1.6 rule 7 now actually fires.** The 22:03 daily-wrap scan runs inside
+   Cooldown — it still journals, but any new Analyzer proposal is force-skipped with
+   `RULE_7_SESSION_BLOCK`. Any 00:00–08:00 UTC scan would be `ASIAN` and blocked the same way;
+   only the four scheduled windows exist today, so 22:03 is the one affected. The 22:05
+   `{"mode":"forecaster"}` sweep is unaffected (it reviews open setups; it does not propose).
+2. **Skeptic / Judge LLM telemetry on `agent_runs`** — new `LlmUsage` model
+   (`src/common/models/llm_usage.py`), `evaluate_traced` on both agents,
+   `AgentState.skeptic_usage` / `judge_usage`; `agent_runs.latency_ms` / `token_usage` /
+   `cost_usd` are now populated for the skeptic and judge rows (analyzer / historian rows stay
+   `0` / `{}` / `NULL` — no LLM call).
+3. **New `setup_evaluations` table** (+2 indexes) and dashboard read indexes
+   `agent_runs (scan_id, agent_role)`, `active_setups (status, opened_at DESC)`;
+   `SetupEvaluationStatus` enum (STILL_VALID / AT_RISK / INVALIDATED / ERROR),
+   `StoredSetupEvaluation`, `record_setup_evaluation` / `list_setup_evaluations` on both store
+   backends. Data-API migration statement count 26 → 31; `EXPECTED_TABLES` is 8 tables.
+4. **Forecaster journals every evaluation** — one verdict row per evaluated setup (persisted
+   before the Telegram notify, so a notify failure cannot mask it) and an `ERROR` row for
+   orphans and for any per-setup exception; per-setup failures log the
+   `PROVIDER_ERROR provider=forecaster` marker so the existing `ProviderErrorAlarm` fires
+   (closes the "Forecaster failures are invisible" finding).
+5. **`DataApiSignalStore(..., resume_attempts=6)` / `from_arns(..., resume_attempts=)`** — the
+   Aurora resume-retry budget is a parameter (default unchanged; the dashboard API will pass
+   `1` because an HTTP request cannot wait ~75 s).
+6. **`MonitoringStack` cost guardrail** — `AWS::Budgets::Budget` $15/month, notifies the alarm
+   SNS topic (→ Telegram) at ACTUAL ≥ 80 % and FORECASTED ≥ 100 %; topic resource policy for
+   `budgets.amazonaws.com`; the Budget `DependsOn` that policy (Budgets validates topic access
+   at create time).
+
+**⚠️ After deploy: invoke `{"mode":"migrate"}` from the Lambda console (`docs/operations.md
+§2.1`) before the next Forecaster sweep (22:05 / 08:05 / 13:05 / 15:05 UTC), or
+`record_setup_evaluation` will fail on the missing `setup_evaluations` table.** The CD
+pre-deploy migration still silently skips (OIDC role lacks `describe-stacks`, §7). Nothing in
+SPEC.md changed in this step — the design's SPEC amendments (§11) ship with Step 4.1. The asyncpg
+integration-test extension for the new table (`tests/integration/test_repositories_integration.py`)
+was written but **not executed** (no Docker on the build machine) — see §7.
 
 ---
 
@@ -231,13 +278,28 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | 🟠 Infra/CD | **OIDC deploy-role grants (blocks the first Critic run AND the CD auto-migration):** the role behind `AWS_DEPLOY_ROLE_ARN` needs `cloudformation:DescribeStacks` on `CryptoSignals-Data` + `CryptoSignals-Compute`; `lambda:InvokeFunction` on the scan Lambda; `rds-data:ExecuteStatement` + `rds-data:BatchExecuteStatement` on the cluster ARN; `secretsmanager:GetSecretValue` on the DB secret; `ssm:GetParameter` on `/crypto-signals/anthropic-api-key` and `/crypto-signals/telegram-bot-token` (no `kms:Decrypt` needed with the default `aws/ssm` key). **Exact JSON policy: `docs/operations.md §7.4`.** Until attached, `critic.yml` fails in its `cfg` step and the deploy migration keeps silently skipping (`{"mode":"migrate"}` escape hatch). |
 | 🟠 Critic v0 | **Run the first backfill** once the grants are in: `gh workflow run critic.yml -f mode=backfill` → read the `::notice::` cost estimate → re-dispatch with `-f confirm_cost=true` → review the `Critic report <date>` PR; its first section is the Slice 2 exit gate. Then merge `feat/slice-2-step-2.14-critic-v0` (deploys the `rate(2 days)` resolver schedule). |
 | 🟡 Finding (2.14) | **Judge vetoes are stored as `signals.status = 'PUBLISHED'`.** `run_scan._persist` writes `PUBLISHED` for any proposal payload; only the presence of an `active_setups` row says whether it was actually published. Critic v0 works around it (`inventory.classify` is Judge-veto aware; the gate counts published = has setup row). Fix: a `VETOED` status (or set `SKIPPED` on `ruling == SKIP`) in a follow-up step; the schema/gate read paths must keep accepting the historical rows. |
-| 🟡 Finding (2.14) | **`session` is hardcoded to `AD_HOC` in every scan**, so hard rule 7 (no new signals in Asian / Cooldown sessions) can never fire in production — the scan windows happen to be inside London/NY hours, but the gate is dead code live. Fix: derive `TradingSession` from the scan's UTC start time in `run_scan` (and store it in `scan_runs.session`). |
+| ✅ Done (Step 4.0) | ~~**`session` is hardcoded to `AD_HOC` in every scan**, so hard rule 7 (no new signals in Asian / Cooldown sessions) can never fire in production.~~ **Fixed (design §14 D1):** `src/common/sessions.py::session_for` derives `ScanSession` from the UTC clock at scan start and `run_one_symbol` stores it on `scan_runs.session`; rule 7 now force-skips with `RULE_7_SESSION_BLOCK`. **Live consequence: the 22:03 daily-wrap scan is review-only** (Cooldown). A console Test event may pass `"session": "AD_HOC"` to bypass for a smoke test (`docs/operations.md §4.1`). |
+| ✅ Done (Step 4.0) | ~~**Observability — Forecaster failures are invisible:** `Forecaster.run` swallowed per-setup exceptions, the Lambda returned `ok`, and no alarm fired.~~ **Fixed:** every per-setup exception now logs `PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` (the existing `ProviderErrorAlarm` metric filter catches it) and journals a `setup_evaluations` row with `status='ERROR'`; every successful evaluation journals its verdict row too. Also closes the Step 2.7 deferral "per-agent token/cost on `agent_runs`": skeptic/judge rows now carry `latency_ms` / `token_usage` / `cost_usd` (`LlmUsage`). |
+| 🟡 Verify after deploy (Step 4.0) | Once the 4.0 PR is merged, deployed, **and the console `{"mode":"migrate"}` invoke has run** (ops §2.1): (a) the next scan's skeptic/judge `agent_runs` rows show non-zero `cost_usd` and `latency_ms`; (b) the next 22:05/08:05/13:05/15:05 sweep writes `setup_evaluations` rows (`SELECT count(*) FROM setup_evaluations`); (c) `scan_runs.session` shows a real window (`LONDON` / `NY` / `OVERLAP` / `COOLDOWN`), not `AD_HOC`; (d) if the 22:03 scan's Analyzer proposes, the `signals` row is `SKIPPED` with `payload->>'violated_rule' = 'RULE_7_SESSION_BLOCK'`. Read these through the AWS MCP Data API path (no local AWS CLI) and record the result here. |
+| 🟡 Test debt (Step 4.0) | Run `.\.venv\Scripts\python.exe -m pytest -m integration tests/integration/test_repositories_integration.py` the next time a local Postgres (Docker, port 5433) is available — the asyncpg `setup_evaluations` record/list round-trip was written in Step 4.0 but has never executed (no Docker on the build machine). |
 | 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |
 | ✅ Done | ~~Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking.~~ **Shipped (`fix/aurora-resume-retry`):** `_execute` retries `DatabaseResumingException` up to 6× with linear backoff (5/10/15/20/25s, ≤75s, well under the 10-min Lambda timeout). This was the production failure — every scheduled scan was dying on its first DB call (`start_scan`) because Aurora had scaled to zero, so no Telegram ever fired. Verified in the live Lambda logs (`log-events-viewer-result.csv`). |
 
 ---
 
-## 8. What's next — Slice 2 (Weeks 4–7), per `SPEC.md §4`
+## 8. What's next
+
+**Next step: Slice 4 Step 4.1 — `DashboardStack` scaffold**, per
+`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md §10` (the design replaces
+SPEC §4 Steps 4.1–4.11; serverless, read-only Phase 1). Deliverable: a new `DashboardStack` in
+`infrastructure/app.py` — API Lambda (FastAPI + Mangum, `/api/health` only), its own dependency
+layer via `lambda_assets.py` extras, HTTP API, log group, cdk-nag clean, added **last** in the
+deploy order; no SPA yet. Checkpoint: `GET /api/health` returns 200 from the API URL and a synth
+test asserts the resources. Step 4.1 also carries the design's SPEC amendments (§11). Before
+starting it: merge + deploy the Step 4.0 PR, run the console `{"mode":"migrate"}` invoke, and
+work through the 🟡 "Verify after deploy" row in §7.
+
+### 8.1 Slice 2 progress log (Weeks 4–7, per `SPEC.md §4`) — historical
 
 > **Progress (2026-06-13):** CD pipeline is fully working (push to `main` → auto-deploy dev via
 > OIDC). The user supplied their reference SMC scripts (`requested_scripts/`); we ran an
@@ -373,7 +435,8 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > LIVE BEHAVIOUR + INTRODUCES ONGOING LLM COST (~$3-5/mo at the ≤5-signal/day cap; skips cost nothing —
 > the conditional edge short-circuits).** FR-1.7: `_persist` writes `create_signal` + one `agent_run` per
 > agent that ran (analyzer always; historian/skeptic/judge only on a publish path) via `model_dump(mode=
-> "json")`; latency/token/cost omitted for now (Langfuse covers that when enabled). FR-5.2:
+> "json")`; latency/token/cost were omitted at the time — **populated for skeptic/judge rows since
+> Slice 4 Step 4.0 (`LlmUsage`, see §2)**. FR-5.2:
 > `compose_message` branches on the Judge ruling — PUBLISH/PUBLISH_WITH_CAVEAT → `format_new_signal` (now
 > takes a `caveat` kwarg) enriched with historian win-rate + skeptic objection (+ caveat); analyzer skip →
 > `format_skip`; Judge veto on a real proposal → a "JUDGED SKIP" note. `run_one_symbol` signature changed:
@@ -384,9 +447,10 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 > persists 4 agent_runs, skip persists 1, compose_message variants, lambda lifecycle (now also patches
 > `AsyncAnthropic`). Checkpoints green: ruff, mypy --strict (55 files), pytest **507 passed**.
 > **STILL DEFERRED (smaller follow-ups, not blockers):** local `AsyncPostgresSaver` checkpointer (Lambda
-> runs without one; needs `langgraph-checkpoint-postgres` + table setup); per-agent token/cost on
-> agent_runs rows; multi-TF/derivatives fetch (still H4-only); the scan `session` is hardcoded AD_HOC
-> (the EventBridge cron→session mapping is Step 2.10).
+> runs without one; needs `langgraph-checkpoint-postgres` + table setup); ~~per-agent token/cost on
+> agent_runs rows~~ (**done in Slice 4 Step 4.0**); multi-TF/derivatives fetch (still H4-only); ~~the
+> scan `session` is hardcoded AD_HOC~~ (**done in Slice 4 Step 4.0** — derived from the UTC clock, not
+> from the EventBridge cron label).
 > **Step 2.8 shipped — ACTIVE SETUPS TRACKING:** new `active_setups` table (id, signal_id FK→signals
 > ON DELETE CASCADE, opened_at, status, last_evaluated_at, latest_evaluation JSONB) + 2 indexes, added
 > to schema.sql (idempotent; CD auto-migrates before deploy → the live DB gets it automatically). New
