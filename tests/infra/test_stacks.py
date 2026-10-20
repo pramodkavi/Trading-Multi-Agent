@@ -1,13 +1,16 @@
-"""CDK synth-time assertions for the Step 2.12 changes.
+"""CDK synth-time assertions for the Step 2.12 changes (and later stack additions).
 
-Covers the SSM-Parameter-Store secret migration (DataStack/ComputeStack) and the
-NFR-2.2 alarms + Telegram alerting path (MonitoringStack). jsii (-> Node) emits
-deprecation/runtime warnings the project's ``filterwarnings=error`` would
-otherwise turn into failures; they are not about our code, so ignore them here.
+Covers the SSM-Parameter-Store secret migration (DataStack/ComputeStack), the
+NFR-2.2 alarms + Telegram alerting path (MonitoringStack), and the Slice 4
+DashboardStack scaffold. jsii (-> Node) emits deprecation/runtime warnings the
+project's ``filterwarnings=error`` would otherwise turn into failures; they are
+not about our code, so ignore them here.
 """
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
 
 import pytest
@@ -336,3 +339,118 @@ def test_scheduling_stack_exports_resolver_schedule_name(templates: dict[str, An
 def test_scheduling_stack_schedule_count(templates: dict[str, Any]) -> None:
     # 4 scan windows + forecaster sweep + outcome resolver.
     templates["scheduling"].resource_count_is("AWS::Scheduler::Schedule", 6)
+
+
+# ---------------------------------------------------------------------------
+# DashboardStack (Slice 4 Step 4.1, design §3.2 / §8 / §10)
+# ---------------------------------------------------------------------------
+
+
+def test_dashboard_lambda_is_zip_fastapi_handler(templates: dict[str, Any]) -> None:
+    templates["dashboard"].resource_count_is("AWS::Lambda::Function", 1)
+    templates["dashboard"].has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Runtime": "python3.11",
+            "Handler": "src.dashboard.api.app.handler",
+            "Architectures": ["x86_64"],
+            "PackageType": assertions.Match.absent(),
+            "VpcConfig": assertions.Match.absent(),
+            "Layers": [{"Ref": assertions.Match.string_like_regexp("^DepsLayer")}],
+            "MemorySize": 512,
+            "Timeout": 25,
+            "Environment": {
+                "Variables": assertions.Match.object_like(
+                    {
+                        "DB_NAME": "signals",
+                        "APP_VERSION": "t3st000",
+                        "LOG_LEVEL": "INFO",
+                        "DB_CLUSTER_ARN": assertions.Match.any_value(),
+                        "DB_SECRET_ARN": assertions.Match.any_value(),
+                    }
+                )
+            },
+        },
+    )
+
+
+def test_dashboard_stack_owns_a_layer_with_the_dashboard_extra(templates: dict[str, Any]) -> None:
+    templates["dashboard"].resource_count_is("AWS::Lambda::LayerVersion", 1)
+    templates["dashboard"].has_resource_properties(
+        "AWS::Lambda::LayerVersion",
+        {
+            "CompatibleRuntimes": ["python3.11"],
+            "Description": assertions.Match.string_like_regexp("extras: dashboard"),
+        },
+    )
+
+
+def test_dashboard_http_api_routes_health_only(templates: dict[str, Any]) -> None:
+    t = templates["dashboard"]
+    t.resource_count_is("AWS::ApiGatewayV2::Api", 1)
+    t.has_resource_properties("AWS::ApiGatewayV2::Api", {"ProtocolType": "HTTP"})
+    t.resource_count_is("AWS::ApiGatewayV2::Route", 1)
+    t.has_resource_properties(
+        "AWS::ApiGatewayV2::Route",
+        {
+            "RouteKey": "GET /api/health",
+            # No authorizer here; Step 4.4 adds the JWT authorizer to the other routes.
+            "AuthorizerId": assertions.Match.absent(),
+        },
+    )
+    t.resource_count_is("AWS::ApiGatewayV2::Integration", 1)
+    t.has_resource_properties(
+        "AWS::ApiGatewayV2::Integration",
+        {"IntegrationType": "AWS_PROXY", "PayloadFormatVersion": "2.0"},
+    )
+
+
+def test_dashboard_default_stage_logged_and_throttled(templates: dict[str, Any]) -> None:
+    templates["dashboard"].resource_count_is("AWS::ApiGatewayV2::Stage", 1)
+    templates["dashboard"].has_resource_properties(
+        "AWS::ApiGatewayV2::Stage",
+        {
+            "StageName": "$default",
+            "AutoDeploy": True,
+            "AccessLogSettings": assertions.Match.object_like(
+                {"DestinationArn": assertions.Match.any_value()}
+            ),
+            "DefaultRouteSettings": assertions.Match.object_like(
+                {"ThrottlingRateLimit": 10, "ThrottlingBurstLimit": 20}
+            ),
+        },
+    )
+
+
+def test_dashboard_log_groups_two_week_retention(templates: dict[str, Any]) -> None:
+    templates["dashboard"].resource_count_is("AWS::Logs::LogGroup", 2)
+    for _, props in templates["dashboard"].find_resources("AWS::Logs::LogGroup").items():
+        assert props["Properties"]["RetentionInDays"] == 14
+
+
+def test_dashboard_role_has_data_api_but_no_ssm(templates: dict[str, Any]) -> None:
+    policies = templates["dashboard"].find_resources("AWS::IAM::Policy")
+    statements = [
+        s for p in policies.values() for s in p["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    actions = {
+        a
+        for s in statements
+        for a in ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])
+    }
+    assert "rds-data:ExecuteStatement" in actions
+    assert "secretsmanager:GetSecretValue" in actions
+    assert not any(a.startswith(("ssm:", "s3:", "lambda:")) for a in actions)
+
+
+def test_dashboard_imports_only_from_data_stack(templates: dict[str, Any]) -> None:
+    # Design §7 / anti-goal §4.4: no coupling to Compute / Scheduling / Monitoring.
+    rendered = json.dumps(templates["dashboard"].to_json())
+    imports = re.findall(r'"Fn::ImportValue":\s*"([^"]+)"', rendered)
+    assert imports, "expected the cluster ARN / secret ARN imports from Data"
+    assert all(name.startswith("Data:") for name in imports), imports
+
+
+def test_dashboard_outputs(templates: dict[str, Any]) -> None:
+    templates["dashboard"].has_output("DashboardApiUrl", assertions.Match.any_value())
+    templates["dashboard"].has_output("DashboardFunctionName", assertions.Match.any_value())
