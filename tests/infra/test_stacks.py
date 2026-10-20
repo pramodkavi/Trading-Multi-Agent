@@ -248,6 +248,19 @@ def test_alarm_topic_allows_budgets_to_publish(templates: dict[str, Any]) -> Non
     )
 
 
+def test_budget_depends_on_alarm_topic_policy(templates: dict[str, Any]) -> None:
+    # AWS Budgets validates topic access at create time ("Invalid SNS topic");
+    # without an explicit DependsOn, CFN may create the Budget before the
+    # TopicPolicy update that grants budgets.amazonaws.com publish lands.
+    template = templates["monitoring"]
+    policy_ids = list(template.find_resources("AWS::SNS::TopicPolicy"))
+    assert len(policy_ids) == 1
+    template.has_resource(
+        "AWS::Budgets::Budget",
+        {"DependsOn": assertions.Match.array_with([policy_ids[0]])},
+    )
+
+
 # ---------------------------------------------------------------------------
 # SchedulingStack: Critic v0 outcome resolver runs on rate(2 days) (Step 2.14)
 # ---------------------------------------------------------------------------

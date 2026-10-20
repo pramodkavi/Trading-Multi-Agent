@@ -38,10 +38,11 @@ spend, not a real-time alarm. Anthropic token spend is tracked separately via
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from aws_cdk import (
     CfnOutput,
+    CfnResource,
     Duration,
     RemovalPolicy,
     Stack,
@@ -266,6 +267,11 @@ class MonitoringStack(Stack):
         without it the notification is silently dropped. Budgets is a global
         service, so the grant is scoped by ``aws:SourceAccount`` rather than a
         region-specific ``aws:SourceArn``.
+
+        AWS Budgets validates topic access at *create* time ("Invalid SNS
+        topic"), and CloudFormation would otherwise create the Budget and update
+        the TopicPolicy in parallel (both depend only on the Topic), so the
+        Budget gets an explicit ``DependsOn`` the policy resource.
         """
         self.topic.add_to_resource_policy(
             iam.PolicyStatement(
@@ -277,11 +283,16 @@ class MonitoringStack(Stack):
                 conditions={"StringEquals": {"aws:SourceAccount": self.account}},
             )
         )
+        # The Topic creates its TopicPolicy child lazily on the first
+        # add_to_resource_policy call, so look it up only after the grant above.
+        topic_policy = cast(sns.TopicPolicy, self.topic.node.find_child("Policy"))
+        topic_policy_cfn = cast(CfnResource, topic_policy.node.default_child)
+
         sns_subscriber = budgets.CfnBudget.SubscriberProperty(
             subscription_type="SNS",
             address=self.topic.topic_arn,
         )
-        return budgets.CfnBudget(
+        budget = budgets.CfnBudget(
             self,
             "MonthlyCostBudget",
             budget=budgets.CfnBudget.BudgetDataProperty(
@@ -313,6 +324,8 @@ class MonitoringStack(Stack):
                 ),
             ],
         )
+        budget.add_dependency(topic_policy_cfn)
+        return budget
 
     # ------------------------------------------------------------------
     # Helpers
