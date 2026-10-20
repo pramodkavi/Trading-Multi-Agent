@@ -513,7 +513,10 @@ in place for 4.2.
 
 CloudFormation console → `CryptoSignals-Dashboard` → **Outputs** → `DashboardApiUrl`
 (and `DashboardFunctionName`); or the `cdk deploy` log of the Deploy (dev) run.
-Record both in `docs/PROJECT_STATE.md §3` after the first deploy.
+Record both in `docs/PROJECT_STATE.md §3` after the first deploy. Because this
+stack deploys last, a red Deploy (dev) run can be Dashboard-only: if the run fails
+on `CryptoSignals-Dashboard`, open that stack's CloudFormation events; the pipeline
+stacks are already updated — do not roll them back.
 
 ### 8.3 Smoke test
 
@@ -522,10 +525,12 @@ curl -s https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/health
 # → {"status":"ok","version":"<short sha>"}
 ```
 
-`version` is the deployed commit: `GITHUB_SHA[:7]` when built on the runner
-(`git rev-parse --short HEAD` for a local synth, else `local`). It should match the
-merge commit that triggered the deploy — if it does not, the deploy ran from a
-different commit than expected (`APP_VERSION` is baked at synth time).
+`version` is the deployed commit: `git rev-parse --short HEAD` of the synthesizing
+checkout first (on the runner that is the tree `actions/checkout` fetched — on a
+`workflow_run`-triggered deploy that is `head_sha`, whereas `GITHUB_SHA` is the
+default-branch tip), then `GITHUB_SHA[:7]` if git is unavailable, else `local`. It
+should match the merge commit that triggered the deploy — if it does not, the deploy
+ran from a different commit than expected (`APP_VERSION` is baked at synth time).
 
 The FastAPI app also defines `/api/openapi.json` and `/api/docs` (`openapi_url` /
 `docs_url` in `create_app()`), but in Step 4.1 the HTTP API routes **only**

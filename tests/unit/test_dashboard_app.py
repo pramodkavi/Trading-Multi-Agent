@@ -126,6 +126,7 @@ def test_unknown_route_is_json_404() -> None:
 
 @pytest.mark.usefixtures("lambda_event_loop")
 def test_lambda_handler_serves_http_api_v2_event(monkeypatch: pytest.MonkeyPatch) -> None:
+    # no effect: handler built at import; version asserted via create_app() tests
     monkeypatch.setenv("APP_VERSION", "cafe123")
     result = handler(_v2_event(), _Ctx())
     assert result["statusCode"] == 200

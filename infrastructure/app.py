@@ -38,13 +38,14 @@ def resolve_app_version() -> str:
     """The build identifier the dashboard's ``/api/health`` reports as ``version``.
 
     The health endpoint is the deploy smoke test, so it should say which commit
-    is live: ``GITHUB_SHA`` (short) on the Actions runner, ``git rev-parse``
-    locally, and ``"local"`` when neither is available (no git, not a checkout).
-    Never raises -- a missing version must not fail ``cdk synth``.
+    is live. Precedence: (1) ``git rev-parse --short HEAD`` -- the checkout IS
+    the deployed tree (``actions/checkout`` leaves a git repo, and on a
+    ``workflow_run``-triggered deploy it checks out ``head_sha`` while
+    ``GITHUB_SHA`` is the default-branch tip, so the env var can name a commit
+    that is not what was synthesized); (2) ``GITHUB_SHA[:7]`` if set and
+    non-empty; (3) ``"local"`` (no git, not a checkout). Never raises -- a
+    missing version must not fail ``cdk synth``.
     """
-    sha = os.environ.get("GITHUB_SHA", "")
-    if sha:
-        return sha[:7]
     try:
         return subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -52,8 +53,12 @@ def resolve_app_version() -> str:
             capture_output=True,
             text=True,
         ).stdout.strip()
-    except Exception:  # any failure (no git on PATH, not a checkout) means "local"
-        return "local"
+    except Exception:  # no git on PATH / not a checkout: fall through to the env var
+        pass
+    sha = os.environ.get("GITHUB_SHA", "")
+    if sha:
+        return sha[:7]
+    return "local"
 
 
 app = cdk.App()

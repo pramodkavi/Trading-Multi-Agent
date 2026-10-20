@@ -9,10 +9,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
-pytestmark = pytest.mark.filterwarnings("ignore")
-
 APP_PY = Path(__file__).resolve().parents[2] / "infrastructure" / "app.py"
 EXPECTED = [
     "CryptoSignals-Network",
