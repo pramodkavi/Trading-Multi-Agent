@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """CDK application entry point for the crypto-signals system.
 
-Instantiates the five Slice 1 stacks and wires cdk-nag's AwsSolutionsChecks
-so security findings surface at synth time. NetworkStack is implemented in
-Step 1.15; the other four are filled in across Steps 1.16-1.18 (and 2.12).
+Instantiates the six stacks and wires cdk-nag's AwsSolutionsChecks so security
+findings surface at synth time. The five pipeline stacks (Network, Data,
+Compute, Scheduling, Monitoring) were built across Steps 1.15-1.18 and 2.12;
+the DashboardStack (Slice 4, Step 4.1) is declared LAST and depends only on
+Data, so a dashboard deploy failure can never block a pipeline deploy.
 
 Environment:
     Stacks are bound to the account/region the CDK CLI resolves from the
@@ -20,14 +22,44 @@ Run from this directory (cdk.json sets `app = python app.py`):
 from __future__ import annotations
 
 import os
+import subprocess
 
 import aws_cdk as cdk
 from cdk_nag import AwsSolutionsChecks
 from stacks.compute_stack import ComputeStack
+from stacks.dashboard_stack import DashboardStack
 from stacks.data_stack import DataStack
 from stacks.monitoring_stack import MonitoringStack
 from stacks.network_stack import NetworkStack
 from stacks.scheduling_stack import SchedulingStack
+
+
+def resolve_app_version() -> str:
+    """The build identifier the dashboard's ``/api/health`` reports as ``version``.
+
+    The health endpoint is the deploy smoke test, so it should say which commit
+    is live. Precedence: (1) ``git rev-parse --short HEAD`` -- the checkout IS
+    the deployed tree (``actions/checkout`` leaves a git repo, and on a
+    ``workflow_run``-triggered deploy it checks out ``head_sha`` while
+    ``GITHUB_SHA`` is the default-branch tip, so the env var can name a commit
+    that is not what was synthesized); (2) ``GITHUB_SHA[:7]`` if set and
+    non-empty; (3) ``"local"`` (no git, not a checkout). Never raises -- a
+    missing version must not fail ``cdk synth``.
+    """
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:  # no git on PATH / not a checkout: fall through to the env var
+        pass
+    sha = os.environ.get("GITHUB_SHA", "")
+    if sha:
+        return sha[:7]
+    return "local"
+
 
 app = cdk.App()
 
@@ -71,6 +103,15 @@ MonitoringStack(
     scan_function=compute.function,
     scan_log_group=compute.log_group,
     cluster=data.cluster,
+)
+# Slice 4 (design 2026-10-18 §3.5 / §4.4): LAST and coupled only to Data, so a
+# dashboard deploy failure can never block or delay a pipeline deploy.
+DashboardStack(
+    app,
+    "CryptoSignals-Dashboard",
+    env=env,
+    cluster=data.cluster,
+    app_version=resolve_app_version(),
 )
 
 # cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a

@@ -24,7 +24,7 @@ if str(_INFRA_DIR) not in sys.path:
 
 @pytest.fixture(scope="session")
 def templates() -> dict[str, Any]:
-    """Synthesize the data/compute/scheduling/monitoring stacks once; return their Templates.
+    """Synthesize the data/compute/scheduling/monitoring/dashboard stacks once.
 
     Built env-agnostically (no account/region) -- enough for resource-shape
     assertions; cross-stack references render as Fn::ImportValue.
@@ -32,6 +32,7 @@ def templates() -> dict[str, Any]:
     import aws_cdk as core
     from aws_cdk import assertions
     from stacks.compute_stack import ComputeStack
+    from stacks.dashboard_stack import DashboardStack
     from stacks.data_stack import DataStack
     from stacks.monitoring_stack import MonitoringStack
     from stacks.network_stack import NetworkStack
@@ -59,9 +60,13 @@ def templates() -> dict[str, Any]:
         scan_log_group=compute.log_group,
         cluster=data.cluster,
     )
+    # Slice 4 Step 4.1: coupled only to Data (design §7 / §4.4). A fixed
+    # app_version so the APP_VERSION env assertion is deterministic.
+    dashboard = DashboardStack(app, "Dashboard", cluster=data.cluster, app_version="t3st000")
     return {
         "data": assertions.Template.from_stack(data),
         "compute": assertions.Template.from_stack(compute),
         "scheduling": assertions.Template.from_stack(scheduling),
         "monitoring": assertions.Template.from_stack(monitoring),
+        "dashboard": assertions.Template.from_stack(dashboard),
     }

@@ -30,6 +30,17 @@ dependencies = [
 ]
 """
 
+# Slice 4 Step 4.1: the dashboard API Lambda's layer = base deps + one named
+# extra. `boto3` inside the extra checks that LAYER_EXCLUDES apply to the union.
+PYPROJECT_WITH_EXTRAS = (
+    PYPROJECT
+    + """
+[project.optional-dependencies]
+dashboard = ["fastapi>=0.115", "mangum>=0.19", "boto3>=1.35"]
+tracing = ["langfuse>=2"]
+"""
+)
+
 
 # ---------------------------------------------------------------------------
 # requirement_name / layer_requirements
@@ -70,6 +81,25 @@ def test_layer_requirements_missing_section_is_a_clear_error() -> None:
         la.layer_requirements("[project]\nname = 'x'\n")
 
 
+def test_layer_requirements_merges_named_extras_and_still_excludes() -> None:
+    reqs = la.layer_requirements(PYPROJECT_WITH_EXTRAS, extras=("dashboard",))
+    names = [la.requirement_name(r) for r in reqs]
+    assert "fastapi" in names and "mangum" in names
+    assert "langfuse" not in names  # other extras untouched
+    assert "boto3" not in names  # excludes apply to the union too
+    assert "psycopg" not in names
+    assert reqs == sorted(reqs)
+
+
+def test_layer_requirements_without_extras_is_unchanged() -> None:
+    assert la.layer_requirements(PYPROJECT_WITH_EXTRAS) == la.layer_requirements(PYPROJECT)
+
+
+def test_layer_requirements_unknown_extra_is_a_clear_error() -> None:
+    with pytest.raises(ValueError, match="dashbaord"):
+        la.layer_requirements(PYPROJECT_WITH_EXTRAS, extras=("dashbaord",))
+
+
 # ---------------------------------------------------------------------------
 # layer_asset_hash
 # ---------------------------------------------------------------------------
@@ -84,6 +114,12 @@ def test_layer_asset_hash_is_stable_and_order_independent() -> None:
 
 def test_layer_asset_hash_changes_when_requirements_change() -> None:
     assert la.layer_asset_hash(["ccxt>=4.4"]) != la.layer_asset_hash(["ccxt>=4.5"])
+
+
+def test_layer_asset_hash_differs_with_extras() -> None:
+    base = la.layer_asset_hash(la.layer_requirements(PYPROJECT_WITH_EXTRAS))
+    dash = la.layer_asset_hash(la.layer_requirements(PYPROJECT_WITH_EXTRAS, extras=("dashboard",)))
+    assert base != dash
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +284,59 @@ def test_run_pip_failure_message_includes_pips_stderr() -> None:
 
 
 # ---------------------------------------------------------------------------
+# deps_layer: CDK asset-staging cache must not merge layers with different extras
+# ---------------------------------------------------------------------------
+
+
+def test_deps_layer_with_different_extras_stages_a_different_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Found at the first Step 4.1 synth: CDK's AssetStaging caches on
+    # (source path + bundling-options fingerprint). Every layer shares the
+    # source path and the Python bundler object fingerprints identically
+    # whatever requirements it holds, so the dashboard layer silently reused
+    # the scan layer's output (no fastapi/mangum in it). Real CDK staging here,
+    # pip replaced by a marker-writing fake.
+    import aws_cdk as core
+    from aws_cdk import assertions
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fake_repo(repo)
+    (repo / "pyproject.toml").write_text(PYPROJECT_WITH_EXTRAS)
+    (repo / "infrastructure").mkdir()
+    (repo / "infrastructure" / ".keep").write_text("")
+    monkeypatch.setattr(la, "REPO_ROOT", repo)
+
+    built: list[list[str]] = []
+
+    def fake_build_layer(output_dir: Path, requirements: list[str]) -> None:
+        built.append(list(requirements))
+        (output_dir / "python").mkdir(parents=True, exist_ok=True)
+        (output_dir / "python" / "REQS").write_text("\n".join(requirements))
+
+    monkeypatch.setattr(la, "build_layer", fake_build_layer)
+
+    app = core.App(outdir=str(tmp_path / "cdk.out"))
+    scan = core.Stack(app, "Scan")
+    dashboard = core.Stack(app, "Dashboard")
+    notifier = core.Stack(app, "Notifier")
+    la.deps_layer(scan, "DepsLayer")
+    la.deps_layer(dashboard, "DepsLayer", extras=("dashboard",))
+    la.deps_layer(notifier, "DepsLayer")
+
+    def layer_key(stack: core.Stack) -> str:
+        layers = assertions.Template.from_stack(stack).find_resources("AWS::Lambda::LayerVersion")
+        (props,) = layers.values()
+        return str(props["Properties"]["Content"]["S3Key"])
+
+    assert layer_key(scan) != layer_key(dashboard)
+    assert layer_key(scan) == layer_key(notifier)  # identical content still dedupes
+    assert len(built) == 2  # base once (shared), dashboard once
+    assert any("fastapi>=0.115" in reqs for reqs in built)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -266,3 +355,19 @@ def test_cli_print_requirements_prints_filtered_specs(
     assert "boto3>=1.35" not in lines
     assert "psycopg[binary]>=3.2" not in lines
     assert "ccxt>=4.4" in lines
+
+
+def test_cli_print_requirements_accepts_repeatable_extra(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fake_repo(repo)
+    (repo / "pyproject.toml").write_text(PYPROJECT_WITH_EXTRAS)
+    monkeypatch.setattr(la, "REPO_ROOT", repo)
+
+    assert la.main(["print-requirements", "--extra", "dashboard"]) == 0
+
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert "fastapi>=0.115" in lines and "mangum>=0.19" in lines
+    assert "boto3>=1.35" not in lines

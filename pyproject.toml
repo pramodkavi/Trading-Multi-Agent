@@ -44,6 +44,14 @@ tracing = [
     "langfuse>=2",
 ]
 
+# Slice 4 Step 4.1: the dashboard API Lambda's web stack. Installed into ITS
+# dependency layer only (infrastructure/lambda_assets.py deps_layer(extras=("dashboard",)));
+# the scan Lambda's layer is unchanged. Locally: pip install -e ".[dev,dashboard]".
+dashboard = [
+    "fastapi>=0.115",
+    "mangum>=0.19",
+]
+
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

@@ -55,12 +55,12 @@ Risk gates live in `src/agents/orchestration/risk_gates.py` as pure functions in
 | Observability | Langfuse (self-hosted) — every LLM/tool call traced from day one |
 | DB | Aurora Serverless v2 PostgreSQL 16+ with pgvector (scale-to-zero). Cloud access via RDS Data API; local dev via asyncpg → Docker. Dual-backend repositories. |
 | Storage | S3 (versioning on, Glacier after 90 days) |
-| Compute | **AWS Lambda** (zip code asset + dependency layer, outside VPC, **source editable in the console**) for the agent pipeline — revised from ECS Fargate, repackaged from a container image 2026-10-03, see SPEC §2.4. Dashboard (Slice 4) is a separate long-running Fargate/App Runner service. |
+| Compute | **AWS Lambda** (zip code asset + dependency layer, outside VPC, **source editable in the console**) for the agent pipeline — revised from ECS Fargate, repackaged from a container image 2026-10-03, see SPEC §2.4. Dashboard (Slice 4) is a second zip Lambda (FastAPI + Mangum) behind API Gateway HTTP API — `DashboardStack`, declared last. |
 | Scheduling | EventBridge Scheduler → Lambda |
 | Secrets | SSM Parameter Store (SecureString) for API keys; AWS Secrets Manager for the Aurora DB credential (Step 2.12) |
 | IaC | AWS CDK (Python) + cdk-nag + `aws-cdk@aws-skills` plugin |
 | Local dev | LocalStack + docker-compose |
-| Dashboard | FastAPI + WebSocket + Postgres LISTEN/NOTIFY; React + TS + TradingView Lightweight Charts |
+| Dashboard | FastAPI on Lambda (Mangum) + HTTP API + Cognito JWT; React + TS + Vite SPA on S3/CloudFront, 60 s polling (design 2026-10-18) |
 | Notifications | Telegram via direct httpx (no library) |
 | Quality | ruff, mypy --strict, pytest, pre-commit |
 
@@ -106,7 +106,7 @@ Minutes are `:03` deliberately — avoids clock-jitter on `:00`. The Actions cro
 - **Slice 1 (Weeks 1-3): ✅ COMPLETE & DEPLOYED LIVE** (Steps 1.1–1.22). End-to-end substrate — multi-symbol watchlist, SMC-stub Analyzer, Telegram delivery from a scheduled **Lambda** (zip + layer, **ap-south-1**) + Aurora Serverless v2 via the RDS Data API. Verified end-to-end (Telegram confirmed 2026-06-12). **See [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md) for live resource IDs, gotchas, and open items.**
 - **Slice 2 (Weeks 4-7): ✅ COMPLETE** — Steps 2.1–2.14 on `main` (2.1–2.13 LIVE since 2026-06-27; Critic v0 / Step 2.14 merged via PR #12 on 2026-10-20). Full 4-agent pipeline + Forecaster + risk gates + multi-symbol + real SMC Analyzer are deployed. Step 2.14's manual review is automated: OutcomeResolver (Lambda) + DecisionReviewer/CriticReport (GitHub Actions `critic.yml`); the **Slice 2 exit gate is the first section of the backfill report** (`docs/critic-reports/<date>.md`). The first Critic backfill is pending on Anthropic credits (operator paused it).
 - **Slice 3 (Weeks 8-11):** Strategy registry + embeddings + Critic with PR opening.
-- **Slice 4 (Weeks 12-15): ⬅️ IN PROGRESS — Step 4.0 shipped; design `docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md` (serverless, read-only Phase 1).**
+- **Slice 4 (Weeks 12-15): ⬅️ IN PROGRESS — Step 4.0 shipped; Step 4.1 shipped: `DashboardStack` scaffold (`/api/health`); design `docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md` (serverless, read-only Phase 1; its §10 table is now SPEC §4 Slice 4).** Next: Step 4.2.
 
 **Open action items** (detail in `docs/PROJECT_STATE.md §7`): rotate the Anthropic + Telegram credentials (exposed in chat); set the git remote + configure CD secrets/vars/environments (region = ap-south-1). *(Resolved: the Aurora-resume retry in `DataApiSignalStore._execute` — shipped on `fix/aurora-resume-retry`.)*
 
