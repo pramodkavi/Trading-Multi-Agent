@@ -291,8 +291,24 @@ near zero when idle), Anthropic tokens (~5 scans/day), Lambda (negligible), S3.
 SSM standard parameters and the SNS/alarm path are free. Critic v0 (§7) records
 every review call's cost in `agent_runs` (`agent_role = 'critic'`) and stops a
 backfill after its first chunk until the operator confirms the extrapolated
-spend; the budget *alarm* (NFR-5.2) is still Slice 3. Watch the AWS Billing
-console; investigate if the monthly run-rate exceeds ~$10.
+spend.
+
+**AWS Budget guardrail** (`MonitoringStack`, `MonthlyCostBudget`): a **$15/month**
+COST budget on the account. It notifies the alarm SNS topic — the same path the
+CloudWatch alarms use, so the message lands in **Telegram** via the notifier
+Lambda — on two conditions:
+
+| Notification | Fires when | Meaning |
+|---|---|---|
+| ACTUAL > 80 % | month-to-date spend passes **$12** | something is already burning money |
+| FORECASTED > 100 % | AWS's month-end forecast passes **$15** | the trend will blow the budget |
+
+AWS Budgets data lags billing by **~8–12 hours** (budgets are evaluated a few
+times a day, not continuously), so this is a guardrail against runaway spend,
+not a real-time alarm — a stuck Aurora at max ACU can run for half a day before
+the message arrives. Still watch the AWS Billing console weekly; investigate if
+the monthly run-rate exceeds ~$10. Anthropic token spend is not in this budget
+(it is tracked in `agent_runs`, NFR-5.1).
 
 ---
 

@@ -188,6 +188,67 @@ def test_monitoring_provider_error_metric_filter(templates: dict[str, Any]) -> N
 
 
 # ---------------------------------------------------------------------------
+# MonitoringStack: $15/month AWS Budget -> alarm topic (dashboard design §9)
+# ---------------------------------------------------------------------------
+
+
+def test_monitoring_has_monthly_cost_budget(templates: dict[str, Any]) -> None:
+    templates["monitoring"].resource_count_is("AWS::Budgets::Budget", 1)
+    templates["monitoring"].has_resource_properties(
+        "AWS::Budgets::Budget",
+        {
+            "Budget": assertions.Match.object_like(
+                {
+                    "BudgetType": "COST",
+                    "TimeUnit": "MONTHLY",
+                    "BudgetLimit": {"Amount": 15, "Unit": "USD"},
+                }
+            ),
+            "NotificationsWithSubscribers": assertions.Match.array_with(
+                [
+                    assertions.Match.object_like(
+                        {
+                            "Notification": assertions.Match.object_like(
+                                {"NotificationType": "ACTUAL", "Threshold": 80}
+                            )
+                        }
+                    ),
+                    assertions.Match.object_like(
+                        {
+                            "Notification": assertions.Match.object_like(
+                                {"NotificationType": "FORECASTED", "Threshold": 100}
+                            )
+                        }
+                    ),
+                ]
+            ),
+        },
+    )
+
+
+def test_alarm_topic_allows_budgets_to_publish(templates: dict[str, Any]) -> None:
+    # AWS Budgets publishes to SNS as a service principal; without this topic
+    # policy the notification is silently dropped (no Telegram message).
+    templates["monitoring"].has_resource_properties(
+        "AWS::SNS::TopicPolicy",
+        {
+            "PolicyDocument": {
+                "Statement": assertions.Match.array_with(
+                    [
+                        assertions.Match.object_like(
+                            {
+                                "Principal": {"Service": "budgets.amazonaws.com"},
+                                "Action": "sns:Publish",
+                            }
+                        )
+                    ]
+                )
+            }
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # SchedulingStack: Critic v0 outcome resolver runs on rate(2 days) (Step 2.14)
 # ---------------------------------------------------------------------------
 
