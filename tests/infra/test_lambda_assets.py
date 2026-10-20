@@ -284,6 +284,59 @@ def test_run_pip_failure_message_includes_pips_stderr() -> None:
 
 
 # ---------------------------------------------------------------------------
+# deps_layer: CDK asset-staging cache must not merge layers with different extras
+# ---------------------------------------------------------------------------
+
+
+def test_deps_layer_with_different_extras_stages_a_different_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Found at the first Step 4.1 synth: CDK's AssetStaging caches on
+    # (source path + bundling-options fingerprint). Every layer shares the
+    # source path and the Python bundler object fingerprints identically
+    # whatever requirements it holds, so the dashboard layer silently reused
+    # the scan layer's output (no fastapi/mangum in it). Real CDK staging here,
+    # pip replaced by a marker-writing fake.
+    import aws_cdk as core
+    from aws_cdk import assertions
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _fake_repo(repo)
+    (repo / "pyproject.toml").write_text(PYPROJECT_WITH_EXTRAS)
+    (repo / "infrastructure").mkdir()
+    (repo / "infrastructure" / ".keep").write_text("")
+    monkeypatch.setattr(la, "REPO_ROOT", repo)
+
+    built: list[list[str]] = []
+
+    def fake_build_layer(output_dir: Path, requirements: list[str]) -> None:
+        built.append(list(requirements))
+        (output_dir / "python").mkdir(parents=True, exist_ok=True)
+        (output_dir / "python" / "REQS").write_text("\n".join(requirements))
+
+    monkeypatch.setattr(la, "build_layer", fake_build_layer)
+
+    app = core.App(outdir=str(tmp_path / "cdk.out"))
+    scan = core.Stack(app, "Scan")
+    dashboard = core.Stack(app, "Dashboard")
+    notifier = core.Stack(app, "Notifier")
+    la.deps_layer(scan, "DepsLayer")
+    la.deps_layer(dashboard, "DepsLayer", extras=("dashboard",))
+    la.deps_layer(notifier, "DepsLayer")
+
+    def layer_key(stack: core.Stack) -> str:
+        layers = assertions.Template.from_stack(stack).find_resources("AWS::Lambda::LayerVersion")
+        (props,) = layers.values()
+        return str(props["Properties"]["Content"]["S3Key"])
+
+    assert layer_key(scan) != layer_key(dashboard)
+    assert layer_key(scan) == layer_key(notifier)  # identical content still dedupes
+    assert len(built) == 2  # base once (shared), dashboard once
+    assert any("fastapi>=0.115" in reqs for reqs in built)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 

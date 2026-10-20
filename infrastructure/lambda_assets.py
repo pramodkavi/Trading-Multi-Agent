@@ -26,8 +26,9 @@ silently disappear.
 
 Both assets use the OUTPUT hash: the ~130 MB layer is re-uploaded only when the
 installed tree actually changes (pip runs each synth to find out), and a
-code-only deploy ships just the small zip. ``layer_asset_hash`` is kept as a
-cheap fingerprint of the requirement set for logging / tests.
+code-only deploy ships just the small zip. ``layer_asset_hash`` is a cheap
+fingerprint of the requirement set; ``deps_layer`` feeds it into the bundling
+options so CDK's staging cache keeps layers with different extras apart.
 """
 
 from __future__ import annotations
@@ -321,8 +322,18 @@ def deps_layer(
     fix in urllib3) is picked up and deployed without touching pyproject -- and
     the Trivy scan in CI sees the same resolve that ships. A CUSTOM hash keyed on
     the requirement list would freeze the deployed layer at first publish.
+
+    Staging-cache key: CDK bundles each (source path, bundling options) pair once
+    per synth and reuses the result for every later asset with the same key. All
+    layers share the source path and a ``_LayerBundler`` fingerprints the same
+    whatever requirements it holds, so without a distinguishing input a layer
+    WITH extras silently reuses the base layer's output (observed at the first
+    Step 4.1 synth: a dashboard layer with no fastapi in it). The requirement-set
+    fingerprint is therefore passed as a bundling environment variable: layers
+    with the same requirements still dedupe, different ones bundle separately.
     """
     requirements = read_layer_requirements(extras=extras)
+    bundling_env = {"LAYER_REQUIREMENTS_SHA256": layer_asset_hash(requirements)}
     description = (
         "crypto-signals runtime dependencies (pyproject [project].dependencies minus "
         + ", ".join(sorted(LAYER_EXCLUDES))
@@ -337,7 +348,9 @@ def deps_layer(
             str(REPO_ROOT / "infrastructure"),
             asset_hash_type=AssetHashType.OUTPUT,
             bundling=BundlingOptions(
-                image=RUNTIME.bundling_image, local=_LayerBundler(requirements)
+                image=RUNTIME.bundling_image,
+                local=_LayerBundler(requirements),
+                environment=bundling_env,
             ),
         ),
         compatible_runtimes=[RUNTIME],
