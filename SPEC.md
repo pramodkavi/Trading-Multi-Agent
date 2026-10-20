@@ -142,14 +142,16 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 | DB connectivity | RDS Data API (boto3 `rds-data`) | Lambda queries Aurora over HTTPS — no VPC attachment, therefore no NAT |
 | Future fan-out | AWS Step Functions (deferred) | If a later slice needs per-symbol parallelism beyond one Lambda's budget; not needed at Slice 1-2 scale |
 
-**Why the change from Fargate:** the original plan used "private subnets + VPC endpoints to avoid NAT," but VPC endpoints only reach *AWS* services — the task's heaviest egress is to *non-AWS* hosts (Binance/Anthropic/Telegram), which still requires a NAT (~$32/mo) or a public IP. Lambda-outside-VPC removes that dilemma entirely while also dropping the ECS cluster, task definitions, and the need to keep compute attached to the VPC. **The one workload that is not Lambda-friendly is the Slice 4 dashboard** — a long-running WebSocket service using Postgres LISTEN/NOTIFY needs a persistent connection, so it runs as a small always-on service (Fargate service or App Runner), decided in Slice 4, independent of the agent pipeline.
+**Why the change from Fargate:** the original plan used "private subnets + VPC endpoints to avoid NAT," but VPC endpoints only reach *AWS* services — the task's heaviest egress is to *non-AWS* hosts (Binance/Anthropic/Telegram), which still requires a NAT (~$32/mo) or a public IP. Lambda-outside-VPC removes that dilemma entirely while also dropping the ECS cluster, task definitions, and the need to keep compute attached to the VPC. The Slice 4 dashboard follows the same shape: a second zip-packaged Lambda (FastAPI via Mangum) behind an API Gateway HTTP API, polled by the SPA every 60 s — no always-on service (see §2.5 and `docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md`).
 
 ### 2.5 Dashboard Layer (Built in Slice 4)
 
 | Component | Technology | Rationale |
 |---|---|---|
-| Backend API | FastAPI | Same Python stack as agents; runs as a small **long-running service** (Fargate service or App Runner) — NOT Lambda, because WebSocket + Postgres LISTEN/NOTIFY need a persistent connection |
-| Real-time delivery | WebSocket + Postgres LISTEN/NOTIFY | Push state changes to dashboard |
+| Backend API | FastAPI on Lambda (Mangum) behind API Gateway HTTP API | Same packaging as the scan Lambda; pay-per-request; keeps Aurora scale-to-zero |
+| Real-time delivery | Client polling (60 s); no WebSocket | State changes ~8×/day; polling is indistinguishable in practice and costs nothing always-on |
+| Auth | Cognito user pool + API Gateway JWT authorizer | Validated before the Lambda runs; no auth code in Python |
+| API routing | CloudFront fronts /api/* to the HTTP API | SPA and API share one origin (no CORS) |
 | Frontend | React + TypeScript | Standard SPA stack |
 | Charts | TradingView Lightweight Charts | Industry standard for crypto; free; documented |
 | Frontend hosting | S3 + CloudFront | Standard static SPA deployment |
@@ -254,7 +256,7 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 **FR-7.4** The dashboard backend (FastAPI) shall read directly from Postgres. It shall NOT invoke the agent pipeline. Read and write paths are fully decoupled.
 
-**FR-7.5** Real-time updates shall use Postgres LISTEN/NOTIFY → FastAPI WebSocket → React frontend.
+**FR-7.5** Updates shall be reflected within 60 s via client polling (TanStack Query `refetchInterval`); no WebSocket / LISTEN-NOTIFY path is built.
 
 ### 3.3 Non-Functional Requirements
 
@@ -286,7 +288,7 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 **NFR-3.4** Dashboard authentication shall be implemented via AWS Cognito (single-user initially, extensible to multi-user later).
 
-**NFR-3.5** All inbound HTTPS traffic to the dashboard shall terminate at CloudFront with AWS WAF rules for basic protection.
+**NFR-3.5** All inbound traffic terminates at CloudFront over HTTPS. WAF is not deployed for the single-user deployment; revisit if the dashboard gains more users.
 
 #### 3.3.4 Performance
 
@@ -294,7 +296,7 @@ All data sources sit behind a uniform `DataProvider` interface. Agents never cal
 
 **NFR-4.2** Forecaster evaluation of a single active setup shall complete within 30 seconds.
 
-**NFR-4.3** Dashboard API responses shall be < 500ms for queries; WebSocket state updates shall be delivered within 2 seconds of the underlying state change.
+**NFR-4.3** Dashboard API responses shall be < 500ms for queries, except the first request after Aurora auto-pause, which may take up to 60 s and shall be surfaced to the user as a wake-up state, not an error.
 
 #### 3.3.5 Cost
 
@@ -777,98 +779,26 @@ The build is organized into **four vertical slices**. Each slice goes through th
 
 ---
 
-### Slice 4: Real-Time Dashboard (Weeks 12-15)
+### Slice 4: Web Dashboard (Weeks 12-15) — serverless, read-only Phase 1
 
-**Slice goal:** Build the FastAPI dashboard backend and React frontend. By end of slice, the user can watch the system in real time, trace signal lifecycles, and view performance analytics.
+**Slice goal:** Build the FastAPI dashboard backend and React frontend. By end of slice, the user can watch the system, trace signal lifecycles, and view performance analytics.
 
-#### Step 4.1: FastAPI service scaffolding
+> **Steps revised 2026-10-20.** The original Steps 4.1–4.11 (Fargate service + ALB, WebSocket + LISTEN/NOTIFY, WAF) are replaced by the build steps of `docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md` §10, reproduced below. Design §11 lists the matching amendments to §2.4, §2.5, FR-7.5, NFR-3.5 and NFR-4.3 (applied in Step 4.1). Each row is one session.
 
-- Create `src/dashboard/api/` directory
-- Initialize FastAPI app with health check endpoint
-- Add to existing Docker image with new entry point
-- Add a new CDK `DashboardStack` with a **Fargate service** (long-running, not a
-  scheduled task) for the dashboard backend — it needs a persistent DB
-  connection for LISTEN/NOTIFY, so it runs in the VPC alongside Aurora (unlike
-  the serverless agent pipeline)
-- Add internal Application Load Balancer
-- Deploy and verify the health check responds
-
-#### Step 4.2: Read-only repository extensions
-
-- Create `src/dashboard/api/repositories.py` with read-only methods optimized for dashboard queries
-- Implement: `list_active_setups`, `get_signal_lifecycle`, `get_performance_breakdown`
-- Add database indexes per query patterns
-- Add tests
-
-#### Step 4.3: REST endpoints
-
-- Implement `/api/active-setups` — list current open setups with latest evaluation
-- Implement `/api/signals/{id}/lifecycle` — full reasoning chain trace
-- Implement `/api/analytics/win-rate` — breakdowns by tag, session, strategy
-- Implement `/api/analytics/skeptic-value` — comparison of overruled vs respected
-- Add OpenAPI documentation
-- Add integration tests
-
-#### Step 4.4: WebSocket real-time updates
-
-- Add Postgres LISTEN/NOTIFY triggers on `signals`, `active_setups`, `agent_runs`
-- Implement FastAPI WebSocket endpoint `/ws/state`
-- Subscribe to Postgres NOTIFY channels in WebSocket handler
-- Push updates to connected clients
-- Add tests with WebSocket test client
-
-#### Step 4.5: Cognito authentication
-
-- Add AWS Cognito User Pool to CDK
-- Implement JWT verification middleware in FastAPI
-- Create single user manually in Cognito console
-- Protect all `/api/*` and `/ws/*` endpoints with auth
-- Test with valid and invalid tokens
-
-#### Step 4.6: React frontend scaffolding
-
-- Initialize React + TypeScript project in `dashboard-ui/`
-- Install: TradingView Lightweight Charts, react-router, TanStack Query, Tailwind CSS
-- Set up Cognito auth flow on frontend
-- Set up build pipeline
-- Deploy build artifacts to S3 + CloudFront via CDK
-
-#### Step 4.7: Live State view
-
-- Implement page: grid of watched symbols with current bias indicator
-- Embedded TradingView chart for each symbol
-- Overlay current active setup zones
-- Connect to WebSocket for live updates
-
-#### Step 4.8: Signal Lifecycle view
-
-- Implement page: search and select a signal by ID or recent
-- Render the full reasoning chain as a vertical timeline
-- For each agent step: show input, output, latency, token usage
-- Include direct link to Langfuse trace
-
-#### Step 4.9: Performance Analytics view
-
-- Implement page with multiple charts:
-  - Win rate over time (line chart)
-  - Win rate by tag (bar chart)
-  - Win rate by session (bar chart)
-  - Skeptic value analysis (when overruled vs respected — bar chart)
-  - Critic-proposed rule changes status (table)
-- Use Recharts or similar
-
-#### Step 4.10: WAF and CloudFront hardening
-
-- Add AWS WAF rules to CloudFront: rate limiting, geo restriction, basic SQL injection protection
-- Configure HTTPS-only with HSTS
-- Test from a non-allowed region (should be blocked)
-
-#### Step 4.11: End-to-end dashboard validation
-
-- Verify a new signal appearing in Postgres triggers WebSocket update within 2 seconds
-- Verify all three views render correctly with real data
-- Verify Cognito auth flow works on mobile
-- Document the dashboard in `docs/dashboard.md`
+| Step | Deliverable | Checkpoint |
+|---|---|---|
+| **pre** | Critic v0 merged to `main` (D2): operator applies the IAM grants, branch pushed, PR reviewed/merged, `critic.yml` backfill run. Not a Slice 4 step; a gate on starting one. | `critic.inventory.classify` importable from `main`; the three Critic tables present after a migrate invoke. |
+| **4.0** ✅ | Pipeline prerequisites: derive `ScanSession` from the clock and record it (D1); populate `agent_runs` latency/tokens/cost; new `setup_evaluations` table + Forecaster writes per-setup rows incl. `ERROR`; two indexes; `resume_attempts` store parameter; AWS Budget alarm. | Unit tests incl. the session boundaries and a Cooldown force-skip; after deploy + a console `{"mode":"migrate"}` invoke, the next scan writes a real session and non-zero cost, and the next sweep writes evaluation rows. |
+| **4.1** ✅ | `DashboardStack` scaffold: Lambda (FastAPI + Mangum, `/api/health` only), own layer via `lambda_assets.py` extras, HTTP API, log group, cdk-nag clean, stack added last in the deploy order (no SPA yet). | `GET /api/health` returns 200 from the API URL; synth test asserts resources. |
+| **4.2** | Read-only queries + `classify.py` + overview/setups/signals endpoints (P1–P3 data). | Unit tests on SQL shape and parsing for the Data API backend; asyncpg integration test opt-in. |
+| **4.3** | Funnel + analytics + system endpoints (P4, P6, P7 data) + klines proxy. | Same test pattern; `EXPLAIN` on the funnel query under 500 ms at 10 k signals (NFR-4.3). |
+| **4.4** | Cognito user pool + JWT authorizer wired; all routes protected except `/api/health`. | Token-less call → 401; valid token → 200. |
+| **4.5** | SPA scaffold: Vite/React/TS/Tailwind/TanStack Query/router, `config.json` loader, OIDC login, S3 + CloudFront + `BucketDeployment` (assets + `config.json`) in the stack, deploy workflow builds the SPA before `cdk deploy`, CI lints/type-checks. | Login → empty shell renders at the CloudFront URL on phone and laptop. |
+| **4.6** | P1 Overview + P7 Health pages. | Red/green badges reflect a forced-failed scan in the DB. |
+| **4.7** | P2 Signal detail + P3 Journal + Telegram deep links (pipeline-side env + formatter change). | A real signal's chain renders; Telegram message link opens it. |
+| **4.8** | P4 Funnel + P6 Analytics. | Charts render against live data; empty states for sparse data. |
+| **4.9** | P5 Live markets with charts and overlays. | Overlay lines match the open setup's numbers. |
+| **4.10** | Hardening + docs: 503-on-resuming handling, error/empty states, responsive pass, `docs/dashboard.md`, SPEC §11 amendments, PROJECT_STATE update. | All universal checkpoints (SPEC §5.1); cost check after one week of use. |
 
 ---
 
@@ -969,10 +899,10 @@ These are out of scope for the current build but should not require rework of Sl
 
 **End of Slice 4:**
 - Dashboard accessible at a CloudFront URL with HTTPS
-- Cognito auth flow works end-to-end
-- All three views render with real data
-- WebSocket updates arrive within 2 seconds of state changes
-- WAF blocks a test request from a non-allowed region
+- Cognito auth flow works end-to-end (phone + laptop)
+- All Phase 1 pages render with real data
+- A pipeline state change is visible on the Overview within 60 s
+- Added AWS cost < $1/month after one week of use (design §9)
 
 ---
 

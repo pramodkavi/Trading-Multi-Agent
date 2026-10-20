@@ -98,7 +98,7 @@ log level, optional Langfuse base URL for trace links) and never loads the agent
 The first query after idle hits `DatabaseResumingException` for ~10–15 s. The existing retry
 in `DataApiSignalStore._execute` waits up to 75 s, which is longer than API Gateway's hard
 30 s timeout. The dashboard therefore constructs the store with a **short resume budget**
-(new constructor parameter, e.g. `resume_retries=1`; the scan Lambda keeps the default) and
+(constructor parameter `resume_attempts=1`, shipped in Step 4.0; the scan Lambda keeps the default) and
 returns **HTTP 503 with `{"reason":"db_resuming"}`** when that budget is exhausted. The
 frontend shows a "waking the database…" state and retries with backoff for up to 60 s
 before showing an error. The Lambda timeout is 25 s.
@@ -373,14 +373,14 @@ Operator usage assumption: ~20 dashboard sessions/week, ~10 minutes each, 60 s p
 | **Total added** | **≈ $0.25–0.70** | vs. ≈ $12–15 for the SPEC's Fargate + ALB shape |
 
 Guardrail: an AWS Budget alert at **$15/month total** on the account (one CDK resource,
-free) — belongs to `MonitoringStack` and ships with Step 4.1.
+free) — belongs to `MonitoringStack`; shipped in Step 4.0.
 
 ## 10. Build steps (replaces SPEC §4 Steps 4.1–4.11; each is one session)
 
 | Step | Deliverable | Checkpoint |
 |---|---|---|
 | **pre** | Critic v0 merged to `main` (D2): operator applies the IAM grants, branch pushed, PR reviewed/merged, `critic.yml` backfill run. Not a Slice 4 step; a gate on starting one. | `critic.inventory.classify` importable from `main`; the three Critic tables present after a migrate invoke. |
-| **4.0** | Pipeline prerequisites: derive `ScanSession` from the clock and record it (D1); populate `agent_runs` latency/tokens/cost; new `setup_evaluations` table + Forecaster writes per-setup rows incl. `ERROR`; two indexes; `resume_retries` store parameter; AWS Budget alarm. | Unit tests incl. the session boundaries and a Cooldown force-skip; after deploy + a console `{"mode":"migrate"}` invoke, the next scan writes a real session and non-zero cost, and the next sweep writes evaluation rows. |
+| **4.0** | Pipeline prerequisites: derive `ScanSession` from the clock and record it (D1); populate `agent_runs` latency/tokens/cost; new `setup_evaluations` table + Forecaster writes per-setup rows incl. `ERROR`; two indexes; `resume_attempts` store parameter; AWS Budget alarm. | Unit tests incl. the session boundaries and a Cooldown force-skip; after deploy + a console `{"mode":"migrate"}` invoke, the next scan writes a real session and non-zero cost, and the next sweep writes evaluation rows. |
 | **4.1** | `DashboardStack` scaffold: Lambda (FastAPI + Mangum, `/api/health` only), own layer via `lambda_assets.py` extras, HTTP API, log group, cdk-nag clean, stack added last in the deploy order (no SPA yet). | `GET /api/health` returns 200 from the API URL; synth test asserts resources. |
 | **4.2** | Read-only queries + `classify.py` + overview/setups/signals endpoints (P1–P3 data). | Unit tests on SQL shape and parsing for the Data API backend; asyncpg integration test opt-in. |
 | **4.3** | Funnel + analytics + system endpoints (P4, P6, P7 data) + klines proxy. | Same test pattern; `EXPLAIN` on the funnel query under 500 ms at 10 k signals (NFR-4.3). |

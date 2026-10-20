@@ -6,7 +6,7 @@
 > **not** cloned, so everything durable has been written here instead. Read this file
 > first; it points to everything else.
 >
-> **Last updated:** 2026-10-20 (Critic v0 / Step 2.14 merged to `main` via PR #12; **Slice 4 started — Step 4.0 pipeline prerequisites shipped** on `feat/slice-4-step-4.0-pipeline-prereqs`, see §2).
+> **Last updated:** 2026-10-20 (Critic v0 / Step 2.14 merged to `main` via PR #12; Slice 4 Step 4.0 pipeline prerequisites shipped; **Step 4.1 `DashboardStack` scaffold shipped** on `feat/slice-4-step-4.1-dashboard-stack-scaffold` together with the design's SPEC §11 amendments, see §2).
 > **Authority order:** `SPEC.md` (authoritative spec) → `CLAUDE.md` (index/rules) → this file (current state).
 
 ---
@@ -38,7 +38,7 @@ UTC cron (crypto never closes). Full detail in `SPEC.md`; quick index in `CLAUDE
 
 ---
 
-## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Step 4.0 shipped (awaiting merge + deploy)**
+## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Steps 4.0 + 4.1 shipped (awaiting merge + deploy)**
 
 Slice 1 (1.1 → 1.22) and Slice 2 build steps **2.1 → 2.14** are done, on `main`, and
 **running in production** (ap-south-1). **Live-verified 2026-06-27:** a manual scan returned
@@ -143,9 +143,45 @@ the 10 minutes before a sweep** (i.e. not 07:55–08:05, 12:55–13:05, 14:55–
 UTC) and run migrate right after, or disable the `ForecasterSweep` EventBridge schedule until
 migrate is done. The CD
 pre-deploy migration still silently skips (OIDC role lacks `describe-stacks`, §7). Nothing in
-SPEC.md changed in this step — the design's SPEC amendments (§11) ship with Step 4.1. The asyncpg
+SPEC.md changed in this step — the design's SPEC amendments (§11) shipped with Step 4.1 (below). The asyncpg
 integration-test extension for the new table (`tests/integration/test_repositories_integration.py`)
 was written but **not executed** (no Docker on the build machine) — see §7.
+
+**Step 4.1 shipped — `DashboardStack` scaffold** (branch
+`feat/slice-4-step-4.1-dashboard-stack-scaffold`; design §10 row 4.1; plan
+`docs/superpowers/plans/2026-10-20-slice-4-step-4.1-dashboard-stack-scaffold.md`). The first
+piece of the serverless dashboard, **no live behaviour change to the pipeline** — the scan Lambda,
+its layer and the four pipeline stacks are untouched; the first deploy after merge simply
+**creates a sixth stack** (`cdk deploy --all`, no workflow change):
+
+1. **Packaging** — `pyproject.toml` `[project.optional-dependencies].dashboard = ["fastapi>=0.115",
+   "mangum>=0.19"]`; `infrastructure/lambda_assets.py::deps_layer(scope, id, *, extras=())` builds a
+   layer from the base deps ∪ named extras. CI installs `.[dev,dashboard]` and the Trivy freeze
+   scans the `--extra dashboard` superset. Local dev: `pip install -e ".[dev,dashboard]"`.
+2. **API** — `src/dashboard/api/`: `app.py` (`create_app()`, module-level Mangum `handler`),
+   `schemas.py` (`HealthResponse`), `routers/health.py` — `GET /api/health` →
+   `{"status":"ok","version":"<short git sha | 'dev'>"}`; touches **no DB and no AWS API**.
+   OpenAPI at `/api/openapi.json`, docs at `/api/docs`. `DashboardSettings` / `deps.py` /
+   `queries.py` / `classify.py` are deferred to Step 4.2.
+3. **Infra** — `infrastructure/stacks/dashboard_stack.py`, stack `CryptoSignals-Dashboard`,
+   declared **last** in `infrastructure/app.py`, coupled only to `DataStack` (cluster ARN + secret
+   ARN). Lambda `DashboardApi` (python3.11, 512 MB, 25 s, outside VPC, handler
+   `src.dashboard.api.app.handler`, env `PERSISTENCE_BACKEND=dataapi`, `DB_CLUSTER_ARN`,
+   `DB_SECRET_ARN`, `DB_NAME`, `APP_VERSION`, `LOG_LEVEL`), its own `DepsLayer` (~136 MB), log
+   groups `DashboardApiLogs` + `DashboardApiAccessLogs` (14 days), HTTP API
+   `crypto-signals-dashboard` with the single route `GET /api/health` (no authorizer — Step 4.4
+   adds the Cognito JWT authorizer), `$default` stage auto-deploy, access logging on, throttle
+   10 rps / burst 20. Role: Data API on the one cluster + its secret, logs write — no SSM/S3.
+   Outputs `DashboardApiUrl`, `DashboardFunctionName`. cdk-nag suppressions: IAM4 + L1 on the
+   function, APIG4 on the health route only. `APP_VERSION` = `GITHUB_SHA[:7]` on the runner,
+   `git rev-parse --short HEAD` locally, else `local`.
+4. **Docs** — the design's SPEC §11 amendments are applied: SPEC §2.4 / §2.5 / FR-7.5 / NFR-3.5 /
+   NFR-4.3 / §5.3 now describe the serverless shape, and SPEC §4 Slice 4 is the design §10 table
+   (4.0, 4.1 ✅). `CLAUDE.md` §4/§7 match. Runbook: `docs/operations.md §8`.
+
+Stack order is now `Network → Data → Compute → Scheduling → Monitoring → Dashboard`; CI's
+`python app.py` synth builds two layers (+~2 min). After the deploy, work through the 🟡 "Verify
+after deploy (Step 4.1)" row in §7 and record the URL + function name in §3.
 
 ---
 
@@ -164,6 +200,9 @@ was written but **not executed** (no Docker on the build machine) — see §7.
 | **DB secret ARN** | `arn:aws:secretsmanager:ap-south-1:097853039368:secret:crypto-signals/db-a3zZGW` |
 | **DB name** | `signals` |
 | **Lambda log group** | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-YGmufZcOKKgE` |
+| **Dashboard stack** | `CryptoSignals-Dashboard` (Step 4.1; **not yet deployed** — created by the first `cdk deploy --all` after the 4.1 merge). Runbook `docs/operations.md §8`. |
+| **Dashboard function name** | _fill in after first deploy_ — CloudFormation → `CryptoSignals-Dashboard` → Outputs → `DashboardFunctionName` |
+| **Dashboard API URL** | _fill in after first deploy_ — Outputs → `DashboardApiUrl`; smoke test `GET <url>/api/health` → `{"status":"ok","version":"<sha>"}`. Only `/api/health` exists until Step 4.2; no auth until Step 4.4. |
 | **Console editing** | The scan + notifier functions are zip-packaged: open **Code** in the Lambda console to read/edit `src/` and `scripts/`, Deploy, then Test (`docs/operations.md §4.1`). **Any `cdk deploy` overwrites console edits.** |
 | **Schedule** | EventBridge Scheduler `cron(3 8 * * ? *)` Etc/UTC, **ENABLED** (London open). NY/overlap/wrap/Critic windows added in later steps. |
 | **App secrets** | **Step 2.12 (code; activates on next deploy):** moved to **SSM Parameter Store SecureString** — `/crypto-signals/anthropic-api-key` (plain key string) and `/crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). Created out-of-band via `aws ssm put-parameter --type SecureString` (CFN can't create SecureString) — see `docs/operations.md §1`. Pre-2.12 these were Secrets Manager secrets (no leading slash); the 2.12 deploy removes them. The Aurora DB credential stays in Secrets Manager. |
@@ -188,7 +227,7 @@ git clone <your-remote-url> "Trading Multi Agent" && cd "Trading Multi Agent"
 
 # 2. Python env (PowerShell shown; bash analogous)
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip install -e ".[dev,dashboard]"   # dashboard extra = fastapi + mangum (Step 4.1)
 
 # 3. Pre-commit + sanity
 .\.venv\Scripts\python.exe -m pre_commit install
@@ -222,7 +261,9 @@ cd infrastructure
 export PATH="/<drive>/.../Trading Multi Agent/.venv/Scripts:$PATH"   # so `python app.py` finds aws-cdk-lib
 export JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION=1                  # silence Node-version banner
 python app.py
-#   ^ pip-installs the ~130 MB layer each synth (1-2 min); the code asset is 0.4 MB.
+#   ^ pip-installs the ~130 MB scan layer AND the ~136 MB dashboard layer each synth
+#     (3-4 min since Step 4.1); the code asset is 0.4 MB. A bare `python app.py` writes the
+#     cloud assembly to %TEMP%\cdk.outXXXX, not infrastructure/cdk.out.
 
 # DB migration over the Data API (idempotent).
 #   NOTE: as of Slice 2 the CD workflows run this AUTOMATICALLY before `cdk deploy`
@@ -267,6 +308,19 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
   re-commit.
 - **CI uses pinned pre-commit** for lint/format so "passes locally ⇒ passes in CI" (sidesteps
   the ruff skew). The bare YAML key `on:` parses to boolean `True` under PyYAML — harmless.
+- **CDK asset-staging cache ignores local-bundler state** (Step 4.1). Two `deps_layer` calls
+  with different `extras` produced the same asset cache key, so the second silently reused the
+  first's bundle — the dashboard layer had no `fastapi`/`mangum`. Fixed in
+  `infrastructure/lambda_assets.py` by putting `LAYER_REQUIREMENTS_SHA256` into the bundling
+  `environment` (regression test in `tests/infra/test_lambda_assets.py`). Rule: any future
+  bundler variant must put its distinguishing input into a serialisable `BundlingOptions` field.
+- **Mangum resolves the asyncio event loop at import** (`handler = Mangum(...)` in
+  `src/dashboard/api/app.py`). Correct on the Python 3.11 Lambda runtime; under pytest-asyncio
+  the tests in `tests/unit/test_dashboard_app.py` manage the loop with fixtures, and on Python
+  3.12+ `asyncio.get_event_loop()` would raise a DeprecationWarning under `filterwarnings=error`
+  — revisit when the runtime moves off 3.11.
+- **A bare `python app.py` synth writes to `%TEMP%\cdk.outXXXX`**, not `infrastructure/cdk.out`
+  — look there (or pass `--output`) when inspecting the synthesised templates.
 
 ---
 
@@ -292,6 +346,7 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | ✅ Done (Step 4.0) | ~~**`session` is hardcoded to `AD_HOC` in every scan**, so hard rule 7 (no new signals in Asian / Cooldown sessions) can never fire in production.~~ **Fixed (design §14 D1):** `src/common/sessions.py::session_for` derives `ScanSession` from the UTC clock at scan start and `run_one_symbol` stores it on `scan_runs.session`; rule 7 now force-skips with `RULE_7_SESSION_BLOCK`. **Live consequence: the 22:03 daily-wrap scan is review-only** (Cooldown). A console Test event may pass `"session": "AD_HOC"` to bypass for a smoke test (`docs/operations.md §4.1`). |
 | ✅ Done (Step 4.0) | ~~**Observability — Forecaster failures are invisible:** `Forecaster.run` swallowed per-setup exceptions, the Lambda returned `ok`, and no alarm fired.~~ **Fixed:** every per-setup exception now logs `PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` — the dedicated `ForecasterErrorAlarm` (metric filter on both terms, threshold 1/h) fires on the first one; the shared `ProviderErrorAlarm` counts it too — and journals a `setup_evaluations` row with `status='ERROR'`; every successful evaluation journals its verdict row too. Also closes the Step 2.7 deferral "per-agent token/cost on `agent_runs`": skeptic/judge rows now carry `latency_ms` / `token_usage` / `cost_usd` (`LlmUsage`). |
 | 🟡 Verify after deploy (Step 4.0) | Once the 4.0 PR is merged, deployed, **and the console `{"mode":"migrate"}` invoke has run** (ops §2.1): (a) the next scan's skeptic/judge `agent_runs` rows show non-zero `cost_usd` and `latency_ms`; (b) the next 22:05/08:05/13:05/15:05 sweep writes `setup_evaluations` rows (`SELECT count(*) FROM setup_evaluations`); (c) `scan_runs.session` shows a real window (`LONDON` / `NY` / `OVERLAP` / `COOLDOWN`), not `AD_HOC`; (d) if the 22:03 scan's Analyzer proposes, the `signals` row is `SKIPPED` with `payload->>'violated_rule' = 'RULE_7_SESSION_BLOCK'`. Read these through the AWS MCP Data API path (no local AWS CLI) and record the result here. |
+| 🟡 Verify after deploy (Step 4.1) | Once the 4.1 PR is merged and the Deploy (dev) run has created `CryptoSignals-Dashboard`: `GET <DashboardApiUrl>/api/health` returns 200 with the **merged short SHA** as `version`; CloudWatch shows the `DashboardApiAccessLogs` log group receiving a line per request **with real values, not all `-`** (CDK's default access-log format uses REST-era variables — if the fields are blank, switch to an HTTP-API-specific format in Step 4.4); record the URL + function name in §3. Runbook: `docs/operations.md §8`. |
 | 🟡 Test debt (Step 4.0) | Run `.\.venv\Scripts\python.exe -m pytest -m integration tests/integration/test_repositories_integration.py` the next time a local Postgres (Docker, port 5433) is available — the asyncpg `setup_evaluations` record/list round-trip was written in Step 4.0 but has never executed (no Docker on the build machine). |
 | 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |
 | ✅ Done | ~~Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking.~~ **Shipped (`fix/aurora-resume-retry`):** `_execute` retries `DatabaseResumingException` up to 6× with linear backoff (5/10/15/20/25s, ≤75s, well under the 10-min Lambda timeout). This was the production failure — every scheduled scan was dying on its first DB call (`start_scan`) because Aurora had scaled to zero, so no Telegram ever fired. Verified in the live Lambda logs (`log-events-viewer-result.csv`). |
@@ -300,15 +355,18 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 
 ## 8. What's next
 
-**Next step: Slice 4 Step 4.1 — `DashboardStack` scaffold**, per
-`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md §10` (the design replaces
-SPEC §4 Steps 4.1–4.11; serverless, read-only Phase 1). Deliverable: a new `DashboardStack` in
-`infrastructure/app.py` — API Lambda (FastAPI + Mangum, `/api/health` only), its own dependency
-layer via `lambda_assets.py` extras, HTTP API, log group, cdk-nag clean, added **last** in the
-deploy order; no SPA yet. Checkpoint: `GET /api/health` returns 200 from the API URL and a synth
-test asserts the resources. Step 4.1 also carries the design's SPEC amendments (§11). Before
-starting it: merge + deploy the Step 4.0 PR, run the console `{"mode":"migrate"}` invoke, and
-work through the 🟡 "Verify after deploy" row in §7.
+**Next step: Slice 4 Step 4.2 — read-only queries + endpoints**, per
+`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md §10` row 4.2 (now also
+SPEC §4 Slice 4; serverless, read-only Phase 1). Deliverable: the read-only query module
+(`src/dashboard/api/queries.py`) + `classify.py` (design §5.1 — decision classification is
+derived, not stored) + the overview / setups / signals endpoints (P1–P3 data, design §6.1), paged
+server-side (Data API 1 MB cap, design §3.4). Step 4.2 also creates `DashboardSettings` and
+`deps.py` (the per-request `DataApiSignalStore` built with `resume_attempts=1`, returning
+**503 `{"reason":"db_resuming"}`** while Aurora wakes) — both were deferred out of 4.1 because
+`/api/health` needs no DB. Checkpoint: unit tests on SQL shape and parsing for the Data API
+backend; asyncpg integration test opt-in. Before starting it: merge + deploy the 4.0 and 4.1
+PRs, run the console `{"mode":"migrate"}` invoke, and work through both 🟡 "Verify after
+deploy" rows in §7 (4.0 and 4.1), recording the dashboard URL + function name in §3.
 
 ### 8.1 Slice 2 progress log (Weeks 4–7, per `SPEC.md §4`) — historical
 

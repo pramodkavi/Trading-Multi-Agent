@@ -120,7 +120,10 @@ If synth fails with `AssetTooLargeError`, a dependency pushed the layer over the
 240 MB guard (or the code over 2.5 MB); the message names the largest packages.
 Trim the dependency or move it to an optional extra — do not raise the guard.
 
-Stacks (dependency order): `Network → Data → Compute → Scheduling → Monitoring`.
+Stacks (dependency order): `Network → Data → Compute → Scheduling → Monitoring → Dashboard`.
+`CryptoSignals-Dashboard` (Slice 4, §8) is declared last and depends only on `Data`;
+`cdk deploy --all` creates it on the first deploy after Step 4.1 merges — no workflow
+change. Synth now builds two dependency layers (scan + dashboard), adding ~2 min.
 First-time-on-this-account only: `cdk bootstrap` (already done for ap-south-1).
 
 > If switching off Secrets Manager for the first time, **create the SSM
@@ -478,3 +481,65 @@ FROM agent_runs WHERE agent_role = 'critic' GROUP BY 1 ORDER BY 1;
 | No PR, but the report is in the artifact | `gh pr create`/`push` failed — branch protection or missing `contents: write` | the job fails so it is visible; the report is also in `critic_reports`; fix and re-run (same-day re-run updates the same PR) |
 | No Telegram message but the PR exists | notifier failure is non-fatal by design | see the `telegram summary failed` traceback in the report step log; usually a bad `/crypto-signals/telegram-bot-token` |
 | Two runs at once | impossible by design (`concurrency: critic`) — the EventBridge resolver *may* overlap the Actions resolve loop | harmless: resolution is idempotent per decision |
+
+---
+
+## 8. Dashboard API (Slice 4)
+
+Design: `docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md`
+(serverless, read-only Phase 1; its §10 table is SPEC §4 Slice 4).
+
+### 8.1 What the stack is (Step 4.1 scaffold)
+
+`CryptoSignals-Dashboard` (`infrastructure/stacks/dashboard_stack.py`, declared
+**last** in `infrastructure/app.py`, coupled only to `CryptoSignals-Data` via the
+cluster ARN + DB secret ARN imports):
+
+| Resource | Detail |
+|---|---|
+| Lambda `DashboardApi` | python3.11, 512 MB, 25 s timeout, **outside the VPC**; handler `src.dashboard.api.app.handler` (FastAPI wrapped by Mangum); env `PERSISTENCE_BACKEND=dataapi`, `DB_CLUSTER_ARN`, `DB_SECRET_ARN`, `DB_NAME`, `APP_VERSION`, `LOG_LEVEL` |
+| Its own `DepsLayer` | built by `lambda_assets.deps_layer(..., extras=("dashboard",))` — base deps + `fastapi` + `mangum` (~136 MB); the scan Lambda's layer is unchanged |
+| HTTP API `crypto-signals-dashboard` | one route `GET /api/health` (no authorizer yet — Step 4.4 adds the Cognito JWT authorizer); `$default` stage, auto-deploy, throttle 10 rps / burst 20 |
+| Log groups | `DashboardApiLogs` (function) + `DashboardApiAccessLogs` (API access log), 14-day retention |
+| IAM role | RDS Data API on the one cluster + read of its secret, CloudWatch Logs write — **no SSM, no S3** |
+| Outputs | `DashboardApiUrl`, `DashboardFunctionName` |
+
+Nothing else is reachable until Step 4.2+ (queries + overview/setups/signals
+endpoints). In 4.1 **nothing in the stack touches Aurora** — the health route does
+not open a DB call, so browsing it never wakes the cluster. The Data API grant is
+in place for 4.2.
+
+### 8.2 Where the API URL is
+
+CloudFormation console → `CryptoSignals-Dashboard` → **Outputs** → `DashboardApiUrl`
+(and `DashboardFunctionName`); or the `cdk deploy` log of the Deploy (dev) run.
+Record both in `docs/PROJECT_STATE.md §3` after the first deploy.
+
+### 8.3 Smoke test
+
+```bash
+curl -s https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/health
+# → {"status":"ok","version":"<short sha>"}
+```
+
+`version` is the deployed commit: `GITHUB_SHA[:7]` when built on the runner
+(`git rev-parse --short HEAD` for a local synth, else `local`). It must match the
+merge commit that triggered the deploy — if it does not, the deploy picked up a
+stale asset. OpenAPI is served at `/api/openapi.json`, Swagger UI at `/api/docs`.
+
+A request also produces one line in `DashboardApiAccessLogs`; the fields should be
+real values, not all `-` (CDK's default access-log format uses REST-era variables —
+if they come out blank, switch to an HTTP-API-specific format in Step 4.4).
+
+### 8.4 Console editing
+
+The function is zip-packaged like the scan Lambda (§4.1): **Code** tab shows
+`src/dashboard/api/…`, Deploy, then call the URL. The same caveat applies — any
+`cdk deploy` replaces console edits with the git contents. There is no console
+**Test** event for an HTTP API Lambda worth saving; use the URL.
+
+### 8.5 Removal
+
+The stack is independent: deleting `CryptoSignals-Dashboard` in CloudFormation
+(or `cdk destroy CryptoSignals-Dashboard` from Actions) removes the API, function,
+layer and log groups without touching the pipeline stacks.
