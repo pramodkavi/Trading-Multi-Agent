@@ -1,7 +1,7 @@
 """MonitoringStack: CloudWatch alarms + Telegram alerting (Step 2.12).
 
-Implements the four alarms of NFR-2.2 (SPEC §3.3.2) and routes them to the
-operator's existing Telegram bot:
+Implements the four alarms of NFR-2.2 (SPEC §3.3.2) plus a dedicated Forecaster
+alarm (Step 4.0) and routes them to the operator's existing Telegram bot:
 
     CloudWatch Alarm -> SNS topic -> notifier Lambda -> Telegram sendMessage
 
@@ -18,6 +18,13 @@ Alarms:
      log group, because a true 1h *rate* is meaningless at this scan volume.
      The scan logs a ``PROVIDER_ERROR`` marker (scripts/run_scan.py) which the
      filter counts. Richer provider-error tracking lands in Step 2.13.
+  5. **Forecaster error** (Step 4.0, dashboard design §5.2) -- a second metric
+     filter on the same log group matching BOTH ``PROVIDER_ERROR`` and
+     ``provider=forecaster`` (the marker ``Forecaster.run`` logs per failed
+     setup), alarmed at >= 1 in 1h. Alarm 4 counts these markers too, but needs
+     3 in an hour; the Forecaster emits at most one per open setup per sweep and
+     the concurrency cap is 3 setups, so with 1-2 open setups a dead Anthropic
+     key would never trip it. One failure is enough at this volume.
 
 The notifier Lambda ships as a zip of the same ``src/`` + ``scripts/`` code asset
 as the scan Lambda (handler overridden to ``scripts.alarm_notifier.lambda_handler``)
@@ -68,12 +75,18 @@ PROVIDER_ERROR_NAMESPACE = "CryptoSignals"
 PROVIDER_ERROR_METRIC = "ProviderErrors"
 # The marker scripts/run_scan.py logs when a provider call raises ProviderError.
 PROVIDER_ERROR_MARKER = "PROVIDER_ERROR"
+# The marker Forecaster.run logs per failed setup (Step 4.0); both terms must match.
+FORECASTER_ERROR_MARKER_TERMS = ("PROVIDER_ERROR", "provider=forecaster")
+FORECASTER_ERROR_METRIC = "ForecasterErrors"
 
 # Alarm thresholds (NFR-2.2).
 SCAN_FAILURE_RATE_PCT = 10
 LATENCY_P95_MS = 120_000  # 2 minutes
 AURORA_CPU_PCT = 80
 PROVIDER_ERROR_COUNT_1H = 3
+# One Forecaster failure per hour is enough: at most one marker per open setup per
+# sweep (cap 3), so the shared threshold of 3 is unreachable with 1-2 open setups.
+FORECASTER_ERROR_COUNT_1H = 1
 
 # Monthly AWS cost guardrail (dashboard design §9). Notifies at 80% actual and
 # 100% forecasted; AWS Budgets data lags billing by several hours.
@@ -113,6 +126,7 @@ class MonitoringStack(Stack):
             self._latency_p95_alarm(scan_function),
             self._aurora_cpu_alarm(cluster),
             self._provider_error_alarm(scan_log_group),
+            self._forecaster_error_alarm(scan_log_group),
         ]
         for alarm in self.alarms:
             alarm.add_alarm_action(cw_actions.SnsAction(self.topic))
@@ -248,6 +262,36 @@ class MonitoringStack(Stack):
                 "expressed as a count at this scan volume)."
             ),
             threshold=PROVIDER_ERROR_COUNT_1H,
+            evaluation_periods=1,
+            comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+            treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,
+        )
+
+    def _forecaster_error_alarm(self, scan_log_group: logs.ILogGroup) -> cloudwatch.Alarm:
+        logs.MetricFilter(
+            self,
+            "ForecasterErrorMetricFilter",
+            log_group=scan_log_group,
+            filter_pattern=logs.FilterPattern.all_terms(*FORECASTER_ERROR_MARKER_TERMS),
+            metric_namespace=PROVIDER_ERROR_NAMESPACE,
+            metric_name=FORECASTER_ERROR_METRIC,
+            metric_value="1",
+            default_value=0,
+        )
+        metric = cloudwatch.Metric(
+            namespace=PROVIDER_ERROR_NAMESPACE,
+            metric_name=FORECASTER_ERROR_METRIC,
+            statistic="Sum",
+            period=Duration.hours(1),
+        )
+        return metric.create_alarm(
+            self,
+            "ForecasterErrorAlarm",
+            alarm_description=(
+                "Forecaster per-setup failure (LLM/provider/notifier) in the last hour "
+                "— one is enough at this volume (design §5.2 / Step 4.0)"
+            ),
+            threshold=FORECASTER_ERROR_COUNT_1H,
             evaluation_periods=1,
             comparison_operator=cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
             treat_missing_data=cloudwatch.TreatMissingData.NOT_BREACHING,

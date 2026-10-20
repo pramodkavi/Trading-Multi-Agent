@@ -114,12 +114,12 @@ def test_compute_stack_owns_the_dependency_layer(templates: dict[str, Any]) -> N
 
 
 # ---------------------------------------------------------------------------
-# MonitoringStack: 4 alarms + SNS -> notifier Lambda + provider-error filter
+# MonitoringStack: 5 alarms + SNS -> notifier Lambda + provider-error filters
 # ---------------------------------------------------------------------------
 
 
-def test_monitoring_has_four_alarms(templates: dict[str, Any]) -> None:
-    templates["monitoring"].resource_count_is("AWS::CloudWatch::Alarm", 4)
+def test_monitoring_has_five_alarms(templates: dict[str, Any]) -> None:
+    templates["monitoring"].resource_count_is("AWS::CloudWatch::Alarm", 5)
 
 
 def test_monitoring_has_sns_topic_and_lambda_subscription(templates: dict[str, Any]) -> None:
@@ -166,7 +166,7 @@ def test_monitoring_notifier_reads_telegram_param(templates: dict[str, Any]) -> 
 
 
 def test_monitoring_provider_error_metric_filter(templates: dict[str, Any]) -> None:
-    templates["monitoring"].resource_count_is("AWS::Logs::MetricFilter", 1)
+    templates["monitoring"].resource_count_is("AWS::Logs::MetricFilter", 2)
     templates["monitoring"].has_resource_properties(
         "AWS::Logs::MetricFilter",
         assertions.Match.object_like(
@@ -182,6 +182,44 @@ def test_monitoring_provider_error_metric_filter(templates: dict[str, Any]) -> N
                         )
                     ]
                 ),
+            }
+        ),
+    )
+
+
+def test_monitoring_forecaster_error_metric_filter_and_alarm(templates: dict[str, Any]) -> None:
+    # Final-review fix (Step 4.0): the shared ProviderErrorAlarm needs >= 3
+    # markers in an hour, but the Forecaster emits at most one per open setup
+    # per sweep (cap 3), so a dead Anthropic key with 1-2 open setups would never
+    # alarm. A dedicated filter on BOTH terms + a threshold-1 alarm closes that.
+    templates["monitoring"].has_resource_properties(
+        "AWS::Logs::MetricFilter",
+        assertions.Match.object_like(
+            {
+                "FilterPattern": assertions.Match.string_like_regexp(
+                    "PROVIDER_ERROR.*provider=forecaster"
+                ),
+                "MetricTransformations": assertions.Match.array_with(
+                    [
+                        assertions.Match.object_like(
+                            {
+                                "MetricNamespace": "CryptoSignals",
+                                "MetricName": "ForecasterErrors",
+                            }
+                        )
+                    ]
+                ),
+            }
+        ),
+    )
+    templates["monitoring"].has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        assertions.Match.object_like(
+            {
+                "Namespace": "CryptoSignals",
+                "MetricName": "ForecasterErrors",
+                "Threshold": 1,
+                "ComparisonOperator": "GreaterThanOrEqualToThreshold",
             }
         ),
     )

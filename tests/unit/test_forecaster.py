@@ -122,10 +122,14 @@ class FakeStore:
         self.updated: list[tuple[UUID, ActiveSetupStatus, dict[str, Any] | None]] = []
         self.outcomes: list[tuple[UUID, SignalOutcome]] = []
         # setup_evaluations rows (Step 4.0); set fail_record to simulate a DB
-        # write failure on the ERROR-row write in run() (verdict rows still land,
-        # so the test pins "the ERROR-row write failing must not abort the run").
+        # write failure for the statuses in fail_record_statuses. Default scope is
+        # the ERROR-row write in run() (verdict rows still land, so the test pins
+        # "the ERROR-row write failing must not abort the run"); widen it to a
+        # verdict status to simulate the deploy->migrate window where the
+        # setup_evaluations table does not exist yet.
         self.evaluations: list[dict[str, Any]] = []
         self.fail_record = False
+        self.fail_record_statuses: set[SetupEvaluationStatus] = {SetupEvaluationStatus.ERROR}
 
     async def list_open_active_setups(self) -> list[StoredActiveSetup]:
         return list(self._setups)
@@ -153,9 +157,7 @@ class FakeStore:
         self.outcomes.append((signal_id, outcome))
 
     async def record_setup_evaluation(self, **kwargs: Any) -> UUID:
-        # Scoped to ERROR rows: a failing verdict-row write propagates out of
-        # _evaluate_one by design (ruling 1), which is a different scenario.
-        if self.fail_record and kwargs["status"] is SetupEvaluationStatus.ERROR:
+        if self.fail_record and kwargs["status"] in self.fail_record_statuses:
             raise RuntimeError("db down")
         self.evaluations.append(kwargs)
         return uuid4()
@@ -498,6 +500,51 @@ async def test_notifier_failure_cannot_mask_the_journaled_verdict(
     assert "telegram down" in store.evaluations[1]["error"]
     assert any("PROVIDER_ERROR provider=forecaster" in r.getMessage() for r in caplog.records)
     # The failed look is not reported as a produced verdict (run() contract unchanged).
+    assert updates == []
+
+
+async def test_verdict_row_failure_still_notifies_and_surfaces_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Final-review fix: journaling must never cost the operator an alert.
+
+    In the deploy->migrate window ``setup_evaluations`` may not exist yet, so the
+    verdict-row write raises. The verdict has already taken effect; the operator
+    may be in the trade -- the INVALIDATED/AT_RISK Telegram alert must still go
+    out, and the journaling failure must still surface to run() (marker + ERROR
+    row attempt) so the outage stays visible.
+    """
+    proposal = _proposal()
+    signal = _stored_signal(proposal)
+    setup = _setup(signal.id)
+    store = FakeStore([setup], {signal.id: signal})
+    store.fail_record = True
+    store.fail_record_statuses = {SetupEvaluationStatus.INVALIDATED, SetupEvaluationStatus.ERROR}
+    notifier = _notifier()
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=notifier,
+        client=_client([_response(_INVALIDATED_LOSS)]),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.agents.forecaster.forecaster"):
+        updates = await forecaster.run()  # must not raise
+
+    # The alert still reached the operator...
+    notifier.send.assert_awaited_once()
+    # ...the verdict took effect...
+    assert store.updated[0][1] is ActiveSetupStatus.LOSS
+    assert store.outcomes == [(signal.id, SignalOutcome.LOSS)]
+    # ...no row could be journaled (table missing), and the failure is visible.
+    assert store.evaluations == []
+    assert any("PROVIDER_ERROR provider=forecaster" in r.getMessage() for r in caplog.records)
+    journal = [
+        r for r in caplog.records if "failed to journal forecaster verdict" in r.getMessage()
+    ]
+    assert len(journal) == 1 and journal[0].levelno == logging.ERROR
+    assert str(setup.id) in journal[0].getMessage()
+    # run() contract unchanged: a failed look is not reported as a produced verdict.
     assert updates == []
 
 
