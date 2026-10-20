@@ -40,7 +40,7 @@ UTC cron (crypto never closes). Full detail in `SPEC.md`; quick index in `CLAUDE
 
 ## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Step 4.0 shipped (awaiting merge + deploy)**
 
-Slice 1 (1.1 → 1.22) and Slice 2 build steps **2.1 → 2.13** are done, on `main`, and
+Slice 1 (1.1 → 1.22) and Slice 2 build steps **2.1 → 2.14** are done, on `main`, and
 **running in production** (ap-south-1). **Live-verified 2026-06-27:** a manual scan returned
 `{"ok": true}` for all 4 watchlist symbols **scanned in parallel**, signals persisted to
 Aurora, and Telegram delivered. (Slice-1 Telegram first confirmed 2026-06-12.)
@@ -116,10 +116,13 @@ pipeline-side changes the serverless dashboard needs before Step 4.1 builds the 
    `StoredSetupEvaluation`, `record_setup_evaluation` / `list_setup_evaluations` on both store
    backends. Data-API migration statement count 26 → 31; `EXPECTED_TABLES` is 8 tables.
 4. **Forecaster journals every evaluation** — one verdict row per evaluated setup (persisted
-   before the Telegram notify, so a notify failure cannot mask it) and an `ERROR` row for
-   orphans and for any per-setup exception; per-setup failures log the
-   `PROVIDER_ERROR provider=forecaster` marker so the existing `ProviderErrorAlarm` fires
-   (closes the "Forecaster failures are invisible" finding).
+   before the Telegram notify, so a notify failure cannot mask it; a failed verdict-row write
+   is deferred so the alert still goes out, then re-raised) and an `ERROR` row for orphans
+   and for any per-setup exception; per-setup failures log the
+   `PROVIDER_ERROR provider=forecaster` marker. A **dedicated `ForecasterErrorAlarm`**
+   (metric filter on both terms, threshold 1 per hour) fires on the first such failure — the
+   shared `ProviderErrorAlarm` still counts the markers too, but its threshold of 3 is
+   unreachable with 1–2 open setups (closes the "Forecaster failures are invisible" finding).
 5. **`DataApiSignalStore(..., resume_attempts=6)` / `from_arns(..., resume_attempts=)`** — the
    Aurora resume-retry budget is a parameter (default unchanged; the dashboard API will pass
    `1` because an HTTP request cannot wait ~75 s).
@@ -130,7 +133,15 @@ pipeline-side changes the serverless dashboard needs before Step 4.1 builds the 
 
 **⚠️ After deploy: invoke `{"mode":"migrate"}` from the Lambda console (`docs/operations.md
 §2.1`) before the next Forecaster sweep (22:05 / 08:05 / 13:05 / 15:05 UTC), or
-`record_setup_evaluation` will fail on the missing `setup_evaluations` table.** The CD
+`record_setup_evaluation` will fail on the missing `setup_evaluations` table.** Until the
+migrate invoke runs, every sweep writes **no** `setup_evaluations` rows and journals each
+open setup as a failure — `PROVIDER_ERROR provider=forecaster` is logged per setup and
+`ForecasterErrorAlarm` **will fire on Telegram (expected, not an outage)** — but the verdicts
+still take effect and AT_RISK / INVALIDATED alerts still reach Telegram (the verdict-row write
+is deferred, never allowed to suppress the alert). To avoid the noise, merge/deploy **outside
+the 10 minutes before a sweep** (i.e. not 07:55–08:05, 12:55–13:05, 14:55–15:05, 21:55–22:05
+UTC) and run migrate right after, or disable the `ForecasterSweep` EventBridge schedule until
+migrate is done. The CD
 pre-deploy migration still silently skips (OIDC role lacks `describe-stacks`, §7). Nothing in
 SPEC.md changed in this step — the design's SPEC amendments (§11) ship with Step 4.1. The asyncpg
 integration-test extension for the new table (`tests/integration/test_repositories_integration.py`)
@@ -276,10 +287,10 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | 🔴 **Security** | **Rotate the Anthropic API key and Telegram bot token** — both appeared in chat across sessions. As of Step 2.12 these live in **SSM Parameter Store**: `aws ssm put-parameter --overwrite --type SecureString --name /crypto-signals/anthropic-api-key --value '<key>'` and `... --name /crypto-signals/telegram-bot-token --value '{"bot_token":"<t>","chat_id":"8300889332"}'` (region ap-south-1). Lambda picks them up on next cold start (no redeploy). Also rotate the local `.env`. Full procedure: `docs/operations.md §1.2`. |
 | 🟠 Infra/CD | No git remote was set when Slice 1 finished — once pushed, configure CD: GitHub repo secrets `AWS_DEPLOY_ROLE_ARN`/`AWS_PROD_DEPLOY_ROLE_ARN`, vars `AWS_REGION`/`AWS_PROD_REGION` **= ap-south-1**, Environments `dev` + `production` (required reviewers), and an OIDC IdP + deploy roles in AWS. See `.github/workflows/deploy-*.yml` headers. **(done for dev — OIDC live.)** |
 | 🟠 Infra/CD | **OIDC deploy-role grants (blocks the first Critic run AND the CD auto-migration):** the role behind `AWS_DEPLOY_ROLE_ARN` needs `cloudformation:DescribeStacks` on `CryptoSignals-Data` + `CryptoSignals-Compute`; `lambda:InvokeFunction` on the scan Lambda; `rds-data:ExecuteStatement` + `rds-data:BatchExecuteStatement` on the cluster ARN; `secretsmanager:GetSecretValue` on the DB secret; `ssm:GetParameter` on `/crypto-signals/anthropic-api-key` and `/crypto-signals/telegram-bot-token` (no `kms:Decrypt` needed with the default `aws/ssm` key). **Exact JSON policy: `docs/operations.md §7.4`.** Until attached, `critic.yml` fails in its `cfg` step and the deploy migration keeps silently skipping (`{"mode":"migrate"}` escape hatch). |
-| 🟠 Critic v0 | **Run the first backfill** once the grants are in: `gh workflow run critic.yml -f mode=backfill` → read the `::notice::` cost estimate → re-dispatch with `-f confirm_cost=true` → review the `Critic report <date>` PR; its first section is the Slice 2 exit gate. Then merge `feat/slice-2-step-2.14-critic-v0` (deploys the `rate(2 days)` resolver schedule). |
+| 🟠 Critic v0 | **Run the first backfill** — `feat/slice-2-step-2.14-critic-v0` is **merged (PR #12, 2026-10-20)**, so the `rate(2 days)` resolver schedule deploys with `main`. The backfill is **paused pending Anthropic credits**: the 2026-10-19 attempt failed on "credit balance is too low". Once topped up: `gh workflow run critic.yml -f mode=backfill` → read the `::notice::` cost estimate → re-dispatch with `-f confirm_cost=true` → review the `Critic report <date>` PR; its first section is the Slice 2 exit gate. |
 | 🟡 Finding (2.14) | **Judge vetoes are stored as `signals.status = 'PUBLISHED'`.** `run_scan._persist` writes `PUBLISHED` for any proposal payload; only the presence of an `active_setups` row says whether it was actually published. Critic v0 works around it (`inventory.classify` is Judge-veto aware; the gate counts published = has setup row). Fix: a `VETOED` status (or set `SKIPPED` on `ruling == SKIP`) in a follow-up step; the schema/gate read paths must keep accepting the historical rows. |
 | ✅ Done (Step 4.0) | ~~**`session` is hardcoded to `AD_HOC` in every scan**, so hard rule 7 (no new signals in Asian / Cooldown sessions) can never fire in production.~~ **Fixed (design §14 D1):** `src/common/sessions.py::session_for` derives `ScanSession` from the UTC clock at scan start and `run_one_symbol` stores it on `scan_runs.session`; rule 7 now force-skips with `RULE_7_SESSION_BLOCK`. **Live consequence: the 22:03 daily-wrap scan is review-only** (Cooldown). A console Test event may pass `"session": "AD_HOC"` to bypass for a smoke test (`docs/operations.md §4.1`). |
-| ✅ Done (Step 4.0) | ~~**Observability — Forecaster failures are invisible:** `Forecaster.run` swallowed per-setup exceptions, the Lambda returned `ok`, and no alarm fired.~~ **Fixed:** every per-setup exception now logs `PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` (the existing `ProviderErrorAlarm` metric filter catches it) and journals a `setup_evaluations` row with `status='ERROR'`; every successful evaluation journals its verdict row too. Also closes the Step 2.7 deferral "per-agent token/cost on `agent_runs`": skeptic/judge rows now carry `latency_ms` / `token_usage` / `cost_usd` (`LlmUsage`). |
+| ✅ Done (Step 4.0) | ~~**Observability — Forecaster failures are invisible:** `Forecaster.run` swallowed per-setup exceptions, the Lambda returned `ok`, and no alarm fired.~~ **Fixed:** every per-setup exception now logs `PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` — the dedicated `ForecasterErrorAlarm` (metric filter on both terms, threshold 1/h) fires on the first one; the shared `ProviderErrorAlarm` counts it too — and journals a `setup_evaluations` row with `status='ERROR'`; every successful evaluation journals its verdict row too. Also closes the Step 2.7 deferral "per-agent token/cost on `agent_runs`": skeptic/judge rows now carry `latency_ms` / `token_usage` / `cost_usd` (`LlmUsage`). |
 | 🟡 Verify after deploy (Step 4.0) | Once the 4.0 PR is merged, deployed, **and the console `{"mode":"migrate"}` invoke has run** (ops §2.1): (a) the next scan's skeptic/judge `agent_runs` rows show non-zero `cost_usd` and `latency_ms`; (b) the next 22:05/08:05/13:05/15:05 sweep writes `setup_evaluations` rows (`SELECT count(*) FROM setup_evaluations`); (c) `scan_runs.session` shows a real window (`LONDON` / `NY` / `OVERLAP` / `COOLDOWN`), not `AD_HOC`; (d) if the 22:03 scan's Analyzer proposes, the `signals` row is `SKIPPED` with `payload->>'violated_rule' = 'RULE_7_SESSION_BLOCK'`. Read these through the AWS MCP Data API path (no local AWS CLI) and record the result here. |
 | 🟡 Test debt (Step 4.0) | Run `.\.venv\Scripts\python.exe -m pytest -m integration tests/integration/test_repositories_integration.py` the next time a local Postgres (Docker, port 5433) is available — the asyncpg `setup_evaluations` record/list round-trip was written in Step 4.0 but has never executed (no Docker on the build machine). |
 | 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |

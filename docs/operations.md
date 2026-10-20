@@ -166,17 +166,21 @@ No manual SNS subscription is needed — CDK wires it.
 | `ScanLatencyP95Alarm` | scan p95 duration > 2 min | Lambda Duration p95 |
 | `AuroraCpuAlarm` | Aurora CPU > 80% for 15 min | RDS CPUUtilization |
 | `ProviderErrorAlarm` | ≥ 3 provider errors in 1h | Logs metric filter on `PROVIDER_ERROR` |
+| `ForecasterErrorAlarm` | ≥ 1 Forecaster per-setup failure in 1h | Logs metric filter on `PROVIDER_ERROR` + `provider=forecaster` |
 
 **Low-volume note:** at ~5 scans/day the failure-rate and provider-error alarms are
 effectively "any failure/several provider errors today" — intended sensitivity for
 a system the operator trades from. Richer provider-error tracking lands in Step 2.13.
 
-`ProviderErrorAlarm` also fires on Forecaster per-setup failures (Step 4.0): the
-sweep runs in the same Lambda/log group and logs the marker
+Forecaster per-setup failures (Step 4.0): the sweep runs in the same Lambda/log
+group and logs the marker
 `PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` for every setup
-whose evaluation raises (and journals an `ERROR` row in `setup_evaluations`), so a
-dead Anthropic key or exhausted credit is alarmed within the hour instead of
-silently skipping every open setup four times a day.
+whose evaluation raises (and journals an `ERROR` row in `setup_evaluations`). The
+dedicated `ForecasterErrorAlarm` fires on the **first** such failure in an hour —
+the Forecaster emits at most one marker per open setup per sweep (cap 3), so the
+shared threshold of 3 is unreachable with 1–2 open setups and a dead Anthropic key
+or exhausted credit would otherwise never alarm. The shared `ProviderErrorAlarm`
+still counts these markers too.
 
 ### Test alarm firing (deliberate failure)
 
