@@ -38,6 +38,7 @@ from src.agents.orchestration.risk_gates import RiskGateReport, make_risk_gate_n
 from src.agents.skeptic import SkepticObjection, make_skeptic_node
 from src.common.models import (
     JudgeRuling,
+    LlmUsage,
     ScanContext,
     SignalProposal,
     SkipDecision,
@@ -82,10 +83,20 @@ class AgentState(TypedDict, total=False):
                            when macro is unavailable (FR-4.3 -> Judge downgrades
                            confidence to medium), or None for skips / when the
                            node is not wired. Edge added in Step 2.7.
+        skeptic_usage    : set by the skeptic node (Step 4.0, design §5.2): the
+                           LlmUsage (model / tokens / cost / latency / attempts)
+                           of its Claude call, persisted to agent_runs by the
+                           scan runner (NFR-2.3). None when no call was made --
+                           the NoMacroData short circuit, skips, or an unwired
+                           node.
         judge_decision   : set by the judge node (Step 2.6's make_judge_node):
                            the full JudgeDecision (ruling + confidence +
                            reasoning + caveat), or None for skips / when the node
                            is not wired. Edge added in Step 2.7.
+        judge_usage      : set by the judge node (Step 4.0, design §5.2): the
+                           LlmUsage of its Claude call, persisted to agent_runs
+                           (NFR-2.3). None for skips / when the node is not
+                           wired; always present alongside a judge_decision.
         risk_gate_report : set by the risk-gate node (Step 2.11's
                            make_risk_gate_node): the full RiskGateReport (one
                            entry per SPEC §1.6 hard rule). None for analyzer
@@ -107,7 +118,9 @@ class AgentState(TypedDict, total=False):
     proposal: SignalProposal | SkipDecision | None
     historian_report: HistorianReport | None
     skeptic_objection: SkepticObjection | NoMacroData | None
+    skeptic_usage: LlmUsage | None
     judge_decision: JudgeDecision | None
+    judge_usage: LlmUsage | None
     risk_gate_report: RiskGateReport | None
     rejected_proposal: SignalProposal | None
     decision: JudgeRuling | None

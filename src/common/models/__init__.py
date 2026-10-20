@@ -16,8 +16,12 @@ Public API:
     ScanSession     -- which scheduler window triggered the scan
     ScanStatus      -- persisted scan_runs row status (RUNNING/SUCCESS/FAILED)
     ActiveSetupStatus -- OPEN + terminal lifecycle of an active_setups row
+    SetupEvaluationStatus -- ForecastStatus + ERROR for a setup_evaluations row
+                       (Step 4.0, design §5.2)
     AgentRole       -- the six agent roles referenced by agent_runs
     ScanContext     -- per-scan metadata propagated through every agent
+    LlmUsage        -- tokens / cost / latency of one agent LLM call, carried
+                       through AgentState into agent_runs (NFR-2.3, design §5.2)
 """
 
 from src.common.models.enums import (
@@ -29,10 +33,12 @@ from src.common.models.enums import (
     ObjectionSeverity,
     ScanSession,
     ScanStatus,
+    SetupEvaluationStatus,
     SignalDirection,
     SignalOutcome,
     SignalStatus,
 )
+from src.common.models.llm_usage import LlmUsage
 from src.common.models.scan_context import ScanContext
 from src.common.models.signal_proposal import SignalProposal
 from src.common.models.skip_decision import SkipDecision, SkipReason
@@ -43,10 +49,12 @@ __all__ = [
     "ForecastStatus",
     "JudgeConfidence",
     "JudgeRuling",
+    "LlmUsage",
     "ObjectionSeverity",
     "ScanContext",
     "ScanSession",
     "ScanStatus",
+    "SetupEvaluationStatus",
     "SignalDirection",
     "SignalOutcome",
     "SignalProposal",

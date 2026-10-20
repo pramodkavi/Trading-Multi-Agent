@@ -16,7 +16,7 @@ from types import TracebackType
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
-from src.common.models import AgentRole
+from src.common.models import AgentRole, SetupEvaluationStatus
 from src.persistence.store import AsyncpgSignalStore
 
 
@@ -143,6 +143,35 @@ async def test_get_agent_run_returns_none_when_absent() -> None:
     store, conn = _store()
     assert await store.get_agent_run(uuid4()) is None
     conn.fetchrow.assert_awaited_once()
+
+
+# ---- setup_evaluations (Slice 4 Step 4.0) -- forwards to SetupEvaluationRepository
+
+
+async def test_record_setup_evaluation_forwards_to_repository() -> None:
+    from uuid import UUID
+
+    store, conn = _store()
+    eval_id = await store.record_setup_evaluation(
+        setup_id=uuid4(),
+        signal_id=uuid4(),
+        status=SetupEvaluationStatus.STILL_VALID,
+        reasoning="on track",
+        latency_ms=120,
+    )
+    assert isinstance(eval_id, UUID)
+    conn.execute.assert_awaited_once()
+    sql = conn.execute.await_args.args[0]
+    assert "INSERT INTO setup_evaluations" in sql
+
+
+async def test_list_setup_evaluations_forwards_to_repository() -> None:
+    store, conn = _store()
+    assert await store.list_setup_evaluations(uuid4(), limit=5) == []
+    conn.fetch.assert_awaited_once()
+    sql, *args = conn.fetch.await_args.args
+    assert "FROM setup_evaluations" in sql
+    assert args[1] == 5
 
 
 async def test_aclose_closes_pool() -> None:

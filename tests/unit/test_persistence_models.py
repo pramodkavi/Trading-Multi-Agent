@@ -15,8 +15,18 @@ from uuid import uuid4
 import pytest
 from pydantic import ValidationError
 
-from src.common.models import SignalDirection, SignalOutcome, SignalStatus
-from src.persistence.models import DecisionSummary, StoredCriticReport, StoredReview
+from src.common.models import (
+    SetupEvaluationStatus,
+    SignalDirection,
+    SignalOutcome,
+    SignalStatus,
+)
+from src.persistence.models import (
+    DecisionSummary,
+    StoredCriticReport,
+    StoredReview,
+    StoredSetupEvaluation,
+)
 from src.persistence.store import AsyncpgSignalStore, DataApiSignalStore, SignalStore
 
 NOW = datetime(2026, 7, 1, tzinfo=UTC)
@@ -198,6 +208,38 @@ def test_stored_critic_report_requires_aware_datetimes(field: str) -> None:
     kwargs[field] = NAIVE
     with pytest.raises(ValidationError, match="timezone-aware"):
         StoredCriticReport.model_validate(kwargs)
+
+
+# ---------------------------------------------------------------------------
+# StoredSetupEvaluation (Step 4.0, design §5.2)
+# ---------------------------------------------------------------------------
+
+
+def test_stored_setup_evaluation_requires_aware_evaluated_at() -> None:
+    with pytest.raises(ValidationError, match="timezone-aware"):
+        StoredSetupEvaluation(
+            id=uuid4(),
+            setup_id=uuid4(),
+            signal_id=uuid4(),
+            evaluated_at=NAIVE,
+            status=SetupEvaluationStatus.STILL_VALID,
+        )
+
+
+def test_stored_setup_evaluation_defaults() -> None:
+    row = StoredSetupEvaluation(
+        id=uuid4(),
+        setup_id=uuid4(),
+        signal_id=uuid4(),
+        evaluated_at=NOW,
+        status=SetupEvaluationStatus.ERROR,
+    )
+    assert row.outcome is None
+    assert row.reasoning is None
+    assert row.error is None
+    assert row.latency_ms == 0
+    assert row.token_usage == {}
+    assert row.cost_usd is None
 
 
 # ---------------------------------------------------------------------------

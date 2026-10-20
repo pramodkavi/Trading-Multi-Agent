@@ -33,6 +33,7 @@ from src.common.models import (
     ActiveSetupStatus,
     AgentRole,
     ScanStatus,
+    SetupEvaluationStatus,
     SignalDirection,
     SignalProposal,
     SignalStatus,
@@ -43,6 +44,7 @@ from src.persistence import (
     ActiveSetupRepository,
     AgentRunRepository,
     ScanRunRepository,
+    SetupEvaluationRepository,
     SignalRepository,
 )
 
@@ -377,6 +379,42 @@ async def test_active_setup_open_list_update_lifecycle(
     assert not stored.is_open
     assert stored.latest_evaluation == {"reason": "premise broke", "outcome": "INVALIDATED"}
     assert stored.last_evaluated_at is not None
+
+    # Step 4.0 (design §5.2): every evaluation is journaled in setup_evaluations,
+    # newest first, and the history cascades away with the parent signal.
+    evals = SetupEvaluationRepository(conn)
+    first_id = await evals.record(
+        setup_id=setup_id,
+        signal_id=signal_id,
+        status=SetupEvaluationStatus.STILL_VALID,
+        reasoning="on track",
+        latency_ms=100,
+        token_usage={"tokens_in": 10},
+        cost_usd=0.001,
+        evaluated_at=datetime(2026, 10, 19, 8, 3, tzinfo=UTC),
+    )
+    second_id = await evals.record(
+        setup_id=setup_id,
+        signal_id=signal_id,
+        status=SetupEvaluationStatus.AT_RISK,
+        reasoning="drifting toward invalidation",
+        evaluated_at=datetime(2026, 10, 19, 13, 3, tzinfo=UTC),
+    )
+
+    history = await evals.list_for_setup(setup_id)
+    assert [row.id for row in history] == [second_id, first_id]
+    assert history[0].status is SetupEvaluationStatus.AT_RISK
+    assert history[0].token_usage == {} and history[0].cost_usd is None
+    assert history[1].status is SetupEvaluationStatus.STILL_VALID
+    assert history[1].token_usage == {"tokens_in": 10}
+    assert history[1].cost_usd == pytest.approx(0.001)
+    assert history[1].latency_ms == 100
+    assert all(row.evaluated_at.tzinfo is not None for row in history)
+    assert await evals.list_for_setup(setup_id, limit=1) == [history[0]]
+
+    await conn.execute("DELETE FROM signals WHERE id = $1", signal_id)
+
+    assert await evals.list_for_setup(setup_id) == []
 
 
 async def test_active_setup_cascades_on_signal_delete(

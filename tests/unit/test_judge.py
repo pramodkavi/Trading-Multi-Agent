@@ -5,8 +5,10 @@ All offline (mocked Anthropic client). Covers:
 - the three SPEC Step 2.6 scenarios (PUBLISH / SKIP / PUBLISH_WITH_CAVEAT): the
   ruling plumbs through and the prompt encodes the distinguishing facts
 - FR-4.3 macro-unavailable confidence cap (deterministic, post-LLM)
-- the LangGraph node: skip for non-proposals (no LLM call); sets both
-  judge_decision and the decision enum for proposals
+- evaluate_traced(): the decision plus the LlmUsage carrier Step 4.0 persists
+  to agent_runs (NFR-2.3); evaluate() delegates to it
+- the LangGraph node: skip for non-proposals (no LLM call); sets
+  judge_decision, judge_usage and the decision enum for proposals
 - prompt rendering of None / NoMacroData inputs and system-prompt guards
 
 The ruling itself is produced by the (mocked) LLM, so these tests verify the
@@ -30,6 +32,7 @@ from src.agents.skeptic import SkepticObjection
 from src.common.models import (
     JudgeConfidence,
     JudgeRuling,
+    LlmUsage,
     ObjectionSeverity,
     SignalDirection,
     SignalProposal,
@@ -237,6 +240,38 @@ async def test_macro_available_does_not_cap_confidence() -> None:
 
 
 # ---------------------------------------------------------------------------
+# evaluate_traced (Step 4.0: usage carried to agent_runs, NFR-2.3)
+# ---------------------------------------------------------------------------
+
+
+async def test_evaluate_traced_returns_usage() -> None:
+    client = _mock_client([_fake_tool_response(_PUBLISH, tokens_in=200, tokens_out=80)])
+    judge = Judge(client=client)
+    decision, usage = await judge.evaluate_traced(
+        make_proposal(),
+        make_report(win_rate=0.78, sample_size=9, wins=7, losses=2),
+        make_objection(ObjectionSeverity.LOW),
+    )
+    assert decision.ruling is JudgeRuling.PUBLISH
+    assert isinstance(usage, LlmUsage)
+    assert (usage.tokens_in, usage.tokens_out) == (200, 80)
+    assert usage.attempts == 1
+    assert usage.latency_ms >= 0
+    assert usage.cost_usd is not None and usage.cost_usd > 0  # Sonnet 4.5 is priced
+
+
+async def test_evaluate_traced_applies_macro_cap_to_returned_decision() -> None:
+    # The FR-4.3 cap must apply on the traced path too (evaluate delegates here).
+    client = _mock_client([_fake_tool_response(_PUBLISH)])  # LLM claims HIGH confidence
+    decision, _usage = await Judge(client=client).evaluate_traced(
+        make_proposal(),
+        make_report(win_rate=0.7, sample_size=10, wins=7, losses=3),
+        NoMacroData(provider="skeptic", reason="all providers down"),
+    )
+    assert decision.confidence is JudgeConfidence.MEDIUM
+
+
+# ---------------------------------------------------------------------------
 # LangGraph node
 # ---------------------------------------------------------------------------
 
@@ -254,7 +289,7 @@ async def test_node_skips_non_proposal_without_llm() -> None:
     )
     for proposal in (None, skip):
         out = await node({"proposal": proposal})
-        assert out == {"judge_decision": None, "decision": JudgeRuling.SKIP}
+        assert out == {"judge_decision": None, "judge_usage": None, "decision": JudgeRuling.SKIP}
     client.messages.create.assert_not_awaited()
 
 
@@ -269,6 +304,24 @@ async def test_node_proposal_sets_decision_and_judge_decision() -> None:
         }
     )
     assert isinstance(out["judge_decision"], JudgeDecision)
+    assert out["judge_decision"].ruling is JudgeRuling.PUBLISH_WITH_CAVEAT
+    assert out["decision"] is JudgeRuling.PUBLISH_WITH_CAVEAT
+
+
+async def test_node_sets_judge_usage() -> None:
+    client = _mock_client([_fake_tool_response(_WITH_CAVEAT, tokens_in=200, tokens_out=80)])
+    node = make_judge_node(Judge(client=client))
+    out = await node(
+        {
+            "proposal": make_proposal(),
+            "historian_report": make_report(win_rate=0.6, sample_size=5, wins=3, losses=2),
+            "skeptic_objection": make_objection(ObjectionSeverity.MEDIUM),
+        }
+    )
+    usage = out["judge_usage"]
+    assert isinstance(usage, LlmUsage)
+    assert (usage.tokens_in, usage.tokens_out) == (200, 80)
+    # The decision keys are unchanged by carrying usage alongside them.
     assert out["judge_decision"].ruling is JudgeRuling.PUBLISH_WITH_CAVEAT
     assert out["decision"] is JudgeRuling.PUBLISH_WITH_CAVEAT
 

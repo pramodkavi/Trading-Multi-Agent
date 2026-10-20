@@ -228,3 +228,45 @@ CREATE TABLE IF NOT EXISTS critic_reports (
 
 CREATE INDEX IF NOT EXISTS idx_critic_reports_created_at
     ON critic_reports (created_at DESC);
+
+
+-- ---------------------------------------------------------------------------
+-- Slice 4 Step 4.0 (dashboard design §5.2): setup_evaluations -- one row per
+-- Forecaster look at a setup, *including* an ERROR row when the per-setup
+-- evaluation raised (those failures previously left no trace in the DB).
+-- active_setups.latest_evaluation stays the "last one wins" cache; this table
+-- is the full history the dashboard health strip / timeline / coverage read.
+-- The Forecaster sweep has no scan_runs row, so it cannot journal through
+-- agent_runs (scan_id NOT NULL) -- a dedicated table is the honest shape.
+-- Rows cascade from both active_setups and signals.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS setup_evaluations (
+    id              UUID        PRIMARY KEY,
+    setup_id        UUID        NOT NULL
+                                REFERENCES active_setups(id) ON DELETE CASCADE,
+    signal_id       UUID        NOT NULL
+                                REFERENCES signals(id) ON DELETE CASCADE,
+    evaluated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status          TEXT        NOT NULL
+                                CHECK (status IN ('STILL_VALID', 'AT_RISK', 'INVALIDATED', 'ERROR')),
+    outcome         TEXT        CHECK (outcome IS NULL OR outcome IN ('WIN', 'LOSS', 'BREAKEVEN', 'INVALIDATED', 'EXPIRED')),
+    reasoning       TEXT,
+    error           TEXT,
+    latency_ms      INTEGER     NOT NULL DEFAULT 0 CHECK (latency_ms >= 0),
+    token_usage     JSONB       NOT NULL DEFAULT '{}'::JSONB,
+    cost_usd        NUMERIC(12, 6)
+);
+
+CREATE INDEX IF NOT EXISTS idx_setup_evaluations_setup_id_evaluated_at
+    ON setup_evaluations (setup_id, evaluated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_setup_evaluations_evaluated_at
+    ON setup_evaluations (evaluated_at DESC);
+
+-- Dashboard read-optimised indexes (design §5.2): the funnel joins agent_runs
+-- on (scan_id, agent_role); the setups page lists by status, newest first.
+CREATE INDEX IF NOT EXISTS idx_agent_runs_scan_id_role
+    ON agent_runs (scan_id, agent_role);
+
+CREATE INDEX IF NOT EXISTS idx_active_setups_status_opened_at
+    ON active_setups (status, opened_at DESC);

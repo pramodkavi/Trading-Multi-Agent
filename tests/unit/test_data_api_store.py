@@ -28,7 +28,9 @@ from src.agents.critic.models import DecisionKind, Resolution, ResolutionOutcome
 from src.common.models import (
     ActiveSetupStatus,
     AgentRole,
+    SetupEvaluationStatus,
     SignalDirection,
+    SignalOutcome,
     SignalProposal,
     SignalStatus,
 )
@@ -660,6 +662,66 @@ async def test_execute_does_not_retry_other_client_errors(monkeypatch: pytest.Mo
     assert client.calls == 1  # non-resume error raises immediately, no retry
 
 
+async def test_execute_single_attempt_raises_without_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Record every backoff sleep instead of collapsing it: a 1-attempt budget must
+    # not sleep at all (design §3.4 -- request-scoped callers sit behind API
+    # Gateway's 30 s cap and cannot wait out an Aurora resume).
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(store_module.asyncio, "sleep", _sleep)
+    client = FlakyRdsDataClient(error=_client_error("DatabaseResumingException"), fail_times=999)
+    store = DataApiSignalStore(
+        client=client,
+        cluster_arn=CLUSTER_ARN,
+        secret_arn=SECRET_ARN,
+        database=DATABASE,
+        resume_attempts=1,
+    )
+
+    with pytest.raises(ClientError):
+        await store.get_scan_run(uuid4())
+
+    assert sleeps == []
+    assert client.calls == 1
+
+
+def test_resume_attempts_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="resume_attempts"):
+        DataApiSignalStore(
+            client=FakeRdsDataClient(),
+            cluster_arn=CLUSTER_ARN,
+            secret_arn=SECRET_ARN,
+            database=DATABASE,
+            resume_attempts=0,
+        )
+
+
+def test_from_arns_passes_resume_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    import boto3
+
+    created: list[tuple[str, str | None]] = []
+
+    def _fake_client(service_name: str, *, region_name: str | None = None) -> FakeRdsDataClient:
+        created.append((service_name, region_name))
+        return FakeRdsDataClient()
+
+    monkeypatch.setattr(boto3, "client", _fake_client)
+
+    store = DataApiSignalStore.from_arns(
+        cluster_arn=CLUSTER_ARN,
+        secret_arn=SECRET_ARN,
+        database=DATABASE,
+        region_name="ap-south-1",
+        resume_attempts=2,
+    )
+
+    assert created == [("rds-data", "ap-south-1")]
+    assert store._resume_attempts == 2
+
+
 # ---------------------------------------------------------------------------
 # lifecycle
 # ---------------------------------------------------------------------------
@@ -1252,3 +1314,126 @@ async def test_save_critic_report_binds_pr_url() -> None:
     assert params_by_name(client.calls[0])["pr_url"] == {
         "stringValue": "https://github.com/o/r/pull/1"
     }
+
+
+# ---------------------------------------------------------------------------
+# setup_evaluations (Slice 4 Step 4.0, design §5.2)
+# ---------------------------------------------------------------------------
+
+
+async def test_record_setup_evaluation_builds_typed_parameters() -> None:
+    store, client = make_store()
+    setup_id, signal_id = uuid4(), uuid4()
+    eval_id = await store.record_setup_evaluation(
+        setup_id=setup_id,
+        signal_id=signal_id,
+        status=SetupEvaluationStatus.AT_RISK,
+        reasoning="drifting",
+        latency_ms=800,
+        token_usage={"tokens_in": 10},
+        cost_usd=0.001,
+    )
+    call = client.calls[0]
+    assert "INSERT INTO setup_evaluations" in call["sql"]
+    p = params_by_name(call)
+    assert p["id"] == {"stringValue": str(eval_id)}
+    assert p["setup_id"] == {"stringValue": str(setup_id)}
+    assert p["signal_id"] == {"stringValue": str(signal_id)}
+    assert p["status"] == {"stringValue": "AT_RISK"}
+    assert p["outcome"] == {"isNull": True} and p["error"] == {"isNull": True}
+    assert p["reasoning"] == {"stringValue": "drifting"}
+    assert p["latency_ms"] == {"longValue": 800}
+    assert json.loads(p["token_usage"]["stringValue"]) == {"tokens_in": 10}
+    assert p["cost_usd"] == {"doubleValue": 0.001}
+    assert p["evaluated_at"] == {"isNull": True}  # DEFAULT NOW() server-side
+
+
+async def test_record_setup_evaluation_error_row() -> None:
+    store, client = make_store()
+    await store.record_setup_evaluation(
+        setup_id=uuid4(),
+        signal_id=uuid4(),
+        status=SetupEvaluationStatus.ERROR,
+        error="RuntimeError: boom",
+    )
+    p = params_by_name(client.calls[0])
+    assert p["status"] == {"stringValue": "ERROR"}
+    assert p["error"] == {"stringValue": "RuntimeError: boom"}
+    assert p["reasoning"] == {"isNull": True}
+    assert p["latency_ms"] == {"longValue": 0}
+    assert json.loads(p["token_usage"]["stringValue"]) == {}
+    assert p["cost_usd"] == {"isNull": True}
+
+
+async def test_record_setup_evaluation_binds_explicit_evaluated_at_and_outcome() -> None:
+    store, client = make_store()
+    ts = datetime(2026, 10, 19, 8, 5, tzinfo=UTC)
+    await store.record_setup_evaluation(
+        setup_id=uuid4(),
+        signal_id=uuid4(),
+        status=SetupEvaluationStatus.INVALIDATED,
+        outcome=SignalOutcome.WIN,
+        evaluated_at=ts,
+    )
+    call = client.calls[0]
+    assert "COALESCE(:evaluated_at::timestamptz, NOW())" in call["sql"]
+    p = params_by_name(call)
+    assert p["outcome"] == {"stringValue": "WIN"}
+    assert p["evaluated_at"] == {"stringValue": ts.isoformat()}
+
+
+async def test_list_setup_evaluations_parses_rows_newest_first_and_clamps_limit() -> None:
+    row: list[dict[str, Any]] = [
+        {"stringValue": str(uuid4())},
+        {"stringValue": str(uuid4())},
+        {"stringValue": str(uuid4())},
+        {"stringValue": "2026-10-19T08:05:00+00:00"},
+        {"stringValue": "INVALIDATED"},
+        {"stringValue": "WIN"},
+        {"stringValue": "target hit"},
+        {"isNull": True},
+        {"longValue": 900},
+        {"stringValue": '{"tokens_in": 5}'},
+        {"doubleValue": 0.002},
+    ]
+    store, client = make_store(
+        response(
+            [
+                "id",
+                "setup_id",
+                "signal_id",
+                "evaluated_at",
+                "status",
+                "outcome",
+                "reasoning",
+                "error",
+                "latency_ms",
+                "token_usage",
+                "cost_usd",
+            ],
+            row,
+        )
+    )
+    setup_id = uuid4()
+    rows = await store.list_setup_evaluations(setup_id, limit=999)
+    assert len(rows) == 1
+    assert rows[0].status is SetupEvaluationStatus.INVALIDATED
+    assert rows[0].outcome is SignalOutcome.WIN
+    assert rows[0].reasoning == "target hit" and rows[0].error is None
+    assert rows[0].latency_ms == 900
+    assert rows[0].token_usage == {"tokens_in": 5} and rows[0].cost_usd == 0.002
+    assert rows[0].evaluated_at.tzinfo is not None
+    call = client.calls[0]
+    assert "FROM setup_evaluations" in call["sql"]
+    assert "WHERE setup_id = :setup_id::uuid" in call["sql"]
+    assert "ORDER BY evaluated_at DESC" in call["sql"]
+    assert "cost_usd::double precision" in call["sql"]
+    p = params_by_name(call)
+    assert p["setup_id"] == {"stringValue": str(setup_id)}
+    assert p["limit"] == {"longValue": 200}
+
+
+async def test_list_setup_evaluations_floors_limit_at_one() -> None:
+    store, client = make_store(response([]))
+    assert await store.list_setup_evaluations(uuid4(), limit=0) == []
+    assert params_by_name(client.calls[0])["limit"] == {"longValue": 1}

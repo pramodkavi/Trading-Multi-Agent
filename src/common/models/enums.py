@@ -152,6 +152,22 @@ class ForecastStatus(StrEnum):
     INVALIDATED = "INVALIDATED"
 
 
+class SetupEvaluationStatus(StrEnum):
+    """Status of one journaled Forecaster evaluation in `setup_evaluations`
+    (Slice 4 Step 4.0, dashboard design §5.2).
+
+    The three `ForecastStatus` verdicts plus ERROR, which records that the
+    per-setup evaluation raised before producing a verdict -- so a failed sweep
+    leaves a trace in the DB instead of being swallowed. Mirrors the CHECK
+    constraint in schema.sql.
+    """
+
+    STILL_VALID = "STILL_VALID"
+    AT_RISK = "AT_RISK"
+    INVALIDATED = "INVALIDATED"
+    ERROR = "ERROR"
+
+
 class ActiveSetupStatus(StrEnum):
     """Lifecycle status of a row in the `active_setups` table (Step 2.8).
 

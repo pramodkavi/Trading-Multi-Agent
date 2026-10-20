@@ -31,6 +31,7 @@ from src.common.models import (
     ActiveSetupStatus,
     AgentRole,
     ScanStatus,
+    SetupEvaluationStatus,
     SignalDirection,
     SignalOutcome,
     SignalProposal,
@@ -43,6 +44,7 @@ from src.persistence.models import (
     StoredAgentRun,
     StoredCriticReport,
     StoredScanRun,
+    StoredSetupEvaluation,
     StoredSignal,
 )
 
@@ -635,6 +637,101 @@ class ActiveSetupRepository:
         if data.get("latest_evaluation") is not None:
             data["latest_evaluation"] = _parse_jsonb_field(data["latest_evaluation"])
         return StoredActiveSetup.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# SetupEvaluationRepository (Slice 4 Step 4.0, dashboard design §5.2)
+# ---------------------------------------------------------------------------
+
+_SETUP_EVALUATION_COLUMNS = (
+    "id, setup_id, signal_id, evaluated_at, status, outcome, reasoning, "
+    "error, latency_ms, token_usage, cost_usd"
+)
+
+
+class SetupEvaluationRepository:
+    """Append-only journal of Forecaster evaluations: the `setup_evaluations` table.
+
+    One row per look at a setup -- a STILL_VALID / AT_RISK / INVALIDATED verdict,
+    or an ERROR row when the per-setup evaluation raised (design §5.2: failures
+    must leave a trace). ``active_setups.latest_evaluation`` remains the
+    "last one wins" cache; this is the full history the dashboard reads.
+    """
+
+    def __init__(self, conn: asyncpg.Connection[Any]) -> None:
+        self._conn = conn
+
+    async def record(
+        self,
+        *,
+        setup_id: UUID,
+        signal_id: UUID,
+        status: SetupEvaluationStatus,
+        outcome: SignalOutcome | None = None,
+        reasoning: str | None = None,
+        error: str | None = None,
+        latency_ms: int = 0,
+        token_usage: Mapping[str, Any] | None = None,
+        cost_usd: float | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> UUID:
+        """Insert one evaluation row; returns the new id.
+
+        ``evaluated_at`` defaults to ``NOW()`` DB-side (as ``AgentRunRepository
+        .log_run`` does for ``created_at``); ``token_usage`` defaults to ``{}``.
+        """
+        evaluation_id = uuid4()
+        await self._conn.execute(
+            """
+            INSERT INTO setup_evaluations
+                (id, setup_id, signal_id, evaluated_at, status, outcome, reasoning,
+                 error, latency_ms, token_usage, cost_usd)
+            VALUES
+                ($1, $2, $3, COALESCE($4, NOW()), $5, $6, $7, $8, $9, $10::jsonb, $11)
+            """,
+            evaluation_id,
+            setup_id,
+            signal_id,
+            evaluated_at,
+            status.value,
+            outcome.value if outcome is not None else None,
+            reasoning,
+            error,
+            latency_ms,
+            _to_jsonb(dict(token_usage) if token_usage is not None else {}),
+            cost_usd,
+        )
+        return evaluation_id
+
+    async def list_for_setup(
+        self, setup_id: UUID, *, limit: int = 50
+    ) -> list[StoredSetupEvaluation]:
+        """A setup's evaluations newest first; ``limit`` is clamped to 1..200.
+
+        Served by the §5.2 ``(setup_id, evaluated_at DESC)`` index.
+        """
+        capped = max(1, min(limit, 200))
+        rows = await self._conn.fetch(
+            f"""
+            SELECT {_SETUP_EVALUATION_COLUMNS}
+            FROM setup_evaluations
+            WHERE setup_id = $1
+            ORDER BY evaluated_at DESC, id DESC
+            LIMIT $2
+            """,
+            setup_id,
+            capped,
+        )
+        return [self._record_to_stored(r) for r in rows]
+
+    @staticmethod
+    def _record_to_stored(record: asyncpg.Record) -> StoredSetupEvaluation:
+        data = _record_to_dict(record)
+        data["token_usage"] = _parse_jsonb_field(data["token_usage"])
+        if data.get("cost_usd") is not None:
+            # asyncpg returns NUMERIC as Decimal; coerce as AgentRunRepository does.
+            data["cost_usd"] = float(data["cost_usd"])
+        return StoredSetupEvaluation.model_validate(data)
 
 
 # ---------------------------------------------------------------------------

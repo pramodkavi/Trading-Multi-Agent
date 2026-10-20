@@ -240,8 +240,9 @@ class TestSchemaContent:
         assert "CREATE TABLE IF NOT EXISTS decision_resolutions" in sql
         assert "CREATE TABLE IF NOT EXISTS decision_reviews" in sql
         assert "CREATE TABLE IF NOT EXISTS critic_reports" in sql
-        # active_setups + decision_resolutions + decision_reviews all cascade from signals.
-        assert sql.count("REFERENCES signals(id) ON DELETE CASCADE") == 3
+        # active_setups + decision_resolutions + decision_reviews + setup_evaluations
+        # (Step 4.0) all cascade from signals.
+        assert sql.count("REFERENCES signals(id) ON DELETE CASCADE") == 4
         assert "decision_kind IN ('PUBLISHED', 'VETOED', 'GATE_REJECTED')" in sql
         assert "decision_kind IN ('PUBLISHED', 'VETOED', 'GATE_REJECTED', 'NO_SETUP')" in sql
         assert "outcome IN ('WIN', 'LOSS', 'EXPIRED', 'UNRESOLVABLE')" in sql
@@ -262,7 +263,8 @@ class TestSchemaContent:
 class TestPersistenceConstants:
     def test_expected_tables_match_schema_scope(self) -> None:
         # Slice 1 shipped scan_runs/signals/agent_runs; Step 2.8 added active_setups;
-        # Step 2.14 (Critic v0) added decision_resolutions/decision_reviews/critic_reports.
+        # Step 2.14 (Critic v0) added decision_resolutions/decision_reviews/critic_reports;
+        # Step 4.0 added setup_evaluations.
         assert (
             frozenset(
                 {
@@ -273,6 +275,7 @@ class TestPersistenceConstants:
                     "decision_resolutions",
                     "decision_reviews",
                     "critic_reports",
+                    "setup_evaluations",
                 }
             )
             == EXPECTED_TABLES

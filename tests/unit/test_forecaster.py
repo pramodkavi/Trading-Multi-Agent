@@ -9,11 +9,17 @@ Covers:
     INVALIDATED -> setup closed with the terminal outcome + outcome logged + notify
 - orphan setup (missing signal) is skipped without an LLM call
 - a per-setup failure is isolated (the rest of the run continues)
+- Step 4.0 (design §5.2): every evaluation -- verdict, orphan, or exception --
+  leaves one `setup_evaluations` row; exceptions also log the `PROVIDER_ERROR`
+  marker; a failure to write the ERROR row itself never aborts the run; the
+  verdict row is journaled before the Telegram send so a notifier outage adds
+  an ERROR row rather than masking the verdict
 - format_forecaster_update rendering
 """
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -27,12 +33,13 @@ from src.agents.forecaster import Forecaster, ForecasterUpdate
 from src.common.models import (
     ActiveSetupStatus,
     ForecastStatus,
+    SetupEvaluationStatus,
     SignalDirection,
     SignalOutcome,
     SignalProposal,
     SignalStatus,
 )
-from src.notifications import format_forecaster_update
+from src.notifications import NotifierUnavailableError, format_forecaster_update
 from src.persistence.models import StoredActiveSetup, StoredSignal
 from src.providers import Kline, MarketSnapshot, Timeframe
 
@@ -114,6 +121,15 @@ class FakeStore:
         self._signals = signals
         self.updated: list[tuple[UUID, ActiveSetupStatus, dict[str, Any] | None]] = []
         self.outcomes: list[tuple[UUID, SignalOutcome]] = []
+        # setup_evaluations rows (Step 4.0); set fail_record to simulate a DB
+        # write failure for the statuses in fail_record_statuses. Default scope is
+        # the ERROR-row write in run() (verdict rows still land, so the test pins
+        # "the ERROR-row write failing must not abort the run"); widen it to a
+        # verdict status to simulate the deploy->migrate window where the
+        # setup_evaluations table does not exist yet.
+        self.evaluations: list[dict[str, Any]] = []
+        self.fail_record = False
+        self.fail_record_statuses: set[SetupEvaluationStatus] = {SetupEvaluationStatus.ERROR}
 
     async def list_open_active_setups(self) -> list[StoredActiveSetup]:
         return list(self._setups)
@@ -139,6 +155,12 @@ class FakeStore:
         outcome_metadata: Any = None,
     ) -> None:
         self.outcomes.append((signal_id, outcome))
+
+    async def record_setup_evaluation(self, **kwargs: Any) -> UUID:
+        if self.fail_record and kwargs["status"] in self.fail_record_statuses:
+            raise RuntimeError("db down")
+        self.evaluations.append(kwargs)
+        return uuid4()
 
 
 def _provider(snapshot: MarketSnapshot, *, side_effect: Any = None) -> MagicMock:
@@ -310,6 +332,220 @@ async def test_per_setup_failure_is_isolated() -> None:
 
     assert len(updates) == 1  # the failing setup was skipped, not fatal
     assert len(store.updated) == 1
+
+
+# ---------------------------------------------------------------------------
+# setup_evaluations journaling (Step 4.0, design §5.2)
+# ---------------------------------------------------------------------------
+
+
+async def test_each_verdict_records_an_evaluation_row() -> None:
+    proposal = _proposal()
+    signal = _stored_signal(proposal)
+    setup = _setup(signal.id)
+    store = FakeStore([setup], {signal.id: signal})
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=_notifier(),
+        client=_client([_response(_AT_RISK)]),
+    )
+
+    updates = await forecaster.run()
+
+    assert len(updates) == 1
+    assert len(store.evaluations) == 1
+    row = store.evaluations[0]
+    assert row["status"] is SetupEvaluationStatus.AT_RISK and row["outcome"] is None
+    assert row["setup_id"] == setup.id and row["signal_id"] == setup.signal_id
+    assert row["reasoning"] == updates[0].reasoning
+    assert row["token_usage"]["tokens_in"] == 100 and row["cost_usd"] is not None
+    assert row.get("error") is None  # a verdict row carries no error text
+
+
+async def test_invalidated_records_outcome_on_evaluation_row() -> None:
+    proposal = _proposal()
+    signal = _stored_signal(proposal)
+    setup = _setup(signal.id)
+    store = FakeStore([setup], {signal.id: signal})
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=_notifier(),
+        client=_client([_response(_INVALIDATED_LOSS)]),
+    )
+
+    await forecaster.run()
+
+    assert len(store.evaluations) == 1
+    assert store.evaluations[0]["status"] is SetupEvaluationStatus.INVALIDATED
+    assert store.evaluations[0]["outcome"] is SignalOutcome.LOSS
+
+
+async def test_orphan_setup_records_error_row_without_llm() -> None:
+    setup = _setup(uuid4())  # references a signal not in the store
+    store = FakeStore([setup], {})
+    client = _client([])
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=_notifier(),
+        client=client,
+    )
+
+    updates = await forecaster.run()
+
+    assert updates == []
+    client.messages.create.assert_not_awaited()
+    assert len(store.evaluations) == 1
+    assert store.evaluations[0]["status"] is SetupEvaluationStatus.ERROR
+    assert store.evaluations[0]["setup_id"] == setup.id
+    assert store.evaluations[0]["signal_id"] == setup.signal_id
+    assert "orphan" in store.evaluations[0]["error"]
+    assert str(setup.signal_id) in store.evaluations[0]["error"]
+
+
+async def test_per_setup_failure_records_error_row_and_logs_marker(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    p1, p2 = _proposal("BTCUSDT"), _proposal("ETHUSDT")
+    s1, s2 = _stored_signal(p1), _stored_signal(p2)
+    setup1, setup2 = _setup(s1.id), _setup(s2.id)
+    store = FakeStore([setup1, setup2], {s1.id: s1, s2.id: s2})
+    # First setup's market fetch blows up; the second succeeds.
+    provider = _provider(_snapshot(), side_effect=[RuntimeError("binance down"), _snapshot()])
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=provider,
+        notifier=_notifier(),
+        client=_client([_response(_STILL_VALID)]),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.agents.forecaster.forecaster"):
+        updates = await forecaster.run()
+
+    assert len(updates) == 1  # the run continued past the failure
+    # One row per setup: the ERROR row for setup1 and the verdict row for setup2.
+    assert len(store.evaluations) == 2
+    errors = [e for e in store.evaluations if e["status"] is SetupEvaluationStatus.ERROR]
+    assert len(errors) == 1 and errors[0]["error"].startswith("RuntimeError")
+    assert errors[0]["setup_id"] == setup1.id
+    assert "binance down" in errors[0]["error"]
+    marker = [r for r in caplog.records if "PROVIDER_ERROR provider=forecaster" in r.getMessage()]
+    assert len(marker) == 1
+    assert f"setup={setup1.id}" in marker[0].getMessage()
+    assert "RuntimeError" in marker[0].getMessage()
+
+
+async def test_error_row_write_failure_does_not_abort_run() -> None:
+    p1, p2 = _proposal("BTCUSDT"), _proposal("ETHUSDT")
+    s1, s2 = _stored_signal(p1), _stored_signal(p2)
+    setup1, setup2 = _setup(s1.id), _setup(s2.id)
+    store = FakeStore([setup1, setup2], {s1.id: s1, s2.id: s2})
+    store.fail_record = True  # the ERROR-row write for setup 1 raises
+    # Provider raises for setup 1; setup 2 is fine.
+    provider = _provider(_snapshot(), side_effect=[RuntimeError("binance down"), _snapshot()])
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=provider,
+        notifier=_notifier(),
+        client=_client([_response(_STILL_VALID)]),
+    )
+
+    updates = await forecaster.run()
+
+    assert len(updates) == 1  # setup 2 still evaluated; the run did not raise
+    assert len(store.updated) == 1  # setup 2's verdict was still applied
+    # Only setup 2's verdict row landed; setup 1's ERROR row failed to write.
+    assert [e["status"] for e in store.evaluations] == [SetupEvaluationStatus.STILL_VALID]
+    assert store.evaluations[0]["setup_id"] == setup2.id
+
+
+async def test_notifier_failure_cannot_mask_the_journaled_verdict(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Review fix: the verdict row is journaled BEFORE the Telegram send.
+
+    A notifier outage after an INVALIDATED verdict must leave the honest record:
+    the setup closed + outcome stamped + the INVALIDATED row, PLUS an ERROR row
+    naming the notifier (and the alarm marker) -- never an ERROR row alone.
+    """
+    proposal = _proposal()
+    signal = _stored_signal(proposal)
+    setup = _setup(signal.id)
+    store = FakeStore([setup], {signal.id: signal})
+    notifier = _notifier()
+    notifier.send = AsyncMock(
+        side_effect=NotifierUnavailableError("telegram down", notifier="telegram")
+    )
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=notifier,
+        client=_client([_response(_INVALIDATED_LOSS)]),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.agents.forecaster.forecaster"):
+        updates = await forecaster.run()  # must not raise
+
+    # The verdict took effect and was journaled...
+    assert store.updated[0][1] is ActiveSetupStatus.LOSS
+    assert store.outcomes == [(signal.id, SignalOutcome.LOSS)]
+    assert len(store.evaluations) == 2
+    assert store.evaluations[0]["status"] is SetupEvaluationStatus.INVALIDATED
+    assert store.evaluations[0]["outcome"] is SignalOutcome.LOSS
+    # ...and the notifier failure is recorded on its own, alarmed, row.
+    assert store.evaluations[1]["status"] is SetupEvaluationStatus.ERROR
+    assert "NotifierUnavailableError" in store.evaluations[1]["error"]
+    assert "telegram down" in store.evaluations[1]["error"]
+    assert any("PROVIDER_ERROR provider=forecaster" in r.getMessage() for r in caplog.records)
+    # The failed look is not reported as a produced verdict (run() contract unchanged).
+    assert updates == []
+
+
+async def test_verdict_row_failure_still_notifies_and_surfaces_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Final-review fix: journaling must never cost the operator an alert.
+
+    In the deploy->migrate window ``setup_evaluations`` may not exist yet, so the
+    verdict-row write raises. The verdict has already taken effect; the operator
+    may be in the trade -- the INVALIDATED/AT_RISK Telegram alert must still go
+    out, and the journaling failure must still surface to run() (marker + ERROR
+    row attempt) so the outage stays visible.
+    """
+    proposal = _proposal()
+    signal = _stored_signal(proposal)
+    setup = _setup(signal.id)
+    store = FakeStore([setup], {signal.id: signal})
+    store.fail_record = True
+    store.fail_record_statuses = {SetupEvaluationStatus.INVALIDATED, SetupEvaluationStatus.ERROR}
+    notifier = _notifier()
+    forecaster = Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=notifier,
+        client=_client([_response(_INVALIDATED_LOSS)]),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.agents.forecaster.forecaster"):
+        updates = await forecaster.run()  # must not raise
+
+    # The alert still reached the operator...
+    notifier.send.assert_awaited_once()
+    # ...the verdict took effect...
+    assert store.updated[0][1] is ActiveSetupStatus.LOSS
+    assert store.outcomes == [(signal.id, SignalOutcome.LOSS)]
+    # ...no row could be journaled (table missing), and the failure is visible.
+    assert store.evaluations == []
+    assert any("PROVIDER_ERROR provider=forecaster" in r.getMessage() for r in caplog.records)
+    journal = [
+        r for r in caplog.records if "failed to journal forecaster verdict" in r.getMessage()
+    ]
+    assert len(journal) == 1 and journal[0].levelno == logging.ERROR
+    assert str(setup.id) in journal[0].getMessage()
+    # run() contract unchanged: a failed look is not reported as a produced verdict.
+    assert updates == []
 
 
 # ---------------------------------------------------------------------------

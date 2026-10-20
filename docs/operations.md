@@ -166,10 +166,21 @@ No manual SNS subscription is needed — CDK wires it.
 | `ScanLatencyP95Alarm` | scan p95 duration > 2 min | Lambda Duration p95 |
 | `AuroraCpuAlarm` | Aurora CPU > 80% for 15 min | RDS CPUUtilization |
 | `ProviderErrorAlarm` | ≥ 3 provider errors in 1h | Logs metric filter on `PROVIDER_ERROR` |
+| `ForecasterErrorAlarm` | ≥ 1 Forecaster per-setup failure in 1h | Logs metric filter on `PROVIDER_ERROR` + `provider=forecaster` |
 
 **Low-volume note:** at ~5 scans/day the failure-rate and provider-error alarms are
 effectively "any failure/several provider errors today" — intended sensitivity for
 a system the operator trades from. Richer provider-error tracking lands in Step 2.13.
+
+Forecaster per-setup failures (Step 4.0): the sweep runs in the same Lambda/log
+group and logs the marker
+`PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` for every setup
+whose evaluation raises (and journals an `ERROR` row in `setup_evaluations`). The
+dedicated `ForecasterErrorAlarm` fires on the **first** such failure in an hour —
+the Forecaster emits at most one marker per open setup per sweep (cap 3), so the
+shared threshold of 3 is unreachable with 1–2 open setups and a dead Anthropic key
+or exhausted credit would otherwise never alarm. The shared `ProviderErrorAlarm`
+still counts these markers too.
 
 ### Test alarm firing (deliberate failure)
 
@@ -215,9 +226,24 @@ Both Lambdas are zip-packaged, so the console shows the full `src/` and
    | `{"mode": "forecaster"}` | Forecaster sweep over open setups |
    | `{"mode": "resolve", "chunk_size": 25}` | Critic v0 outcome resolver — **only after the Critic v0 branch (Step 2.14) is merged**; on earlier code an unknown `mode` falls through to a full scan |
    | `{"mode": "migrate"}` | apply the DB schema over the Data API |
+   | `{"symbols": ["BTCUSDT"], "session": "AD_HOC"}` | one symbol with the rule-7 session window bypassed (manual smoke test only) |
 
    The JSON summary appears inline; logs under **Monitor → View CloudWatch logs**.
    First call after idle may hit Aurora resuming — retry after ~8 s.
+
+   **Scan session (Step 4.0, design §14 D1).** Since Step 4.0 the scan derives
+   its `ScanSession` from the UTC clock at scan start (Asian 00:00–08:00, London
+   08:00–13:00, NY 13:00–15:00, Overlap 15:00–21:00, Cooldown 21:00–00:00) and
+   records it on `scan_runs.session`, so SPEC §1.6 rule 7 now actually fires:
+   **the 22:03 daily-wrap scan runs inside Cooldown and is review-only** — it
+   still journals (`scan_runs` / `signals` / `agent_runs`), but any new
+   proposal is force-skipped with `RULE_7_SESSION_BLOCK`. Open setups are still
+   reviewed at daily wrap, but by the **separate 22:05 `{"mode":"forecaster"}`
+   sweep** (the `ForecasterSweep` schedule), not by the 22:03 scan itself; the
+   sweep never proposes, so rule 7 does not touch it. Scheduled invocations
+   never set `session`. A console Test event may add `"session": "AD_HOC"`
+   (case-insensitive) to bypass the window for a manual smoke test; an unknown
+   value fails the invocation on purpose rather than silently bypassing the rule.
 
 **Caveats**
 - **Every `cdk deploy` (manual, or the push-to-main auto-deploy) replaces the
@@ -272,8 +298,24 @@ near zero when idle), Anthropic tokens (~5 scans/day), Lambda (negligible), S3.
 SSM standard parameters and the SNS/alarm path are free. Critic v0 (§7) records
 every review call's cost in `agent_runs` (`agent_role = 'critic'`) and stops a
 backfill after its first chunk until the operator confirms the extrapolated
-spend; the budget *alarm* (NFR-5.2) is still Slice 3. Watch the AWS Billing
-console; investigate if the monthly run-rate exceeds ~$10.
+spend.
+
+**AWS Budget guardrail** (`MonitoringStack`, `MonthlyCostBudget`): a **$15/month**
+COST budget on the account. It notifies the alarm SNS topic — the same path the
+CloudWatch alarms use, so the message lands in **Telegram** via the notifier
+Lambda — on two conditions:
+
+| Notification | Fires when | Meaning |
+|---|---|---|
+| ACTUAL > 80 % | month-to-date spend passes **$12** | something is already burning money |
+| FORECASTED > 100 % | AWS's month-end forecast passes **$15** | the trend will blow the budget |
+
+AWS Budgets data lags billing by **~8–12 hours** (budgets are evaluated a few
+times a day, not continuously), so this is a guardrail against runaway spend,
+not a real-time alarm — a stuck Aurora at max ACU can run for half a day before
+the message arrives. Still watch the AWS Billing console weekly; investigate if
+the monthly run-rate exceeds ~$10. Anthropic token spend is not in this budget
+(it is tracked in `agent_runs`, NFR-5.1).
 
 ---
 

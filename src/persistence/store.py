@@ -47,6 +47,7 @@ from botocore.exceptions import ClientError
 from src.common.models import (
     ActiveSetupStatus,
     AgentRole,
+    SetupEvaluationStatus,
     SignalDirection,
     SignalOutcome,
     SignalProposal,
@@ -59,6 +60,7 @@ from src.persistence.models import (
     StoredAgentRun,
     StoredCriticReport,
     StoredScanRun,
+    StoredSetupEvaluation,
     StoredSignal,
 )
 from src.persistence.repositories import (
@@ -66,6 +68,7 @@ from src.persistence.repositories import (
     AgentRunRepository,
     DecisionRepository,
     ScanRunRepository,
+    SetupEvaluationRepository,
     SignalRepository,
     _assert_safe_feature_key,
     _parse_jsonb_field,
@@ -96,6 +99,8 @@ logger = logging.getLogger(__name__)
 # migration step retries for the same reason. Worst-case wait
 # (5+10+15+20+25 = 75s) is well under the 10-minute Lambda timeout. Only the Data
 # API backend needs this -- local asyncpg / Docker Postgres never auto-pauses.
+# _RESUME_MAX_ATTEMPTS is the *default* budget; DataApiSignalStore(resume_attempts=)
+# lets request-scoped callers (API Gateway, 30 s cap) shrink it.
 _RESUME_RETRY_CODES: frozenset[str] = frozenset({"DatabaseResumingException"})
 _RESUME_MAX_ATTEMPTS: int = 6
 _RESUME_BACKOFF_SECONDS: float = 5.0
@@ -375,6 +380,33 @@ class SignalStore(Protocol):
         """Record an evaluation + status on a setup (keeps OPEN, or closes it)."""
         ...
 
+    # ---- setup_evaluations (Slice 4 Step 4.0, design §5.2) ---------------------
+
+    async def record_setup_evaluation(
+        self,
+        *,
+        setup_id: UUID,
+        signal_id: UUID,
+        status: SetupEvaluationStatus,
+        outcome: SignalOutcome | None = None,
+        reasoning: str | None = None,
+        error: str | None = None,
+        latency_ms: int = 0,
+        token_usage: Mapping[str, Any] | None = None,
+        cost_usd: float | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> UUID:
+        """Journal one Forecaster look at a setup (verdict or ERROR). Returns its id.
+
+        ``evaluated_at`` defaults to the DB clock (``NOW()``) when omitted."""
+        ...
+
+    async def list_setup_evaluations(
+        self, setup_id: UUID, *, limit: int = 50
+    ) -> list[StoredSetupEvaluation]:
+        """A setup's evaluation history, newest first; ``limit`` is clamped to 1..200."""
+        ...
+
     # ---- Critic v0 (Step 2.14) -- Layer 1: OutcomeResolver queue ---------------
 
     async def list_unresolved_decisions(
@@ -481,6 +513,14 @@ class DataApiSignalStore:
     The client is injected (not created here) so the unit tests can pass a
     mock and so the Lambda handler controls client lifetime/reuse across
     invocations. Use :meth:`from_arns` to build one with a real boto3 client.
+
+    ``resume_attempts`` bounds how many times :meth:`_execute` retries Aurora's
+    ``DatabaseResumingException`` (see the module-level ``_RESUME_*`` constants).
+    The default budget (6 attempts, up to ~75 s of backoff) suits the scheduled
+    scan Lambda, which can afford to wait out a scale-from-zero resume.
+    Request-scoped callers behind API Gateway's 30 s cap -- the Slice 4
+    dashboard -- must pass a small budget (``1`` fails fast) rather than let a
+    cold cluster time out the HTTP request (dashboard design §3.4).
     """
 
     def __init__(
@@ -490,11 +530,15 @@ class DataApiSignalStore:
         cluster_arn: str,
         secret_arn: str,
         database: str,
+        resume_attempts: int = _RESUME_MAX_ATTEMPTS,
     ) -> None:
+        if resume_attempts < 1:
+            raise ValueError(f"resume_attempts must be >= 1, got {resume_attempts}")
         self._client = client
         self._cluster_arn = cluster_arn
         self._secret_arn = secret_arn
         self._database = database
+        self._resume_attempts = resume_attempts
 
     @classmethod
     def from_arns(
@@ -504,12 +548,14 @@ class DataApiSignalStore:
         secret_arn: str,
         database: str,
         region_name: str | None = None,
+        resume_attempts: int = _RESUME_MAX_ATTEMPTS,
     ) -> DataApiSignalStore:
         """Construct with a fresh boto3 ``rds-data`` client.
 
         ``boto3`` is imported lazily so importing this module (and the unit
         tests, which inject a mock) never depends on AWS credentials or region
-        resolution.
+        resolution. ``resume_attempts`` is forwarded to the constructor; see the
+        class docstring for when to lower it.
         """
         import boto3
 
@@ -519,6 +565,7 @@ class DataApiSignalStore:
             cluster_arn=cluster_arn,
             secret_arn=secret_arn,
             database=database,
+            resume_attempts=resume_attempts,
         )
 
     # ---- low-level execute ------------------------------------------------
@@ -535,7 +582,9 @@ class DataApiSignalStore:
         Retries ``DatabaseResumingException`` -- Aurora Serverless v2 waking from
         its scale-to-zero auto-pause -- with linear backoff, so a scan that lands
         on a paused cluster rides out the ~20-30s resume instead of failing on its
-        first DB call. Any other error (including a non-resume ``ClientError``)
+        first DB call. The attempt budget is ``self._resume_attempts`` (constructor
+        ``resume_attempts``); with a budget of 1 the first resume error propagates
+        without sleeping. Any other error (including a non-resume ``ClientError``)
         propagates immediately.
         """
 
@@ -550,19 +599,19 @@ class DataApiSignalStore:
             )
             return result
 
-        for attempt in range(1, _RESUME_MAX_ATTEMPTS + 1):
+        for attempt in range(1, self._resume_attempts + 1):
             try:
                 return await asyncio.to_thread(_call)
             except ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code", "")
-                if code not in _RESUME_RETRY_CODES or attempt == _RESUME_MAX_ATTEMPTS:
+                if code not in _RESUME_RETRY_CODES or attempt == self._resume_attempts:
                     raise
                 delay = _RESUME_BACKOFF_SECONDS * attempt
                 logger.warning(
                     "Aurora resuming (%s); retry %d/%d in %.0fs",
                     code,
                     attempt,
-                    _RESUME_MAX_ATTEMPTS,
+                    self._resume_attempts,
                     delay,
                 )
                 await asyncio.sleep(delay)
@@ -1063,6 +1112,92 @@ class DataApiSignalStore:
         if row.get("latest_evaluation") is not None:
             row["latest_evaluation"] = _parse_jsonb_field(row["latest_evaluation"])
         return StoredActiveSetup.model_validate(row)
+
+    # ---- setup_evaluations (Slice 4 Step 4.0, design §5.2) ---------------------
+
+    async def record_setup_evaluation(
+        self,
+        *,
+        setup_id: UUID,
+        signal_id: UUID,
+        status: SetupEvaluationStatus,
+        outcome: SignalOutcome | None = None,
+        reasoning: str | None = None,
+        error: str | None = None,
+        latency_ms: int = 0,
+        token_usage: Mapping[str, Any] | None = None,
+        cost_usd: float | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> UUID:
+        """Insert one ``setup_evaluations`` row (design §5.2); returns the new id.
+
+        Nullable text columns go through ``_str_param`` so ``None`` binds as a
+        typed NULL via the SQL casts; ``evaluated_at`` falls back to ``NOW()``
+        DB-side, mirroring ``update_active_setup``.
+        """
+        evaluation_id = uuid4()
+        await self._execute(
+            """
+            INSERT INTO setup_evaluations
+                (id, setup_id, signal_id, evaluated_at, status, outcome, reasoning,
+                 error, latency_ms, token_usage, cost_usd)
+            VALUES
+                (:id::uuid, :setup_id::uuid, :signal_id::uuid,
+                 COALESCE(:evaluated_at::timestamptz, NOW()),
+                 :status, :outcome, :reasoning, :error, :latency_ms,
+                 :token_usage::jsonb, :cost_usd)
+            """,
+            [
+                _str_param("id", str(evaluation_id)),
+                _str_param("setup_id", str(setup_id)),
+                _str_param("signal_id", str(signal_id)),
+                _str_param(
+                    "evaluated_at",
+                    evaluated_at.isoformat() if evaluated_at is not None else None,
+                ),
+                _str_param("status", status.value),
+                _str_param("outcome", outcome.value if outcome is not None else None),
+                _str_param("reasoning", reasoning),
+                _str_param("error", error),
+                _long_param("latency_ms", latency_ms),
+                _str_param(
+                    "token_usage",
+                    _to_jsonb(dict(token_usage) if token_usage is not None else {}),
+                ),
+                _double_param("cost_usd", cost_usd),
+            ],
+        )
+        return evaluation_id
+
+    async def list_setup_evaluations(
+        self, setup_id: UUID, *, limit: int = 50
+    ) -> list[StoredSetupEvaluation]:
+        """A setup's evaluations newest first; ``limit`` is clamped to 1..200.
+
+        Served by the §5.2 ``(setup_id, evaluated_at DESC)`` index.
+        """
+        capped = max(1, min(limit, 200))
+        response = await self._execute(
+            f"""
+            SELECT id::text AS id, setup_id::text AS setup_id, signal_id::text AS signal_id,
+                   {_utc_iso("evaluated_at", alias="evaluated_at")},
+                   status, outcome, reasoning, error, latency_ms,
+                   token_usage::text AS token_usage,
+                   cost_usd::double precision AS cost_usd
+            FROM setup_evaluations
+            WHERE setup_id = :setup_id::uuid
+            ORDER BY evaluated_at DESC, id DESC
+            LIMIT :limit
+            """,
+            [_str_param("setup_id", str(setup_id)), _long_param("limit", capped)],
+            with_metadata=True,
+        )
+        return [self._row_to_setup_evaluation(row) for row in _parse_records(response)]
+
+    @staticmethod
+    def _row_to_setup_evaluation(row: dict[str, Any]) -> StoredSetupEvaluation:
+        row["token_usage"] = _parse_jsonb_field(row["token_usage"])
+        return StoredSetupEvaluation.model_validate(row)
 
     # ---- Critic v0 (Step 2.14) -- Layer 1: OutcomeResolver queue ---------------
 
@@ -1626,6 +1761,42 @@ class AsyncpgSignalStore:
                 evaluation=evaluation,
                 evaluated_at=evaluated_at,
             )
+
+    # ---- setup_evaluations (Slice 4 Step 4.0, design §5.2) ---------------------
+
+    async def record_setup_evaluation(
+        self,
+        *,
+        setup_id: UUID,
+        signal_id: UUID,
+        status: SetupEvaluationStatus,
+        outcome: SignalOutcome | None = None,
+        reasoning: str | None = None,
+        error: str | None = None,
+        latency_ms: int = 0,
+        token_usage: Mapping[str, Any] | None = None,
+        cost_usd: float | None = None,
+        evaluated_at: datetime | None = None,
+    ) -> UUID:
+        async with self._acquire() as conn:
+            return await SetupEvaluationRepository(conn).record(
+                setup_id=setup_id,
+                signal_id=signal_id,
+                status=status,
+                outcome=outcome,
+                reasoning=reasoning,
+                error=error,
+                latency_ms=latency_ms,
+                token_usage=token_usage,
+                cost_usd=cost_usd,
+                evaluated_at=evaluated_at,
+            )
+
+    async def list_setup_evaluations(
+        self, setup_id: UUID, *, limit: int = 50
+    ) -> list[StoredSetupEvaluation]:
+        async with self._acquire() as conn:
+            return await SetupEvaluationRepository(conn).list_for_setup(setup_id, limit=limit)
 
     # ---- Critic v0 (Step 2.14) -- DecisionRepository delegation ----------------
 

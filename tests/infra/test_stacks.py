@@ -114,12 +114,12 @@ def test_compute_stack_owns_the_dependency_layer(templates: dict[str, Any]) -> N
 
 
 # ---------------------------------------------------------------------------
-# MonitoringStack: 4 alarms + SNS -> notifier Lambda + provider-error filter
+# MonitoringStack: 5 alarms + SNS -> notifier Lambda + provider-error filters
 # ---------------------------------------------------------------------------
 
 
-def test_monitoring_has_four_alarms(templates: dict[str, Any]) -> None:
-    templates["monitoring"].resource_count_is("AWS::CloudWatch::Alarm", 4)
+def test_monitoring_has_five_alarms(templates: dict[str, Any]) -> None:
+    templates["monitoring"].resource_count_is("AWS::CloudWatch::Alarm", 5)
 
 
 def test_monitoring_has_sns_topic_and_lambda_subscription(templates: dict[str, Any]) -> None:
@@ -166,7 +166,7 @@ def test_monitoring_notifier_reads_telegram_param(templates: dict[str, Any]) -> 
 
 
 def test_monitoring_provider_error_metric_filter(templates: dict[str, Any]) -> None:
-    templates["monitoring"].resource_count_is("AWS::Logs::MetricFilter", 1)
+    templates["monitoring"].resource_count_is("AWS::Logs::MetricFilter", 2)
     templates["monitoring"].has_resource_properties(
         "AWS::Logs::MetricFilter",
         assertions.Match.object_like(
@@ -184,6 +184,118 @@ def test_monitoring_provider_error_metric_filter(templates: dict[str, Any]) -> N
                 ),
             }
         ),
+    )
+
+
+def test_monitoring_forecaster_error_metric_filter_and_alarm(templates: dict[str, Any]) -> None:
+    # Final-review fix (Step 4.0): the shared ProviderErrorAlarm needs >= 3
+    # markers in an hour, but the Forecaster emits at most one per open setup
+    # per sweep (cap 3), so a dead Anthropic key with 1-2 open setups would never
+    # alarm. A dedicated filter on BOTH terms + a threshold-1 alarm closes that.
+    templates["monitoring"].has_resource_properties(
+        "AWS::Logs::MetricFilter",
+        assertions.Match.object_like(
+            {
+                "FilterPattern": assertions.Match.string_like_regexp(
+                    "PROVIDER_ERROR.*provider=forecaster"
+                ),
+                "MetricTransformations": assertions.Match.array_with(
+                    [
+                        assertions.Match.object_like(
+                            {
+                                "MetricNamespace": "CryptoSignals",
+                                "MetricName": "ForecasterErrors",
+                            }
+                        )
+                    ]
+                ),
+            }
+        ),
+    )
+    templates["monitoring"].has_resource_properties(
+        "AWS::CloudWatch::Alarm",
+        assertions.Match.object_like(
+            {
+                "Namespace": "CryptoSignals",
+                "MetricName": "ForecasterErrors",
+                "Threshold": 1,
+                "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+            }
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# MonitoringStack: $15/month AWS Budget -> alarm topic (dashboard design §9)
+# ---------------------------------------------------------------------------
+
+
+def test_monitoring_has_monthly_cost_budget(templates: dict[str, Any]) -> None:
+    templates["monitoring"].resource_count_is("AWS::Budgets::Budget", 1)
+    templates["monitoring"].has_resource_properties(
+        "AWS::Budgets::Budget",
+        {
+            "Budget": assertions.Match.object_like(
+                {
+                    "BudgetType": "COST",
+                    "TimeUnit": "MONTHLY",
+                    "BudgetLimit": {"Amount": 15, "Unit": "USD"},
+                }
+            ),
+            "NotificationsWithSubscribers": assertions.Match.array_with(
+                [
+                    assertions.Match.object_like(
+                        {
+                            "Notification": assertions.Match.object_like(
+                                {"NotificationType": "ACTUAL", "Threshold": 80}
+                            )
+                        }
+                    ),
+                    assertions.Match.object_like(
+                        {
+                            "Notification": assertions.Match.object_like(
+                                {"NotificationType": "FORECASTED", "Threshold": 100}
+                            )
+                        }
+                    ),
+                ]
+            ),
+        },
+    )
+
+
+def test_alarm_topic_allows_budgets_to_publish(templates: dict[str, Any]) -> None:
+    # AWS Budgets publishes to SNS as a service principal; without this topic
+    # policy the notification is silently dropped (no Telegram message).
+    templates["monitoring"].has_resource_properties(
+        "AWS::SNS::TopicPolicy",
+        {
+            "PolicyDocument": {
+                "Statement": assertions.Match.array_with(
+                    [
+                        assertions.Match.object_like(
+                            {
+                                "Principal": {"Service": "budgets.amazonaws.com"},
+                                "Action": "sns:Publish",
+                            }
+                        )
+                    ]
+                )
+            }
+        },
+    )
+
+
+def test_budget_depends_on_alarm_topic_policy(templates: dict[str, Any]) -> None:
+    # AWS Budgets validates topic access at create time ("Invalid SNS topic");
+    # without an explicit DependsOn, CFN may create the Budget before the
+    # TopicPolicy update that grants budgets.amazonaws.com publish lands.
+    template = templates["monitoring"]
+    policy_ids = list(template.find_resources("AWS::SNS::TopicPolicy"))
+    assert len(policy_ids) == 1
+    template.has_resource(
+        "AWS::Budgets::Budget",
+        {"DependsOn": assertions.Match.array_with([policy_ids[0]])},
     )
 
 
