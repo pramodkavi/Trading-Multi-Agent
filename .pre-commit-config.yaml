@@ -37,5 +37,7 @@ repos:
           - psycopg[binary]>=3.2
           - asyncpg>=0.29
           - boto3>=1.35
+          - fastapi>=0.115
+          - mangum>=0.19
         args: [--strict, --config-file=pyproject.toml]
         files: ^src/

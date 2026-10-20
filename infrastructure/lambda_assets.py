@@ -10,7 +10,10 @@ unzipped. So the deployable is split into
   * a **dependency layer** -- every ``[project].dependencies`` entry from
     ``pyproject.toml`` except ``boto3`` (already in the Lambda runtime) and
     ``psycopg`` (used only by ``scripts/migrate.py``'s local socket path and
-    the integration tests; nothing under ``src/`` imports it).
+    the integration tests; nothing under ``src/`` imports it). A stack may
+    request named ``[project.optional-dependencies]`` extras on top of that
+    base (``deps_layer(..., extras=("dashboard",))`` -- Slice 4 Step 4.1), so
+    each Lambda ships only the web stack it imports.
 
 Both are produced by CDK *local bundling* (no Docker): pip resolves manylinux
 wheels for the Lambda platform directly, which works on Windows and on the
@@ -93,15 +96,34 @@ def requirement_name(spec: str) -> str:
     return normalize_name(match.group(1))
 
 
-def layer_requirements(pyproject_text: str, exclude: frozenset[str] = LAYER_EXCLUDES) -> list[str]:
-    """The sorted ``[project].dependencies`` entries that belong in the layer."""
+def layer_requirements(
+    pyproject_text: str,
+    exclude: frozenset[str] = LAYER_EXCLUDES,
+    *,
+    extras: Sequence[str] = (),
+) -> list[str]:
+    """The sorted requirement specs that belong in a layer.
+
+    Base ``[project].dependencies`` plus every ``[project.optional-dependencies]``
+    entry named in *extras*, de-duplicated by spec string; *exclude* is applied
+    to the union (an extra that re-lists ``boto3`` must not smuggle it back in).
+    An unknown extra name raises -- a typo in a stack's ``extras=`` must fail
+    ``cdk synth`` loudly, not silently build the base layer and deploy a Lambda
+    that cannot import its web framework.
+    """
     data = tomllib.loads(pyproject_text)
     try:
         deps: list[str] = data["project"]["dependencies"]
     except KeyError as exc:
         raise ValueError("pyproject.toml has no [project].dependencies list") from exc
+    optional: dict[str, list[str]] = data["project"].get("optional-dependencies", {})
+    specs = list(deps)
+    for name in extras:
+        if name not in optional:
+            raise ValueError(f"pyproject.toml has no optional-dependencies extra {name!r}")
+        specs.extend(optional[name])
     excluded = {normalize_name(n) for n in exclude}
-    return sorted(spec for spec in deps if requirement_name(spec) not in excluded)
+    return sorted({spec for spec in specs if requirement_name(spec) not in excluded})
 
 
 def layer_asset_hash(requirements: Sequence[str]) -> str:
@@ -227,11 +249,14 @@ def strip_console_scripts(python_dir: Path) -> None:
             record.write_text("".join(kept), encoding="utf-8")
 
 
-def read_layer_requirements(repo_root: Path | None = None) -> list[str]:
+def read_layer_requirements(
+    repo_root: Path | None = None, *, extras: Sequence[str] = ()
+) -> list[str]:
     # Resolve REPO_ROOT at call time (not as a bound default) so tests can
     # monkeypatch the module attribute.
     root = repo_root if repo_root is not None else REPO_ROOT
-    return layer_requirements((root / "pyproject.toml").read_text(encoding="utf-8"))
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    return layer_requirements(text, extras=extras)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +301,9 @@ def code_asset() -> lambda_.Code:
     )
 
 
-def deps_layer(scope: Construct, construct_id: str) -> lambda_.LayerVersion:
+def deps_layer(
+    scope: Construct, construct_id: str, *, extras: Sequence[str] = ()
+) -> lambda_.LayerVersion:
     """The dependency layer for one stack.
 
     Call once PER STACK (like ``code_asset``): a LayerVersion ARN imported across
@@ -284,13 +311,25 @@ def deps_layer(scope: Construct, construct_id: str) -> lambda_.LayerVersion:
     layer and fail ``cdk deploy --all`` with "Cannot update export ... in use".
     Two stacks building the same content produce one staged asset / one upload.
 
+    *extras* names ``[project.optional-dependencies]`` groups to add to the base
+    set (the dashboard API Lambda needs ``fastapi``/``mangum``; the scan Lambda
+    must not carry them). With no extras the layer is byte-for-byte the one the
+    scan stacks have always built.
+
     OUTPUT hash (spec §3.2): pip runs on every synth (~1-2 min) and the hash is
     taken from the installed tree, so a transitive-dependency change (e.g. a CVE
     fix in urllib3) is picked up and deployed without touching pyproject -- and
     the Trivy scan in CI sees the same resolve that ships. A CUSTOM hash keyed on
     the requirement list would freeze the deployed layer at first publish.
     """
-    requirements = read_layer_requirements()
+    requirements = read_layer_requirements(extras=extras)
+    description = (
+        "crypto-signals runtime dependencies (pyproject [project].dependencies minus "
+        + ", ".join(sorted(LAYER_EXCLUDES))
+        + "); manylinux2014_x86_64 / cp311 wheels."
+    )
+    if extras:
+        description += " + extras: " + ", ".join(extras)
     return lambda_.LayerVersion(
         scope,
         construct_id,
@@ -303,11 +342,7 @@ def deps_layer(scope: Construct, construct_id: str) -> lambda_.LayerVersion:
         ),
         compatible_runtimes=[RUNTIME],
         compatible_architectures=[ARCHITECTURE],
-        description=(
-            "crypto-signals runtime dependencies (pyproject [project].dependencies minus "
-            + ", ".join(sorted(LAYER_EXCLUDES))
-            + "); manylinux2014_x86_64 / cp311 wheels."
-        ),
+        description=description,
     )
 
 
@@ -322,7 +357,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Build / inspect the Lambda code asset and dependency layer.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("print-requirements", help="print the filtered layer requirement specs")
+    p_print = sub.add_parser(
+        "print-requirements", help="print the filtered layer requirement specs"
+    )
     p_code = sub.add_parser("copy-code", help="copy src/ + scripts/ into --out")
     p_code.add_argument("--out", required=True, type=Path)
     p_layer = sub.add_parser("build-layer", help="pip-install the layer into --out/python")
@@ -331,9 +368,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         "freeze", help="build the layer in a temp dir and write `pip freeze` of it to --out"
     )
     p_freeze.add_argument("--out", required=True, type=Path)
+    # The layer-producing commands take the same extras a stack passes to deps_layer.
+    for p_extra in (p_print, p_layer, p_freeze):
+        p_extra.add_argument(
+            "--extra",
+            action="append",
+            default=[],
+            metavar="NAME",
+            help="also include this [project.optional-dependencies] extra (repeatable)",
+        )
     args = parser.parse_args(argv)
 
-    requirements = read_layer_requirements()
+    # copy-code builds no layer and has no --extra, hence getattr.
+    requirements = read_layer_requirements(extras=getattr(args, "extra", []))
     if args.command == "print-requirements":
         print("\n".join(requirements))
         return 0

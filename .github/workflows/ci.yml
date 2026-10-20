@@ -41,7 +41,7 @@ jobs:
           cache: pip
 
       - name: Install project + dev tools
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev,dashboard]"
 
       - name: Install CDK app deps (for the infra synth tests)
         # tests/infra/ synthesizes the CDK stacks with aws-cdk-lib (jsii -> Node,
@@ -99,7 +99,9 @@ jobs:
       - name: Build the layer and pin it
         # Installs the exact manylinux wheel set the Lambda layer ships, then
         # `pip freeze`s it so Trivy sees pinned versions (it skips `>=` floors).
-        run: python infrastructure/lambda_assets.py freeze --out layer-scan/requirements.txt
+        # `--extra dashboard` builds the dashboard API layer, a superset of the
+        # scan layer, so one scan covers both Lambdas.
+        run: python infrastructure/lambda_assets.py freeze --extra dashboard --out layer-scan/requirements.txt
 
       - name: Scan pinned dependencies with Trivy
         # Pin to a current release: older trivy-action tags (e.g. v0.28.0)
