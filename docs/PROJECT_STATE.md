@@ -161,7 +161,9 @@ its layer and the four pipeline stacks are untouched; the first deploy after mer
 2. **API** — `src/dashboard/api/`: `app.py` (`create_app()`, module-level Mangum `handler`),
    `schemas.py` (`HealthResponse`), `routers/health.py` — `GET /api/health` →
    `{"status":"ok","version":"<short git sha | 'dev'>"}`; touches **no DB and no AWS API**.
-   OpenAPI at `/api/openapi.json`, docs at `/api/docs`. `DashboardSettings` / `deps.py` /
+   The app defines `/api/openapi.json` and `/api/docs`, but they are **not routed** through the
+   HTTP API in 4.1 (only `GET /api/health` is; other paths get API Gateway's `Not Found`) — a
+   later step adds them behind the JWT authorizer (design §6). `DashboardSettings` / `deps.py` /
    `queries.py` / `classify.py` are deferred to Step 4.2.
 3. **Infra** — `infrastructure/stacks/dashboard_stack.py`, stack `CryptoSignals-Dashboard`,
    declared **last** in `infrastructure/app.py`, coupled only to `DataStack` (cluster ARN + secret
@@ -203,7 +205,7 @@ after deploy (Step 4.1)" row in §7 and record the URL + function name in §3.
 | **Dashboard stack** | `CryptoSignals-Dashboard` (Step 4.1; **not yet deployed** — created by the first `cdk deploy --all` after the 4.1 merge). Runbook `docs/operations.md §8`. |
 | **Dashboard function name** | _fill in after first deploy_ — CloudFormation → `CryptoSignals-Dashboard` → Outputs → `DashboardFunctionName` |
 | **Dashboard API URL** | _fill in after first deploy_ — Outputs → `DashboardApiUrl`; smoke test `GET <url>/api/health` → `{"status":"ok","version":"<sha>"}`. Only `/api/health` exists until Step 4.2; no auth until Step 4.4. |
-| **Console editing** | The scan + notifier functions are zip-packaged: open **Code** in the Lambda console to read/edit `src/` and `scripts/`, Deploy, then Test (`docs/operations.md §4.1`). **Any `cdk deploy` overwrites console edits.** |
+| **Console editing** | The scan + notifier functions — and, once deployed, the dashboard API function (`docs/operations.md §8.4`) — are zip-packaged: open **Code** in the Lambda console to read/edit `src/` and `scripts/`, Deploy, then Test (`docs/operations.md §4.1`). **Any `cdk deploy` overwrites console edits.** |
 | **Schedule** | EventBridge Scheduler `cron(3 8 * * ? *)` Etc/UTC, **ENABLED** (London open). NY/overlap/wrap/Critic windows added in later steps. |
 | **App secrets** | **Step 2.12 (code; activates on next deploy):** moved to **SSM Parameter Store SecureString** — `/crypto-signals/anthropic-api-key` (plain key string) and `/crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). Created out-of-band via `aws ssm put-parameter --type SecureString` (CFN can't create SecureString) — see `docs/operations.md §1`. Pre-2.12 these were Secrets Manager secrets (no leading slash); the 2.12 deploy removes them. The Aurora DB credential stays in Secrets Manager. |
 | **Estimated cost** | ~$5–9/month (Aurora scales to zero when idle). |
@@ -231,7 +233,7 @@ python -m venv .venv
 
 # 3. Pre-commit + sanity
 .\.venv\Scripts\python.exe -m pre_commit install
-.\.venv\Scripts\python.exe -m pytest -q          # expect: 351 passed
+.\.venv\Scripts\python.exe -m pytest -q          # expect: 1051 passed, 23 deselected (as of Step 4.1)
 .\.venv\Scripts\python.exe -m mypy --strict src/ scripts/
 
 # 4. AWS creds (the NEW machine needs its own credentials for account 097853039368)

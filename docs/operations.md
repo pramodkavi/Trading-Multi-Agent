@@ -523,9 +523,16 @@ curl -s https://<api-id>.execute-api.ap-south-1.amazonaws.com/api/health
 ```
 
 `version` is the deployed commit: `GITHUB_SHA[:7]` when built on the runner
-(`git rev-parse --short HEAD` for a local synth, else `local`). It must match the
-merge commit that triggered the deploy — if it does not, the deploy picked up a
-stale asset. OpenAPI is served at `/api/openapi.json`, Swagger UI at `/api/docs`.
+(`git rev-parse --short HEAD` for a local synth, else `local`). It should match the
+merge commit that triggered the deploy — if it does not, the deploy ran from a
+different commit than expected (`APP_VERSION` is baked at synth time).
+
+The FastAPI app also defines `/api/openapi.json` and `/api/docs` (`openapi_url` /
+`docs_url` in `create_app()`), but in Step 4.1 the HTTP API routes **only**
+`GET /api/health` — any other path (including those two) returns API Gateway's
+`{"message":"Not Found"}`. They become reachable when a later step adds the routes
+behind the JWT authorizer (design §6: "OpenAPI served at `/api/docs` (behind the
+authorizer)").
 
 A request also produces one line in `DashboardApiAccessLogs`; the fields should be
 real values, not all `-` (CDK's default access-log format uses REST-era variables —
@@ -540,6 +547,9 @@ The function is zip-packaged like the scan Lambda (§4.1): **Code** tab shows
 
 ### 8.5 Removal
 
-The stack is independent: deleting `CryptoSignals-Dashboard` in CloudFormation
-(or `cdk destroy CryptoSignals-Dashboard` from Actions) removes the API, function,
-layer and log groups without touching the pipeline stacks.
+The stack is independent: deleting `CryptoSignals-Dashboard` in the CloudFormation
+console removes the API, function, layer and log groups without touching the
+pipeline stacks. No workflow exposes `cdk destroy` for it (the deploy workflow's
+`recreate_stateless_stacks` covers Monitoring / Scheduling / Compute only), and the
+hard rule rules out a local CLI — the console delete is the path. Note that the next
+`cdk deploy --all` recreates it.

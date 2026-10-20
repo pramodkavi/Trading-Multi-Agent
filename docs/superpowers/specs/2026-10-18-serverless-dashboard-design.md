@@ -364,7 +364,7 @@ Operator usage assumption: ~20 dashboard sessions/week, ~10 minutes each, 60 s p
 
 | Item | Monthly | Notes |
 |---|---|---|
-| Lambda (dashboard) | ~$0.00 | ~15 k invocations × 256 MB × ~0.5 s ≈ well inside the permanent free tier |
+| Lambda (dashboard) | ~$0.00 | ~15 k invocations × 512 MB (as built in Step 4.1; §12 range 256–512) × ~0.5 s ≈ 3.75 k GB-s, well inside the permanent free tier (400 k GB-s/month) |
 | API Gateway HTTP API | ~$0.00–0.02 | $1.00 per million requests after the first year |
 | Cognito | $0.00 | free under 50 k MAU; advanced security off |
 | S3 + CloudFront | ~$0.00–0.05 | KBs of assets; CloudFront free tier 1 TB/month |
