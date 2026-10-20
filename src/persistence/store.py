@@ -200,6 +200,10 @@ def _signal_projection(prefix: str) -> str:
                    {q}outcome_metadata::text AS outcome_metadata"""
 
 
+# Public alias so the Slice 4 dashboard queries never import a private name.
+signal_projection = _signal_projection
+
+
 # Unresolved decision (design §5.1): a proposal (direction set) or a gate-rejected
 # skip (payload.violated_rule set) with no decision_resolutions row yet, old enough
 # that its resolution window has elapsed. NO_SETUP skips never need a replay.
@@ -520,7 +524,9 @@ class DataApiSignalStore:
     scan Lambda, which can afford to wait out a scale-from-zero resume.
     Request-scoped callers behind API Gateway's 30 s cap -- the Slice 4
     dashboard -- must pass a small budget (``1`` fails fast) rather than let a
-    cold cluster time out the HTTP request (dashboard design §3.4).
+    cold cluster time out the HTTP request (dashboard design §3.4). The
+    dashboard reads through :meth:`read_rows` (its only SQL seam, design §6.2)
+    and maps ``signal_projection`` rows with :meth:`row_to_signal`.
     """
 
     def __init__(
@@ -618,6 +624,24 @@ class DataApiSignalStore:
         # The loop returns on success or re-raises on the final attempt; this line
         # is unreachable but satisfies the type checker's return-path analysis.
         raise AssertionError("unreachable: _execute retry loop exited")  # pragma: no cover
+
+    async def read_rows(
+        self,
+        sql: str,
+        parameters: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Run a read-only statement and return its rows as plain dicts.
+
+        The dashboard's read seam (Slice 4 Step 4.2, dashboard design §6.2):
+        the **only** public SQL entry point the dashboard queries use, so the
+        pipeline's typed methods stay the only writers and the Data API wiring
+        (ARNs, resume retry, typed-field parsing) lives in one place. Executes
+        with ``includeResultMetadata=True`` and zips column labels to values via
+        :func:`_parse_records`. Raises whatever :meth:`_execute` raises; not part
+        of the :class:`SignalStore` protocol.
+        """
+        response = await self._execute(sql, parameters, with_metadata=True)
+        return _parse_records(response)
 
     # ---- scan_runs --------------------------------------------------------
 
@@ -945,6 +969,10 @@ class DataApiSignalStore:
         if row.get("outcome_metadata") is not None:
             row["outcome_metadata"] = _parse_jsonb_field(row["outcome_metadata"])
         return StoredSignal.model_validate(row)
+
+    # Public alias for the Slice 4 dashboard: a ``signal_projection`` row from
+    # ``read_rows`` -> StoredSignal, without importing a private name.
+    row_to_signal = _row_to_signal
 
     # ---- agent_runs -------------------------------------------------------
 

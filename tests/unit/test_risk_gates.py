@@ -551,3 +551,12 @@ async def test_node_ignores_non_proposal_state() -> None:
     state = {"proposal": skip, "snapshot": _snapshot(), "scan_context": make_scan_context()}
     out = await node(state)  # type: ignore[arg-type]
     assert out == {}
+
+
+async def test_gather_risk_context_without_snapshot_has_no_funding_rate() -> None:
+    ctx = await gather_risk_context(
+        store=_FakeStore(),  # type: ignore[arg-type]
+        snapshot=None,
+        now=datetime(2026, 10, 20, 9, tzinfo=UTC),
+    )
+    assert ctx.funding_rate is None and ctx.open_setup_count == 0

@@ -45,6 +45,7 @@ from src.persistence.store import (
     DataApiSignalStore,
     _parse_field,
     _parse_records,
+    signal_projection,
 )
 
 CLUSTER_ARN = "arn:aws:rds:us-east-1:123456789012:cluster:crypto"
@@ -1437,3 +1438,24 @@ async def test_list_setup_evaluations_floors_limit_at_one() -> None:
     store, client = make_store(response([]))
     assert await store.list_setup_evaluations(uuid4(), limit=0) == []
     assert params_by_name(client.calls[0])["limit"] == {"longValue": 1}
+
+
+# ---------------------------------------------------------------------------
+# Dashboard read seam (Slice 4 Step 4.2, design §6.2)
+# ---------------------------------------------------------------------------
+
+
+async def test_read_rows_executes_with_metadata_and_parses() -> None:
+    store, client = make_store(response(["n", "name"], [{"longValue": 2}, {"stringValue": "x"}]))
+    rows = await store.read_rows("SELECT :a AS n", [{"name": "a", "value": {"longValue": 2}}])
+    assert rows == [{"n": 2, "name": "x"}]
+    assert client.calls[0]["includeResultMetadata"] is True
+    assert client.calls[0]["sql"] == "SELECT :a AS n"
+
+
+def test_signal_projection_public_alias() -> None:
+    assert signal_projection is store_module._signal_projection
+
+
+def test_row_to_signal_public_alias() -> None:
+    assert DataApiSignalStore.row_to_signal is DataApiSignalStore._row_to_signal
