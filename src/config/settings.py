@@ -35,6 +35,20 @@ DEFAULT_WATCHLIST: list[str] = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 _VALID_LOG_LEVELS: frozenset[str] = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
+def parse_symbol_csv(v: object) -> object:
+    """Accept a comma-separated string from an env var and split it to a list.
+
+    Env vars are always strings, so SCAN_SYMBOLS='BTCUSDT,ETHUSDT' arrives as
+    one string. Split on commas, strip whitespace, uppercase, and drop empties.
+    A genuine list (from tests / programmatic construction) passes through
+    untouched. Shared by `Settings` (the scan Lambda) and the dashboard's
+    `DashboardSettings` so both read the same `SCAN_SYMBOLS` the same way.
+    """
+    if isinstance(v, str):
+        return [part.strip().upper() for part in v.split(",") if part.strip()]
+    return v
+
+
 class Settings(BaseSettings):
     """Typed application configuration loaded from environment / .env.
 
@@ -111,9 +125,9 @@ class Settings(BaseSettings):
 
     # ---- Operational (defaulted) -----------------------------------------
     # NoDecode disables pydantic-settings' default JSON pre-parse for this
-    # complex (list) field, so the raw env string reaches _split_csv_symbols
-    # below. Without it, pydantic-settings tries json.loads('BTCUSDT,...')
-    # and fails before our validator runs.
+    # complex (list) field, so the raw env string reaches parse_symbol_csv via
+    # the validator below. Without it, pydantic-settings tries
+    # json.loads('BTCUSDT,...') and fails before our validator runs.
     scan_symbols: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: list(DEFAULT_WATCHLIST),
         description="Watchlist symbols. Env var SCAN_SYMBOLS is a comma-separated "
@@ -129,16 +143,8 @@ class Settings(BaseSettings):
     @field_validator("scan_symbols", mode="before")
     @classmethod
     def _split_csv_symbols(cls, v: object) -> object:
-        """Accept a comma-separated string from the env var and split to a list.
-
-        Env vars are always strings, so SCAN_SYMBOLS='BTCUSDT,ETHUSDT' arrives
-        as one string. We split on commas, strip whitespace, uppercase, and
-        drop empties. A genuine list (from tests / programmatic construction)
-        passes through untouched.
-        """
-        if isinstance(v, str):
-            return [part.strip().upper() for part in v.split(",") if part.strip()]
-        return v
+        """Split a comma-separated SCAN_SYMBOLS string (see `parse_symbol_csv`)."""
+        return parse_symbol_csv(v)
 
     @field_validator("scan_symbols")
     @classmethod
