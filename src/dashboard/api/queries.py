@@ -710,10 +710,20 @@ WHERE signal_id = :signal_id::uuid"""
 class UsageDay(BaseModel):
     """Runs, failures and LLM spend of one agent role on one UTC day.
 
-    Three sources (design §4.2 P7): ``agent_runs`` (the scan pipeline -- a row is
-    only written on success, so ``errors`` is 0), ``setup_evaluations`` (role
-    ``forecaster``; ``ERROR`` rows are failures) and ``decision_reviews`` (role
-    ``critic``; a set ``error`` is a failure). Unpriced calls (NULL cost) add 0.
+    Source rule (no double counting):
+
+    * ``agent_runs`` is the source of runs and cost for **every** role it holds,
+      the Critic included -- a successful review is written to ``agent_runs``
+      (role ``critic``, same ``cost_usd``) *and* to ``decision_reviews``, and the
+      Critic's report call exists only in ``agent_runs``. A row is only written on
+      success, so these rows carry ``errors`` = 0.
+    * ``decision_reviews`` contributes **only failures**: rows with ``error`` set
+      (never in ``agent_runs``, NULL cost) add one run + one error to ``critic``
+      and zero cost.
+    * ``setup_evaluations`` is the Forecaster (role ``forecaster``; it has no
+      ``agent_runs`` rows -- no scan id): runs, ``ERROR`` rows as errors, cost.
+
+    Unpriced calls (NULL cost) add 0.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -765,7 +775,8 @@ def _utc_day(column: str) -> str:
 
 
 # One statement, three sources, aggregated per (UTC day, role). A bounded result:
-# at most 30 days x 6 roles rows.
+# at most 30 days x 6 roles rows. Source rule in `UsageDay`: decision_reviews adds
+# only its FAILED rows (successful reviews are already in agent_runs as `critic`).
 _USAGE_BY_DAY_SQL = f"""SELECT day, role,
        sum(runs)::bigint AS runs,
        sum(errors)::bigint AS errors,
@@ -786,10 +797,10 @@ FROM (
     GROUP BY 1
     UNION ALL
     SELECT {_utc_day("created_at")} AS day, 'critic' AS role,
-           count(*) AS runs, count(*) FILTER (WHERE error IS NOT NULL) AS errors,
-           sum(cost_usd)::double precision AS cost_usd
+           count(*) AS runs, count(*) AS errors,
+           0::double precision AS cost_usd
     FROM decision_reviews
-    WHERE created_at >= :since::timestamptz
+    WHERE error IS NOT NULL AND created_at >= :since::timestamptz
     GROUP BY 1
 ) u
 GROUP BY day, role

@@ -18,7 +18,8 @@ Step 4.3: the OPEN setup cards carry a best-effort unrealised R -- one
 5 s overall budget). Binance down or slow leaves `unrealised_r` null with
 "price unavailable"; the landing page is still 200. The alarm strip is one
 CloudWatch `DescribeAlarms` (`cloudwatch.read_alarms`), run concurrently with
-the price fetch; a CloudWatch error leaves `alarms` null with
+the price fetch under its own 5 s budget (`cloudwatch.ALARM_BUDGET_S`); a
+CloudWatch error or a blown budget leaves `alarms` null with
 `alarms_note = "cloudwatch unavailable"` -- still 200.
 """
 
@@ -30,7 +31,7 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter
 
 from src.agents.orchestration.risk_gates import gather_risk_context
-from src.dashboard.api import market
+from src.dashboard.api import cloudwatch, market
 from src.dashboard.api import overview as assembly
 from src.dashboard.api.cloudwatch import CloudWatchDep, read_alarms
 from src.dashboard.api.deps import StoreDep
@@ -78,7 +79,7 @@ async def overview(
             now=now,
             budget_s=market.PRICE_BUDGET_S,
         ),
-        read_alarms(cw),
+        read_alarms(cw, budget_s=cloudwatch.ALARM_BUDGET_S),
     )
 
     health = HealthStrip(

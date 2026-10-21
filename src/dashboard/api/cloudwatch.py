@@ -39,6 +39,7 @@ from fastapi import Depends
 from pydantic import BaseModel, ConfigDict, Field
 
 __all__ = [
+    "ALARM_BUDGET_S",
     "ALARM_PREFIX",
     "CLIENT_CONFIG",
     "CLOUDWATCH_UNAVAILABLE",
@@ -63,6 +64,10 @@ ALARM_PREFIX: Final = "CryptoSignals-Monitoring-"
 SCAN_FUNCTION_PREFIX: Final = "CryptoSignals-Compute-ScanLambda"
 # The section note when CloudWatch refused or failed (AccessDenied, throttling, network).
 CLOUDWATCH_UNAVAILABLE: Final = "cloudwatch unavailable"
+
+# Overall budget for the overview's alarm-strip fetch. Routers read it at call time
+# (`cloudwatch.ALARM_BUDGET_S`) so tests can shrink it, like `market.PRICE_BUDGET_S`.
+ALARM_BUDGET_S: float = 5.0
 
 # Bounded like the Data API client (deps.py): one attempt, short timeouts.
 CLIENT_CONFIG: Final = Config(
@@ -327,10 +332,23 @@ def get_cloudwatch_reader() -> CloudWatchReader:
 CloudWatchDep = Annotated[CloudWatchReader, Depends(get_cloudwatch_reader)]
 
 
-async def read_alarms(reader: CloudWatchReader) -> tuple[list[AlarmState] | None, str | None]:
-    """``(alarms, None)``, or ``(None, "cloudwatch unavailable")`` on a CloudWatch error."""
+async def read_alarms(
+    reader: CloudWatchReader, *, budget_s: float | None = None
+) -> tuple[list[AlarmState] | None, str | None]:
+    """``(alarms, None)``, or ``(None, "cloudwatch unavailable")`` on a CloudWatch error.
+
+    With ``budget_s`` the call is bounded by ``asyncio.wait_for`` and a blown
+    budget degrades the same way (the overview passes :data:`ALARM_BUDGET_S` so a
+    slow CloudWatch cannot hold the landing page). The worker thread itself
+    cannot be cancelled; it finishes within the client's own 3 s / 10 s bounds.
+    """
     try:
-        return await reader.describe_alarms(ALARM_PREFIX), None
+        call = reader.describe_alarms(ALARM_PREFIX)
+        alarms = await (call if budget_s is None else asyncio.wait_for(call, timeout=budget_s))
+    except TimeoutError:
+        logger.warning("CloudWatch DescribeAlarms exceeded the %.1f s budget", budget_s)
+        return None, CLOUDWATCH_UNAVAILABLE
     except (ClientError, BotoCoreError) as exc:
         logger.warning("CloudWatch DescribeAlarms failed: %s", exc)
         return None, CLOUDWATCH_UNAVAILABLE
+    return alarms, None

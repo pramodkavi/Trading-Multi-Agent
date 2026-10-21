@@ -7,6 +7,8 @@ SQL-dispatching fake reader (no Data API) and a fake `CloudWatchReader`
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -17,10 +19,14 @@ from fastapi.testclient import TestClient
 
 from src.common.models import ScanStatus
 from src.common.schedule import SCAN_WINDOWS
+from src.dashboard.api import cloudwatch, system
 from src.dashboard.api import overview as assembly
-from src.dashboard.api import system
 from src.dashboard.api.app import create_app
-from src.dashboard.api.cloudwatch import CLOUDWATCH_UNAVAILABLE, get_cloudwatch_reader
+from src.dashboard.api.cloudwatch import (
+    CLOUDWATCH_UNAVAILABLE,
+    AlarmState,
+    get_cloudwatch_reader,
+)
 from src.dashboard.api.deps import get_store
 from src.dashboard.api.queries import ConfigFacts, EvaluationStamp, UsageDay
 from src.dashboard.api.settings import DashboardSettings, get_dashboard_settings
@@ -181,7 +187,7 @@ def test_cost_per_day_sums_three_sources() -> None:
         UsageDay(date=d1, role="analyzer", runs=4, errors=0, cost_usd=0.10),
         UsageDay(date=d1, role="judge", runs=1, errors=0, cost_usd=0.05),
         UsageDay(date=d1, role="forecaster", runs=3, errors=1, cost_usd=0.02),  # setup_evaluations
-        UsageDay(date=d1, role="critic", runs=2, errors=0, cost_usd=0.30),  # decision_reviews
+        UsageDay(date=d1, role="critic", runs=2, errors=0, cost_usd=0.30),  # agent_runs
         UsageDay(date=d2, role="analyzer", runs=4, errors=0, cost_usd=0.12),
     ]
     days = system.cost_per_day(usage)
@@ -226,6 +232,42 @@ def test_system_agents_route_reads_three_tables(monkeypatch: pytest.MonkeyPatch)
     assert "status = 'ERROR'" in sql and "error IS NOT NULL" in sql
     assert datetime.fromisoformat(params["since"]) == _at(0, 0, day=date(2026, 10, 14))
     assert ":since" in sql and "2026" not in sql  # bound, never formatted
+
+
+def _usage_branches(sql: str) -> dict[str, str]:
+    """The UNION ALL branches of the usage statement, keyed by their source table."""
+    inner = sql.split("FROM (", 1)[1].rsplit(") u", 1)[0]
+    branches: dict[str, str] = {}
+    for branch in inner.split("UNION ALL"):
+        for table in ("agent_runs", "setup_evaluations", "decision_reviews"):
+            if f"FROM {table}" in branch:
+                branches[table] = branch
+    return branches
+
+
+def test_agent_usage_sql_does_not_double_count_critic(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A successful review is persisted to BOTH decision_reviews and agent_runs (role
+    # critic, same cost_usd; critic/reviewer.py), so decision_reviews may add only its
+    # FAILED rows -- one run + one error each, zero cost -- or the Critic counts twice.
+    fake = SqlFake()
+    assert _client(fake, monkeypatch).get("/api/system/agents").status_code == 200
+    ((sql, _),) = fake.calls
+    branches = _usage_branches(sql)
+    assert set(branches) == {"agent_runs", "setup_evaluations", "decision_reviews"}
+
+    reviews = branches["decision_reviews"]
+    assert "WHERE error IS NOT NULL" in reviews
+    assert "0::double precision AS cost_usd" in reviews
+    assert "sum(cost_usd)" not in reviews and "cost_usd)" not in reviews
+    assert "count(*) AS runs, count(*) AS errors" in reviews
+
+    # agent_runs is the source of runs + cost for every role, the Critic included.
+    runs = branches["agent_runs"]
+    assert "agent_role AS role" in runs and "sum(cost_usd)" in runs
+    assert "critic" not in runs  # no role filter excluding (or special-casing) the Critic
+    # The Forecaster has no agent_runs rows; setup_evaluations is its whole source.
+    evals = branches["setup_evaluations"]
+    assert "'forecaster' AS role" in evals and "sum(cost_usd)" in evals
 
 
 @pytest.mark.parametrize("path", ["/api/system/agents", "/api/system/sweeps"])
@@ -370,6 +412,35 @@ def test_overview_alarm_strip_degrades(overview_scenario: Scenario) -> None:
     assert resp.status_code == 200
     health = resp.json()["health"]
     assert health["alarms"] is None and health["alarms_note"] == CLOUDWATCH_UNAVAILABLE
+
+
+class _SlowReader(FakeReader):
+    """Alarms that never arrive inside the budget."""
+
+    async def describe_alarms(self, prefix: str) -> list[AlarmState]:
+        self.calls.append(("describe_alarms", prefix))
+        await asyncio.sleep(10)
+        return [ALARM]  # pragma: no cover - cancelled by the budget
+
+
+def test_overview_alarm_strip_degrades_on_timeout(
+    overview_scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cloudwatch, "ALARM_BUDGET_S", 0.05)
+    app, client = _client_for(overview_scenario.store)
+    reader = _SlowReader()
+    app.dependency_overrides[get_cloudwatch_reader] = lambda: reader
+    started = time.perf_counter()
+    resp = client.get("/api/overview")
+    assert time.perf_counter() - started < 5  # the budget, not the 10 s sleep
+    assert resp.status_code == 200
+    health = resp.json()["health"]
+    assert health["alarms"] is None and health["alarms_note"] == CLOUDWATCH_UNAVAILABLE
+    assert reader.calls == [("describe_alarms", "CryptoSignals-Monitoring-")]
+
+
+def test_alarm_budget_default_is_5s() -> None:
+    assert cloudwatch.ALARM_BUDGET_S == 5.0
 
 
 def test_openapi_lists_system_routes() -> None:
