@@ -12,8 +12,8 @@ prefix and routes are declared with their full `/api/...` paths.
 `lifespan="off"`: nothing is opened at startup. The store lives in `deps.py`
 (Step 4.2) and is created lazily on the first request that depends on it, so
 startup stays I/O-free and the unauthenticated `/api/health` probe can never
-wake Aurora. `errors.py` installs the app-wide Data API error mapping
-(503 `db_resuming` / 502 `db_error`) for the data routes.
+wake Aurora. `errors.py` installs the app-wide error mapping for the data
+routes (503 `db_resuming` / 502 `db_error` / 404 `not_found` / 400 `bad_cursor`).
 
 `APP_VERSION` is the short git SHA injected by CDK; it falls back to `"dev"`
 when unset (local runs, tests).
@@ -27,7 +27,7 @@ from fastapi import FastAPI
 from mangum import Mangum
 
 from src.dashboard.api.errors import register_error_handlers
-from src.dashboard.api.routers import health, system
+from src.dashboard.api.routers import health, overview, setups, signals, system
 
 
 def create_app(*, version: str | None = None) -> FastAPI:
@@ -47,6 +47,11 @@ def create_app(*, version: str | None = None) -> FastAPI:
     register_error_handlers(app)
     app.include_router(health.router)
     app.include_router(system.router)
+    # Step 4.2 data routes. They exist in the FastAPI app only: the HTTP API routes
+    # them (behind the authorizer) in Step 4.4.
+    app.include_router(overview.router)
+    app.include_router(setups.router)
+    app.include_router(signals.router)
     return app
 
 

@@ -1,0 +1,419 @@
+"""Pure assembly helpers for the dashboard's data routes (design §4.2, §5.3, §3.4).
+
+Everything here is a function of its arguments and the ``now`` it is handed:
+no store, no clock reads except :func:`utcnow` (the one seam the routers call
+and the tests monkeypatch), no HTTP. The routers (``routers/overview.py``,
+``routers/setups.py``, ``routers/signals.py``) do the I/O through ``queries``
+and the typed store methods, then hand the models to these helpers.
+
+Three rules of the overview are decided here and nowhere else:
+
+* **Risk numbers come from ``risk_gates``** (design §5.3): :func:`build_risk_budget`
+  takes the :class:`RiskContext` that ``gather_risk_context`` built and runs the
+  gate's own ``check_loss_streak`` / ``check_session`` over it, so the dashboard
+  can never disagree with what the gate will see.
+* **A window is a group of per-symbol scan rows.** The scan Lambda writes one
+  ``scan_runs`` row per symbol per invocation, so :func:`window_outcome`
+  aggregates the group (earliest start, worst status, sorted symbol union,
+  first error) and :func:`bucket_windows` keys the groups by
+  ``schedule.window_for``; an ``AD_HOC`` run belongs to no window.
+* **Forecaster staleness is relative to the last *completed* sweep.** The
+  Forecaster runs inside each scheduled scan, so a sweep is counted once the
+  fire time plus :data:`SWEEP_GRACE` has passed (:func:`last_sweep_at`); an OPEN
+  setup is stale when it was never evaluated or last evaluated before that
+  fire time (:func:`count_stale`). Before the first sweep of the day only the
+  never-evaluated setups count.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
+from uuid import UUID
+
+from src.agents.orchestration.risk_gates import (
+    LOSS_PAUSE,
+    RiskContext,
+    check_loss_streak,
+    check_session,
+)
+from src.common.models import AgentRole, ScanStatus
+from src.common.schedule import AD_HOC, SCAN_WINDOWS, next_scan_at, window_for, windows_for_day
+from src.common.sessions import session_for
+from src.dashboard.api.queries import JournalRow, SetupCard
+from src.dashboard.api.schemas import (
+    LifecycleStep,
+    RiskBudget,
+    SetupCardOut,
+    SignalRowOut,
+    SymbolChip,
+    WindowOutcome,
+    WindowSummary,
+)
+from src.persistence.models import StoredActiveSetup, StoredAgentRun, StoredScanRun, StoredSignal
+
+__all__ = [
+    "AD_HOC_GROUP_TOLERANCE",
+    "SWEEP_GRACE",
+    "bucket_windows",
+    "build_risk_budget",
+    "count_stale",
+    "last_scan_outcome",
+    "last_sweep_at",
+    "lifecycle_step",
+    "setup_card_for_signal",
+    "setup_card_out",
+    "signal_row_out",
+    "trim_output",
+    "utcnow",
+    "window_outcome",
+]
+
+# A scheduled sweep is counted once its fire time plus this grace has passed: the
+# Forecaster evaluates inside the scan, which takes a minute or two end to end.
+SWEEP_GRACE = timedelta(minutes=2)
+
+# Per-symbol rows of one AD_HOC invocation start within seconds of each other; rows
+# further apart than this are separate invocations (e.g. two console tests).
+AD_HOC_GROUP_TOLERANCE = timedelta(minutes=5)
+
+# Worst-first status precedence for a window's aggregate outcome.
+_STATUS_RANK: dict[ScanStatus, int] = {
+    ScanStatus.FAILED: 0,
+    ScanStatus.RUNNING: 1,
+    ScanStatus.SUCCESS: 2,
+}
+
+
+def utcnow() -> datetime:
+    """The routers' clock (tests monkeypatch this module attribute)."""
+    return datetime.now(UTC)
+
+
+def _require_aware(value: datetime, name: str) -> datetime:
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        raise ValueError(f"{name} must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _age_seconds(since: datetime, *, now: datetime) -> int:
+    """Whole seconds from ``since`` to ``now``, never negative (clock skew / in-flight rows)."""
+    return max(0, int((now - since).total_seconds()))
+
+
+# ---------------------------------------------------------------------------
+# Risk budget (design §5.3)
+# ---------------------------------------------------------------------------
+
+
+def build_risk_budget(ctx: RiskContext, *, now: datetime) -> RiskBudget:
+    """The SPEC §1.6 caps as the gate will see them, from the gate's own context + checks.
+
+    ``pause_until`` is set only while the loss-streak pause is active (rule 6):
+    the latest loss plus the 24 h window. ``session`` / ``session_blocked`` come
+    from the clock via ``sessions.session_for`` and the gate's ``check_session``
+    (rule 7). Raises ``ValueError`` on a naive ``now``.
+    """
+    now_utc = _require_aware(now, "now")
+    streak = check_loss_streak(
+        consecutive_losses=ctx.consecutive_losses,
+        latest_loss_at=ctx.latest_loss_at,
+        now=now_utc,
+    )
+    pause_active = not streak.passed
+    pause_until = (
+        ctx.latest_loss_at + LOSS_PAUSE if pause_active and ctx.latest_loss_at is not None else None
+    )
+    session = session_for(now_utc)
+    next_fire = next_scan_at(now_utc)
+    return RiskBudget(
+        open_setups=ctx.open_setup_count,
+        published_24h=ctx.published_last_24h,
+        loss_streak=ctx.consecutive_losses,
+        pause_active=pause_active,
+        pause_until=pause_until,
+        session=session.value,
+        session_blocked=not check_session(session).passed,
+        next_scan_at=next_fire,
+        seconds_to_next_scan=_age_seconds(now_utc, now=next_fire),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scan windows (design §4.2 P1 "last scan per window")
+# ---------------------------------------------------------------------------
+
+
+def window_outcome(label: str, scans: Sequence[StoredScanRun]) -> WindowOutcome:
+    """Aggregate the per-symbol ``scan_runs`` rows of one window / invocation.
+
+    Earliest ``started_at``, worst ``status`` (FAILED > RUNNING > SUCCESS), the
+    sorted union of ``symbols`` and the first ``error_message`` in start order.
+    Raises ``ValueError`` when ``scans`` is empty (a window with no rows is
+    ``None`` on the wire, never an empty outcome).
+    """
+    if not scans:
+        raise ValueError("window_outcome needs at least one scan run")
+    ordered = sorted(scans, key=lambda s: (s.started_at, str(s.id)))
+    symbols = sorted({sym for s in ordered for sym in (s.symbols or [])})
+    status = min((s.status for s in ordered), key=lambda st: _STATUS_RANK.get(st, 1))
+    error = next((s.error_message for s in ordered if s.error_message), None)
+    return WindowOutcome(
+        label=label,
+        started_at=ordered[0].started_at,
+        status=status,
+        symbols=symbols,
+        error=error,
+    )
+
+
+def _scans_on(scans: Sequence[StoredScanRun], day: date) -> list[StoredScanRun]:
+    return [s for s in scans if s.started_at.astimezone(UTC).date() == day]
+
+
+def _chips_for(rows: Sequence[JournalRow], scan_ids: set[UUID]) -> list[SymbolChip]:
+    chips = [
+        SymbolChip(
+            symbol=row.signal.symbol,
+            kind=row.decision_kind,
+            violated_rule=row.violated_rule,
+            signal_id=row.signal.id,
+        )
+        for row in rows
+        if row.signal.scan_id in scan_ids
+    ]
+    return sorted(chips, key=lambda c: (c.symbol, str(c.signal_id)))
+
+
+def bucket_windows(
+    scans: Sequence[StoredScanRun], rows: Sequence[JournalRow], *, day: date
+) -> list[WindowSummary]:
+    """Today's four scheduled windows with their scan outcome and per-symbol chips.
+
+    A scan row belongs to the window ``schedule.window_for`` assigns it (fire
+    time to fire time + 30 min); ``AD_HOC`` rows -- console tests, retries hours
+    later -- and rows from other UTC dates appear in no window. Chips are the
+    journal rows of the window's scans, sorted by symbol.
+    """
+    todays = _scans_on(scans, day)
+    by_label: dict[str, list[StoredScanRun]] = {}
+    for scan in todays:
+        by_label.setdefault(window_for(scan.started_at), []).append(scan)
+
+    summaries: list[WindowSummary] = []
+    for window, fire_time in zip(SCAN_WINDOWS, windows_for_day(day), strict=True):
+        group = by_label.get(window.label, [])
+        summaries.append(
+            WindowSummary(
+                label=window.label,
+                fire_time=fire_time,
+                scan=window_outcome(window.label, group) if group else None,
+                symbols=_chips_for(rows, {s.id for s in group}),
+            )
+        )
+    return summaries
+
+
+def last_scan_outcome(scans: Sequence[StoredScanRun], *, day: date) -> WindowOutcome | None:
+    """The most recent scan on ``day`` as a window outcome, or ``None`` if none ran yet.
+
+    The latest row names the group: every row of the same scheduled window, or
+    -- for an ``AD_HOC`` row -- the ``AD_HOC`` rows that started within
+    :data:`AD_HOC_GROUP_TOLERANCE` before it (one invocation's per-symbol rows).
+    """
+    todays = _scans_on(scans, day)
+    if not todays:
+        return None
+    latest = max(todays, key=lambda s: (s.started_at, str(s.id)))
+    label = window_for(latest.started_at)
+    if label == AD_HOC:
+        group = [
+            s
+            for s in todays
+            if window_for(s.started_at) == AD_HOC
+            and timedelta(0) <= latest.started_at - s.started_at <= AD_HOC_GROUP_TOLERANCE
+        ]
+    else:
+        group = [s for s in todays if window_for(s.started_at) == label]
+    return window_outcome(label, group)
+
+
+# ---------------------------------------------------------------------------
+# Forecaster coverage
+# ---------------------------------------------------------------------------
+
+
+def last_sweep_at(now: datetime) -> datetime | None:
+    """Fire time of the latest scheduled scan today whose sweep had time to finish.
+
+    A window counts once ``fire + SWEEP_GRACE <= now``; returns ``None`` before the
+    first such window of the UTC day. Raises ``ValueError`` on a naive ``now``.
+    """
+    now_utc = _require_aware(now, "now")
+    completed = [fire for fire in windows_for_day(now_utc.date()) if fire + SWEEP_GRACE <= now_utc]
+    return completed[-1] if completed else None
+
+
+def count_stale(cards: Sequence[SetupCard], *, sweep_at: datetime | None) -> int:
+    """OPEN setups the last completed sweep did not cover.
+
+    Never evaluated -> stale. Otherwise stale iff last evaluated before
+    ``sweep_at``; with no sweep yet today (``sweep_at is None``) an evaluated
+    setup cannot have missed one.
+    """
+    return sum(
+        1
+        for card in cards
+        if card.last_evaluated_at is None
+        or (sweep_at is not None and card.last_evaluated_at < sweep_at)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Setup cards
+# ---------------------------------------------------------------------------
+
+
+def setup_card_out(card: SetupCard, *, now: datetime) -> SetupCardOut:
+    """Add the clock-relative ages and lift the latest verdict out of the evaluation JSON."""
+    evaluation = card.latest_evaluation or {}
+    status = evaluation.get("status")
+    reasoning = evaluation.get("reasoning")
+    return SetupCardOut(
+        setup_id=card.setup_id,
+        signal_id=card.signal_id,
+        symbol=card.symbol,
+        direction=card.direction,
+        entry_price=card.entry_price,
+        stop_loss=card.stop_loss,
+        take_profit_1=card.take_profit_1,
+        take_profit_2=card.take_profit_2,
+        opened_at=card.opened_at,
+        age_seconds=_age_seconds(card.opened_at, now=now),
+        last_evaluated_at=card.last_evaluated_at,
+        evaluation_age_seconds=(
+            None
+            if card.last_evaluated_at is None
+            else _age_seconds(card.last_evaluated_at, now=now)
+        ),
+        latest_status=str(status) if status is not None else None,
+        latest_reasoning=str(reasoning) if reasoning is not None else None,
+    )
+
+
+def setup_card_for_signal(setup: StoredActiveSetup, signal: StoredSignal) -> SetupCard | None:
+    """A :class:`SetupCard` for the lifecycle page, prices lifted from the proposal payload.
+
+    Returns ``None`` when the signal is a skip row (no direction / prices): a
+    setup can only be opened for a proposal, so this is a defensive branch for
+    malformed data rather than an expected path.
+    """
+    if signal.direction is None:
+        return None
+    payload = signal.payload
+    try:
+        tp2 = payload.get("take_profit_2")
+        return SetupCard(
+            setup_id=setup.id,
+            signal_id=signal.id,
+            symbol=signal.symbol,
+            direction=signal.direction,
+            entry_price=float(payload["entry_price"]),
+            stop_loss=float(payload["stop_loss"]),
+            take_profit_1=float(payload["take_profit_1"]),
+            take_profit_2=None if tp2 is None else float(tp2),
+            opened_at=setup.opened_at,
+            last_evaluated_at=setup.last_evaluated_at,
+            latest_evaluation=setup.latest_evaluation,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Journal rows
+# ---------------------------------------------------------------------------
+
+
+def signal_row_out(row: JournalRow) -> SignalRowOut:
+    """Flatten a nested :class:`JournalRow` into the wire row."""
+    return SignalRowOut(
+        **row.signal.model_dump(),
+        decision_kind=row.decision_kind,
+        judge_ruling=row.judge_ruling,
+        session=row.session,
+        has_setup=row.has_setup,
+        violated_rule=row.violated_rule,
+        resolution_outcome=row.resolution_outcome,
+        realized_r=row.realized_r,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle steps (design §3.4: trimmed on the timeline, full JSON per run)
+# ---------------------------------------------------------------------------
+
+_PROPOSAL_KEYS = (
+    "direction",
+    "entry_price",
+    "stop_loss",
+    "take_profit_1",
+    "take_profit_2",
+    "risk_reward_ratio",
+    "tags",
+)
+_SKIP_KEYS = ("reason", "violated_rule", "details")
+_HISTORIAN_KEYS = ("win_rate", "sample_size", "wins", "losses")
+_MATCH_KEYS = ("signal_id", "symbol", "outcome")
+_SKEPTIC_KEYS = ("severity", "recommends_against", "headline")
+_JUDGE_KEYS = ("ruling", "confidence", "caveat")
+
+
+def _pick(output: Mapping[str, Any], keys: Sequence[str]) -> dict[str, Any]:
+    return {key: output.get(key) for key in keys}
+
+
+def trim_output(role: AgentRole, output: Mapping[str, Any]) -> dict[str, Any]:
+    """The timeline summary of one agent output; everything else is on the runs endpoint.
+
+    - analyzer: proposal prices / R:R / tags, or a skip's reason / rule / details
+      (a gate-rejected run holds the *rejected proposal*, so it summarises as one);
+    - historian: the win-rate numbers and each match as ``{signal_id, symbol, outcome}``;
+    - skeptic: severity / recommends_against / headline, or ``{"no_macro_data": true}``
+      for the ``NoMacroData`` sentinel (serialised as ``{provider, reason}``, no severity);
+    - judge: ruling / confidence / caveat;
+    - any other role: ``{}``.
+
+    Missing keys read as ``None`` rather than raising, so a row written by an older
+    model version still renders.
+    """
+    if role is AgentRole.ANALYZER:
+        return _pick(output, _PROPOSAL_KEYS if "direction" in output else _SKIP_KEYS)
+    if role is AgentRole.HISTORIAN:
+        raw_matches = output.get("matches")
+        matches = (
+            [_pick(m, _MATCH_KEYS) for m in raw_matches if isinstance(m, Mapping)]
+            if isinstance(raw_matches, list)
+            else []
+        )
+        return {**_pick(output, _HISTORIAN_KEYS), "matches": matches}
+    if role is AgentRole.SKEPTIC:
+        if "severity" not in output:
+            return {"no_macro_data": True}
+        return _pick(output, _SKEPTIC_KEYS)
+    if role is AgentRole.JUDGE:
+        return _pick(output, _JUDGE_KEYS)
+    return {}
+
+
+def lifecycle_step(run: StoredAgentRun) -> LifecycleStep:
+    """One timeline entry: accounting columns verbatim, output trimmed by role."""
+    return LifecycleStep(
+        role=run.agent_role.value,
+        run_id=run.id,
+        created_at=run.created_at,
+        latency_ms=run.latency_ms,
+        cost_usd=run.cost_usd,
+        summary=trim_output(run.agent_role, run.output),
+    )

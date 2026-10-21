@@ -1,0 +1,1130 @@
+"""Slice 4 Step 4.2 — data routes: `/api/overview`, `/api/setups/open`, `/api/signals[...]`.
+
+`FakeStore` stands in for `DataApiSignalStore`: it serves the dashboard's `read_rows`
+seam by dispatching on fixed SQL fragments of `queries.py` (returning Data-API-shaped
+rows) and implements the typed methods the routers and `risk_gates.gather_risk_context`
+call. The clock is pinned by monkeypatching `src.dashboard.api.overview.utcnow`, so
+every age / countdown / session in the responses is deterministic.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from src.agents.critic.models import DecisionKind, Resolution, ResolutionOutcome
+from src.common.models import (
+    ActiveSetupStatus,
+    AgentRole,
+    ScanStatus,
+    SetupEvaluationStatus,
+    SignalDirection,
+    SignalStatus,
+)
+from src.dashboard.api import deps
+from src.dashboard.api import overview as assembly
+from src.dashboard.api.app import create_app, handler
+from src.dashboard.api.cursor import decode_cursor, encode_cursor
+from src.dashboard.api.deps import get_store
+from src.dashboard.api.settings import get_dashboard_settings
+from src.persistence.models import (
+    StoredActiveSetup,
+    StoredAgentRun,
+    StoredSetupEvaluation,
+    StoredSignal,
+)
+from src.persistence.store import DataApiSignalStore
+from tests.unit.test_dashboard_app import _Ctx, _v2_event
+
+DAY = date(2026, 10, 20)
+NOW = datetime(2026, 10, 20, 13, 10, 0, tzinfo=UTC)  # NY session; the 13:03 sweep is done
+NARRATIVE = "Synthetic fixture narrative for the dashboard route tests, long enough."
+
+
+def _at(hour: int, minute: int = 0, second: int = 0, *, day: date = DAY) -> datetime:
+    return datetime(day.year, day.month, day.day, hour, minute, second, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Fake store
+# ---------------------------------------------------------------------------
+
+
+def _param_values(parameters: list[dict[str, Any]]) -> dict[str, Any]:
+    """Data API parameter list -> {name: python value}."""
+    out: dict[str, Any] = {}
+    for p in parameters:
+        value = p["value"]
+        if value.get("isNull"):
+            out[p["name"]] = None
+        elif "stringValue" in value:
+            out[p["name"]] = value["stringValue"]
+        elif "longValue" in value:
+            out[p["name"]] = value["longValue"]
+        else:  # pragma: no cover - no other types are used by the dashboard queries
+            out[p["name"]] = value
+    return out
+
+
+@dataclass
+class FakeStore:
+    """`DataApiSignalStore` stand-in: SQL-dispatching `read_rows` + the typed methods."""
+
+    signals: dict[UUID, StoredSignal] = field(default_factory=dict)
+    recent: list[StoredSignal] = field(default_factory=list)
+    open_setups: list[StoredActiveSetup] = field(default_factory=list)
+    runs_by_scan: dict[UUID, list[StoredAgentRun]] = field(default_factory=dict)
+    resolutions: dict[UUID, Resolution] = field(default_factory=dict)
+    evaluations_by_setup: dict[UUID, list[StoredSetupEvaluation]] = field(default_factory=dict)
+    setup_card_rows: list[dict[str, Any]] = field(default_factory=list)
+    scan_rows: list[dict[str, Any]] = field(default_factory=list)
+    journal_rows: list[dict[str, Any]] = field(default_factory=list)
+    page_rows: list[dict[str, Any]] = field(default_factory=list)
+    eval_count: dict[str, Any] = field(default_factory=lambda: {"total": 0, "errors": 0})
+    setup_rows_by_signal: dict[str, dict[str, Any]] = field(default_factory=dict)
+    review_rows_by_signal: dict[str, dict[str, Any]] = field(default_factory=dict)
+    calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+    # -- the read seam -----------------------------------------------------
+
+    async def read_rows(self, sql: str, parameters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        params = _param_values(parameters)
+        self.calls.append((sql, params))
+        if "FROM active_setups t" in sql:
+            return list(self.setup_card_rows)
+        if "FROM scan_runs" in sql:
+            since = datetime.fromisoformat(params["since"])
+            return [r for r in self.scan_rows if datetime.fromisoformat(r["started_at"]) >= since]
+        if "string_to_array(:ids" in sql:
+            ids = set(params["ids"].split(","))
+            return [r for r in self.journal_rows if r["scan_id"] in ids]
+        if "LIMIT :limit" in sql:
+            return list(self.page_rows[: params["limit"]])
+        if "FROM setup_evaluations" in sql:
+            return [dict(self.eval_count)]
+        if "FROM active_setups" in sql:
+            row = self.setup_rows_by_signal.get(params["signal_id"])
+            return [row] if row is not None else []
+        if "FROM decision_reviews" in sql:
+            row = self.review_rows_by_signal.get(params["signal_id"])
+            return [row] if row is not None else []
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+    def calls_matching(self, fragment: str) -> list[dict[str, Any]]:
+        return [params for sql, params in self.calls if fragment in sql]
+
+    # -- typed methods ------------------------------------------------------
+
+    async def list_open_active_setups(self) -> list[StoredActiveSetup]:
+        return list(self.open_setups)
+
+    async def get_signal(self, signal_id: UUID) -> StoredSignal | None:
+        return self.signals.get(signal_id)
+
+    async def list_recent_signals(
+        self, *, limit: int = 50, symbol: str | None = None
+    ) -> list[StoredSignal]:
+        rows = [s for s in self.recent if symbol is None or s.symbol == symbol]
+        return rows[:limit]
+
+    async def list_agent_runs_for_scan(self, scan_id: UUID) -> list[StoredAgentRun]:
+        return sorted(self.runs_by_scan.get(scan_id, []), key=lambda r: r.created_at)
+
+    async def get_resolution(self, signal_id: UUID) -> Resolution | None:
+        return self.resolutions.get(signal_id)
+
+    async def list_setup_evaluations(
+        self, setup_id: UUID, *, limit: int = 50
+    ) -> list[StoredSetupEvaluation]:
+        rows = sorted(
+            self.evaluations_by_setup.get(setup_id, []),
+            key=lambda e: e.evaluated_at,
+            reverse=True,  # the store returns newest first
+        )
+        return rows[: max(1, min(limit, 200))]
+
+    async def get_agent_run(self, run_id: UUID) -> StoredAgentRun | None:
+        for runs in self.runs_by_scan.values():
+            for run in runs:
+                if run.id == run_id:
+                    return run
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Fixture data builders
+# ---------------------------------------------------------------------------
+
+
+def _proposal_payload(scan_id: UUID, symbol: str, direction: SignalDirection) -> dict[str, Any]:
+    long = direction is SignalDirection.LONG
+    return {
+        "proposal_id": str(uuid4()),
+        "scan_id": str(scan_id),
+        "strategy": "smc",
+        "created_at": _at(8, 3, 55).isoformat(),
+        "symbol": symbol,
+        "direction": direction.value,
+        "entry_price": 100.0,
+        "stop_loss": 98.0 if long else 102.0,
+        "take_profit_1": 106.0 if long else 94.0,
+        "take_profit_2": 110.0 if long else 90.0,
+        "risk_reward_ratio": 3.0,
+        "leverage": 3.0,
+        "risk_percent": 1.0,
+        "tags": ["fvg"],
+        "confluence_narrative": NARRATIVE,
+        "features": {"rr": 3.0},
+    }
+
+
+def _skip_payload(scan_id: UUID, symbol: str, violated_rule: str | None) -> dict[str, Any]:
+    return {
+        "decision_id": str(uuid4()),
+        "scan_id": str(scan_id),
+        "strategy": "smc",
+        "symbol": symbol,
+        "reason": "INSUFFICIENT_RR" if violated_rule else "NO_CLEAR_BIAS",
+        "details": "gate rejected the proposal" if violated_rule else "no valid structure",
+        "violated_rule": violated_rule,
+        "created_at": _at(13, 3, 45).isoformat(),
+    }
+
+
+def _signal(
+    scan_id: UUID,
+    *,
+    symbol: str,
+    created_at: datetime,
+    direction: SignalDirection | None = None,
+    violated_rule: str | None = None,
+) -> StoredSignal:
+    payload = (
+        _proposal_payload(scan_id, symbol, direction)
+        if direction is not None
+        else _skip_payload(scan_id, symbol, violated_rule)
+    )
+    return StoredSignal(
+        id=uuid4(),
+        scan_id=scan_id,
+        symbol=symbol,
+        strategy="smc",
+        direction=direction,
+        status=SignalStatus.PUBLISHED if direction is not None else SignalStatus.SKIPPED,
+        created_at=created_at,
+        payload=payload,
+        tags=list(payload.get("tags", [])),
+        features=dict(payload.get("features", {})),
+    )
+
+
+def _journal_row(
+    signal: StoredSignal,
+    *,
+    kind: DecisionKind,
+    session: str | None,
+    ruling: str | None = None,
+    has_setup: bool = False,
+    violated_rule: str | None = None,
+    resolution_outcome: str | None = None,
+    realized_r: float | None = None,
+) -> dict[str, Any]:
+    """One row exactly as `read_rows` hands back the journal projection."""
+    return {
+        "id": str(signal.id),
+        "scan_id": str(signal.scan_id),
+        "symbol": signal.symbol,
+        "strategy": signal.strategy,
+        "direction": signal.direction.value if signal.direction is not None else None,
+        "status": signal.status.value,
+        "created_at": signal.created_at.isoformat(),
+        "payload": json.dumps(signal.payload),
+        "tags": list(signal.tags),
+        "features": json.dumps(signal.features),
+        "outcome": signal.outcome.value if signal.outcome is not None else None,
+        "outcome_metadata": None,
+        "decision_kind": kind.value,
+        "judge_ruling": ruling,
+        "session": session,
+        "has_setup": has_setup,
+        "violated_rule": violated_rule,
+        "resolution_outcome": resolution_outcome,
+        "realized_r": realized_r,
+    }
+
+
+def _scan_row(
+    scan_id: UUID,
+    *,
+    started_at: datetime,
+    symbol: str,
+    session: str,
+    status: ScanStatus = ScanStatus.SUCCESS,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": str(scan_id),
+        "started_at": started_at.isoformat(),
+        "completed_at": (started_at + timedelta(seconds=40)).isoformat(),
+        "status": status.value,
+        "error_message": error,
+        "session": session,
+        "strategy": "smc",
+        "symbols": [symbol],
+    }
+
+
+def _run(
+    scan_id: UUID,
+    role: AgentRole,
+    output: dict[str, Any],
+    *,
+    created_at: datetime,
+    latency_ms: int = 0,
+    cost_usd: float | None = None,
+) -> StoredAgentRun:
+    return StoredAgentRun(
+        id=uuid4(),
+        scan_id=scan_id,
+        agent_role=role,
+        strategy="smc",
+        input_hash="hash-" + role.value,
+        output=output,
+        latency_ms=latency_ms,
+        token_usage={"input_tokens": 10} if cost_usd is not None else {},
+        cost_usd=cost_usd,
+        created_at=created_at,
+    )
+
+
+def _historian_output(direction: SignalDirection) -> dict[str, Any]:
+    return {
+        "query_proposal_id": str(uuid4()),
+        "strategy": "smc",
+        "direction": direction.value,
+        "session": "LONDON",
+        "primary_poi_type": "order_block",
+        "sample_size": 1,
+        "wins": 1,
+        "losses": 0,
+        "breakeven": 0,
+        "inconclusive": 0,
+        "win_rate": 1.0,
+        "matches": [
+            {
+                "signal_id": str(uuid4()),
+                "symbol": "ETHUSDT",
+                "direction": direction.value,
+                "created_at": "2026-10-01T08:03:55+00:00",
+                "outcome": "WIN",
+                "tags": ["fvg"],
+                "tag_overlap": 1,
+                "l2_distance": 0.1,
+            }
+        ],
+        "summary": "one precedent, a win",
+    }
+
+
+@dataclass
+class Scenario:
+    store: FakeStore
+    london_scan: UUID
+    published: StoredSignal
+    setup: StoredActiveSetup
+    published_runs: list[StoredAgentRun]
+    vetoed: StoredSignal
+    vetoed_runs: list[StoredAgentRun]
+    ny_published: StoredSignal
+    gate_rejected: StoredSignal
+
+
+def _scenario() -> Scenario:
+    store = FakeStore()
+    two_days_ago = DAY - timedelta(days=2)
+
+    # LONDON window, BTCUSDT: published with caveat, OPEN setup, two evaluations.
+    s1 = uuid4()
+    published = _signal(
+        s1, symbol="BTCUSDT", created_at=_at(8, 3, 55), direction=SignalDirection.LONG
+    )
+    setup = StoredActiveSetup(
+        id=uuid4(),
+        signal_id=published.id,
+        opened_at=_at(8, 4),
+        status=ActiveSetupStatus.OPEN,
+        last_evaluated_at=_at(13, 4),
+        latest_evaluation={
+            "status": "AT_RISK",
+            "reasoning": "price near the stop",
+            "outcome": None,
+        },
+    )
+    published_runs = [
+        _run(s1, AgentRole.ANALYZER, dict(published.payload), created_at=_at(8, 3, 53)),
+        _run(
+            s1,
+            AgentRole.HISTORIAN,
+            _historian_output(SignalDirection.LONG),
+            created_at=_at(8, 3, 54),
+        ),
+        _run(
+            s1,
+            AgentRole.SKEPTIC,
+            {
+                "severity": "LOW",
+                "recommends_against": False,
+                "headline": "USD mildly firm",
+                "reasoning": "the dollar index is firm but not trending; equities calm",
+                "cited_macro": ["DXY 104.2"],
+            },
+            created_at=_at(8, 3, 55),
+            latency_ms=1500,
+            cost_usd=0.01,
+        ),
+        _run(
+            s1,
+            AgentRole.JUDGE,
+            {
+                "ruling": "PUBLISH_WITH_CAVEAT",
+                "confidence": "MEDIUM",
+                "reasoning": "clean structure; small sample; mild macro headwind",
+                "caveat": "USD mildly firm",
+            },
+            created_at=_at(8, 3, 56),
+            latency_ms=2100,
+            cost_usd=0.02,
+        ),
+    ]
+    evaluations = [
+        StoredSetupEvaluation(
+            id=uuid4(),
+            setup_id=setup.id,
+            signal_id=published.id,
+            evaluated_at=_at(8, 4, 30),
+            status=SetupEvaluationStatus.STILL_VALID,
+            reasoning="on track",
+        ),
+        StoredSetupEvaluation(
+            id=uuid4(),
+            setup_id=setup.id,
+            signal_id=published.id,
+            evaluated_at=_at(13, 4),
+            status=SetupEvaluationStatus.AT_RISK,
+            reasoning="price near the stop",
+            latency_ms=900,
+            cost_usd=0.005,
+        ),
+    ]
+
+    # NY window: ETHUSDT published (setup already closed), SOLUSDT gate-rejected.
+    s2, s4 = uuid4(), uuid4()
+    ny_published = _signal(
+        s2, symbol="ETHUSDT", created_at=_at(13, 3, 45), direction=SignalDirection.SHORT
+    )
+    gate_rejected = _signal(
+        s4, symbol="SOLUSDT", created_at=_at(13, 3, 46), violated_rule="RULE_2_MIN_RR"
+    )
+
+    # Two days ago: SOLUSDT vetoed by the Judge (NoMacroData), resolved + reviewed by the Critic.
+    s3 = uuid4()
+    vetoed = _signal(
+        s3,
+        symbol="SOLUSDT",
+        created_at=_at(13, 3, 45, day=two_days_ago),
+        direction=SignalDirection.SHORT,
+    )
+    vetoed_runs = [
+        _run(
+            s3,
+            AgentRole.ANALYZER,
+            dict(vetoed.payload),
+            created_at=_at(13, 3, 41, day=two_days_ago),
+        ),
+        _run(
+            s3,
+            AgentRole.HISTORIAN,
+            _historian_output(SignalDirection.SHORT),
+            created_at=_at(13, 3, 42, day=two_days_ago),
+        ),
+        _run(
+            s3,
+            AgentRole.SKEPTIC,
+            {"provider": "skeptic", "reason": "no macro providers configured"},
+            created_at=_at(13, 3, 43, day=two_days_ago),
+        ),
+        _run(
+            s3,
+            AgentRole.JUDGE,
+            {
+                "ruling": "SKIP",
+                "confidence": "MEDIUM",
+                "reasoning": "no macro context and a thin precedent sample",
+                "caveat": None,
+            },
+            created_at=_at(13, 3, 44, day=two_days_ago),
+            latency_ms=1800,
+            cost_usd=0.02,
+        ),
+    ]
+    store.resolutions[vetoed.id] = Resolution(
+        signal_id=vetoed.id,
+        decision_kind=DecisionKind.VETOED,
+        outcome=ResolutionOutcome.LOSS,
+        decided_at=vetoed.created_at,
+        entered_at=vetoed.created_at + timedelta(hours=1),
+        resolved_at=vetoed.created_at + timedelta(hours=6),
+        realized_r=-1.0,
+        candles_used=288,
+        engine_version="replay-v1",
+    )
+    store.review_rows_by_signal[str(vetoed.id)] = {
+        "signal_id": str(vetoed.id),
+        "decision_kind": "VETOED",
+        "review": json.dumps({"judge_correct": True, "lesson": "the veto was right"}),
+        "model": "claude-sonnet-4-5",
+        "token_usage": json.dumps({"input_tokens": 100}),
+        "cost_usd": 0.03,
+        "error": None,
+        "attempts": 1,
+        "created_at": _at(22, 30, day=DAY - timedelta(days=1)).isoformat(),
+    }
+
+    for sig in (published, ny_published, gate_rejected, vetoed):
+        store.signals[sig.id] = sig
+    store.recent = [gate_rejected, ny_published, published, vetoed]  # newest first
+    store.open_setups = [setup]
+    store.runs_by_scan = {s1: published_runs, s3: vetoed_runs}
+    store.evaluations_by_setup = {setup.id: evaluations}
+    store.setup_card_rows = [
+        {
+            "setup_id": str(setup.id),
+            "signal_id": str(published.id),
+            "symbol": "BTCUSDT",
+            "direction": "LONG",
+            "entry_price": 100.0,
+            "stop_loss": 98.0,
+            "take_profit_1": 106.0,
+            "take_profit_2": 110.0,
+            "opened_at": setup.opened_at.isoformat(),
+            "last_evaluated_at": _at(13, 4).isoformat(),
+            "latest_evaluation": json.dumps(setup.latest_evaluation),
+        }
+    ]
+    store.setup_rows_by_signal[str(published.id)] = {
+        "id": str(setup.id),
+        "signal_id": str(published.id),
+        "opened_at": setup.opened_at.isoformat(),
+        "status": "OPEN",
+        "last_evaluated_at": _at(13, 4).isoformat(),
+        "latest_evaluation": json.dumps(setup.latest_evaluation),
+    }
+    store.scan_rows = [
+        _scan_row(s3, started_at=_at(13, 3, 40, day=two_days_ago), symbol="SOLUSDT", session="NY"),
+        _scan_row(s1, started_at=_at(8, 3, 52), symbol="BTCUSDT", session="LONDON"),
+        _scan_row(s2, started_at=_at(13, 3, 40), symbol="ETHUSDT", session="NY"),
+        _scan_row(s4, started_at=_at(13, 3, 41), symbol="SOLUSDT", session="NY"),
+    ]
+    store.journal_rows = [
+        _journal_row(
+            gate_rejected,
+            kind=DecisionKind.GATE_REJECTED,
+            session="NY",
+            violated_rule="RULE_2_MIN_RR",
+        ),
+        _journal_row(
+            ny_published,
+            kind=DecisionKind.PUBLISHED,
+            session="NY",
+            ruling="PUBLISH",
+            has_setup=True,
+        ),
+        _journal_row(
+            published,
+            kind=DecisionKind.PUBLISHED,
+            session="LONDON",
+            ruling="PUBLISH_WITH_CAVEAT",
+            has_setup=True,
+        ),
+        _journal_row(
+            vetoed,
+            kind=DecisionKind.VETOED,
+            session="NY",
+            ruling="SKIP",
+            resolution_outcome="LOSS",
+            realized_r=-1.0,
+        ),
+    ]
+    store.eval_count = {"total": 1, "errors": 0}
+    return Scenario(
+        store=store,
+        london_scan=s1,
+        published=published,
+        setup=setup,
+        published_runs=published_runs,
+        vetoed=vetoed,
+        vetoed_runs=vetoed_runs,
+        ny_published=ny_published,
+        gate_rejected=gate_rejected,
+    )
+
+
+def _page_rows(n: int) -> list[dict[str, Any]]:
+    """`n` synthetic journal rows, newest first, distinct `(created_at, id)`."""
+    rows = []
+    for i in range(n):
+        created_at = NOW - timedelta(minutes=i + 1)
+        signal = _signal(uuid4(), symbol="BTCUSDT", created_at=created_at)
+        rows.append(_journal_row(signal, kind=DecisionKind.NO_SETUP, session="LONDON"))
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scenario() -> Scenario:
+    return _scenario()
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    monkeypatch.setattr(assembly, "utcnow", lambda: NOW)
+    return NOW
+
+
+def _client_for(store: FakeStore) -> tuple[FastAPI, TestClient]:
+    app = create_app(version="t")
+    app.dependency_overrides[get_store] = lambda: store
+    return app, TestClient(app)
+
+
+@pytest.fixture
+def client(scenario: Scenario, frozen_clock: datetime) -> TestClient:
+    _, test_client = _client_for(scenario.store)
+    return test_client
+
+
+# ---------------------------------------------------------------------------
+# /api/overview
+# ---------------------------------------------------------------------------
+
+
+def test_overview_shape_and_risk_numbers(client: TestClient, scenario: Scenario) -> None:
+    resp = client.get("/api/overview")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"generated_at", "health", "risk", "open_setups", "windows_today"}
+    assert datetime.fromisoformat(body["generated_at"]) == NOW
+
+    risk = body["risk"]
+    assert risk["open_setups"] == 1 and risk["open_cap"] == 3
+    assert risk["published_24h"] == 2 and risk["daily_cap"] == 5  # the vetoed row is 2 days old
+    assert risk["loss_streak"] == 0 and risk["pause_active"] is False
+    assert risk["pause_until"] is None
+    assert risk["session"] == "NY" and risk["session_blocked"] is False
+    assert datetime.fromisoformat(risk["next_scan_at"]) == _at(15, 3)
+    assert risk["seconds_to_next_scan"] == 6780  # 13:10 -> 15:03
+    assert risk["seconds_to_next_scan"] > 0
+
+    assert body["health"]["alarms"] is None
+    assert body["health"]["alarms_note"] == "pending Step 4.3"
+    assert body["health"]["db"] == "ok"
+
+    assert len(body["open_setups"]) == 1
+    assert body["open_setups"][0]["setup_id"] == str(scenario.setup.id)
+
+
+def test_overview_health_strip(client: TestClient, scenario: Scenario) -> None:
+    body = client.get("/api/overview").json()
+    health = body["health"]
+    last = health["last_scan"]
+    assert last["label"] == "NY"
+    assert datetime.fromisoformat(last["started_at"]) == _at(13, 3, 40)
+    assert last["status"] == "SUCCESS" and last["error"] is None
+    assert last["symbols"] == ["ETHUSDT", "SOLUSDT"]  # the two per-symbol rows of one window
+
+    forecaster = health["forecaster"]
+    assert forecaster == {
+        "open_setups": 1,
+        "stale": 0,  # evaluated 13:04, after the 13:03 sweep
+        "evaluations_last_window": 1,
+        "errors_last_window": 0,
+    }
+    # Scans are bounded to the current UTC day; evaluations are counted since the sweep.
+    (scan_call,) = scenario.store.calls_matching("FROM scan_runs")
+    assert datetime.fromisoformat(scan_call["since"]) == _at(0, 0)
+    (count_call,) = scenario.store.calls_matching("FROM setup_evaluations")
+    assert datetime.fromisoformat(count_call["since"]) == _at(13, 3)
+
+
+def test_overview_windows_today(client: TestClient, scenario: Scenario) -> None:
+    windows = client.get("/api/overview").json()["windows_today"]
+    assert [w["label"] for w in windows] == ["LONDON", "NY", "OVERLAP", "DAILY_WRAP"]
+    assert [datetime.fromisoformat(w["fire_time"]) for w in windows] == [
+        _at(8, 3),
+        _at(13, 3),
+        _at(15, 3),
+        _at(22, 3),
+    ]
+    london, ny, overlap, wrap = windows
+    assert london["scan"]["status"] == "SUCCESS" and london["scan"]["symbols"] == ["BTCUSDT"]
+    assert london["symbols"] == [
+        {
+            "symbol": "BTCUSDT",
+            "kind": "PUBLISHED",
+            "violated_rule": None,
+            "signal_id": str(scenario.published.id),
+        }
+    ]
+    assert ny["scan"]["symbols"] == ["ETHUSDT", "SOLUSDT"]
+    assert [(c["symbol"], c["kind"], c["violated_rule"]) for c in ny["symbols"]] == [
+        ("ETHUSDT", "PUBLISHED", None),
+        ("SOLUSDT", "GATE_REJECTED", "RULE_2_MIN_RR"),
+    ]
+    assert overlap["scan"] is None and overlap["symbols"] == []
+    assert wrap["scan"] is None and wrap["symbols"] == []
+    # Only today's scans were asked for; the two-day-old scan never reached the chips query.
+    (chips_call,) = scenario.store.calls_matching("string_to_array(:ids")
+    assert str(scenario.vetoed.scan_id) not in chips_call["ids"]
+
+
+def test_overview_stale_setup_and_no_sweep_yet(
+    scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 08:04 UTC: the LONDON sweep fired a minute ago, so no sweep counts yet today; a
+    # never-evaluated setup is stale, one evaluated yesterday is not (no sweep to miss).
+    early = _at(8, 4)
+    monkeypatch.setattr(assembly, "utcnow", lambda: early)
+    never = StoredActiveSetup(
+        id=uuid4(),
+        signal_id=scenario.published.id,
+        opened_at=_at(7, 0),
+        status=ActiveSetupStatus.OPEN,
+    )
+    scenario.store.open_setups = [scenario.setup, never]
+    # The fixture's scan rows are static; drop the ones that have not "happened" at 08:04.
+    scenario.store.scan_rows = [
+        r for r in scenario.store.scan_rows if datetime.fromisoformat(r["started_at"]) <= early
+    ]
+    scenario.store.setup_card_rows = [
+        dict(
+            scenario.store.setup_card_rows[0],
+            last_evaluated_at=_at(22, 5, day=DAY - timedelta(days=1)).isoformat(),
+        ),
+        dict(
+            scenario.store.setup_card_rows[0],
+            setup_id=str(never.id),
+            last_evaluated_at=None,
+            latest_evaluation=None,
+        ),
+    ]
+    _, client = _client_for(scenario.store)
+    body = client.get("/api/overview").json()
+    assert body["health"]["forecaster"]["open_setups"] == 2
+    assert body["health"]["forecaster"]["stale"] == 1
+    (count_call,) = scenario.store.calls_matching("FROM setup_evaluations")
+    assert datetime.fromisoformat(count_call["since"]) == _at(0, 0)  # start of day fallback
+    assert body["health"]["last_scan"]["label"] == "LONDON"  # 08:03:52 is the only scan so far
+    assert body["risk"]["session"] == "LONDON"
+
+
+def test_overview_with_nothing_today(frozen_clock: datetime) -> None:
+    store = FakeStore()
+    _, client = _client_for(store)
+    body = client.get("/api/overview").json()
+    assert body["health"]["last_scan"] is None
+    assert body["health"]["forecaster"] == {
+        "open_setups": 0,
+        "stale": 0,
+        "evaluations_last_window": 0,
+        "errors_last_window": 0,
+    }
+    assert body["open_setups"] == []
+    assert all(w["scan"] is None and w["symbols"] == [] for w in body["windows_today"])
+    assert body["risk"]["open_setups"] == 0 and body["risk"]["published_24h"] == 0
+    # No scans -> the chips query is skipped entirely.
+    assert store.calls_matching("string_to_array(:ids") == []
+
+
+# ---------------------------------------------------------------------------
+# /api/setups/open
+# ---------------------------------------------------------------------------
+
+
+def test_setups_open_cards(client: TestClient, scenario: Scenario) -> None:
+    resp = client.get("/api/setups/open")
+    assert resp.status_code == 200
+    (card,) = resp.json()
+    assert card == {
+        "setup_id": str(scenario.setup.id),
+        "signal_id": str(scenario.published.id),
+        "symbol": "BTCUSDT",
+        "direction": "LONG",
+        "entry_price": 100.0,
+        "stop_loss": 98.0,
+        "take_profit_1": 106.0,
+        "take_profit_2": 110.0,
+        "opened_at": "2026-10-20T08:04:00Z",
+        "age_seconds": 5 * 3600 + 6 * 60,  # 08:04 -> 13:10
+        "last_evaluated_at": "2026-10-20T13:04:00Z",
+        "evaluation_age_seconds": 6 * 60,
+        "latest_status": "AT_RISK",
+        "latest_reasoning": "price near the stop",
+        "unrealised_r": None,
+        "unrealised_r_note": "pending Step 4.3",
+    }
+    # One query, no typed-method round trips, and the setup list is the only SQL.
+    assert [sql for sql, _ in scenario.store.calls if "FROM active_setups t" in sql]
+    assert len(scenario.store.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# /api/signals (journal page)
+# ---------------------------------------------------------------------------
+
+
+def test_signals_page_default_limit_and_next_cursor(client: TestClient, scenario: Scenario) -> None:
+    scenario.store.page_rows = _page_rows(51)
+    resp = client.get("/api/signals")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"items", "next_cursor"}
+    assert len(body["items"]) == 50
+    assert [i["id"] for i in body["items"]] == [r["id"] for r in scenario.store.page_rows[:50]]
+    last = scenario.store.page_rows[49]
+    assert body["next_cursor"] is not None
+    assert decode_cursor(body["next_cursor"]) == (
+        datetime.fromisoformat(last["created_at"]),
+        UUID(last["id"]),
+    )
+    (call,) = scenario.store.calls_matching("LIMIT :limit")
+    assert call["limit"] == 51 and call["after_ts"] is None and call["after_id"] is None
+    first = body["items"][0]
+    assert first["decision_kind"] == "NO_SETUP" and first["status"] == "SKIPPED"
+    assert first["direction"] is None and first["has_setup"] is False
+    assert set(first) == {
+        "id",
+        "scan_id",
+        "symbol",
+        "strategy",
+        "direction",
+        "status",
+        "created_at",
+        "payload",
+        "tags",
+        "features",
+        "outcome",
+        "outcome_metadata",
+        "decision_kind",
+        "judge_ruling",
+        "session",
+        "has_setup",
+        "violated_rule",
+        "resolution_outcome",
+        "realized_r",
+    }
+
+
+def test_signals_last_page_has_no_cursor(client: TestClient, scenario: Scenario) -> None:
+    scenario.store.page_rows = _page_rows(3)
+    body = client.get("/api/signals?limit=3").json()
+    assert len(body["items"]) == 3 and body["next_cursor"] is None
+    (call,) = scenario.store.calls_matching("LIMIT :limit")
+    assert call["limit"] == 4
+
+
+def test_signals_exactly_limit_rows_has_no_cursor(client: TestClient, scenario: Scenario) -> None:
+    scenario.store.page_rows = _page_rows(50)
+    body = client.get("/api/signals").json()
+    assert len(body["items"]) == 50 and body["next_cursor"] is None
+
+
+def test_signals_limit_clamped_to_200(client: TestClient, scenario: Scenario) -> None:
+    # Design §3.4 says "max 200"; the plan's ruling is to *reject* out-of-range limits with
+    # 422 (`Query(ge=1, le=200)`) rather than silently clamp.
+    assert client.get("/api/signals?limit=500").status_code == 422
+    assert client.get("/api/signals?limit=201").status_code == 422
+    assert client.get("/api/signals?limit=0").status_code == 422
+    assert scenario.store.calls == []
+    assert client.get("/api/signals?limit=200").status_code == 200
+    (call,) = scenario.store.calls_matching("LIMIT :limit")
+    assert call["limit"] == 201
+
+
+def test_signals_bad_cursor_is_400(client: TestClient, scenario: Scenario) -> None:
+    resp = client.get("/api/signals?cursor=zzz")
+    assert resp.status_code == 400
+    assert resp.json() == {"reason": "bad_cursor"}
+    assert scenario.store.calls == []
+
+
+def test_signals_cursor_forwarded_to_keyset(client: TestClient, scenario: Scenario) -> None:
+    ts, signal_id = _at(9, 0), uuid4()
+    resp = client.get("/api/signals", params={"cursor": encode_cursor(ts, signal_id)})
+    assert resp.status_code == 200
+    (call,) = scenario.store.calls_matching("LIMIT :limit")
+    assert call["after_ts"] == ts.isoformat() and call["after_id"] == str(signal_id)
+
+
+def test_signals_filters_forwarded(client: TestClient, scenario: Scenario) -> None:
+    resp = client.get(
+        "/api/signals",
+        params={
+            "since": "2026-10-19T00:00:00+00:00",
+            "until": "2026-10-21T00:00:00Z",
+            "symbol": "ETHUSDT",
+            "kind": "VETOED",
+            "outcome": "LOSS",
+            "tag": "order_block",
+            "session": "OVERLAP",
+            "violated_rule": "RULE_3_PREMIUM_DISCOUNT",
+            "limit": 20,
+        },
+    )
+    assert resp.status_code == 200
+    (call,) = scenario.store.calls_matching("LIMIT :limit")
+    assert call["since"] == "2026-10-19T00:00:00+00:00"
+    assert call["until"] == "2026-10-21T00:00:00+00:00"
+    assert call["symbol"] == "ETHUSDT"
+    assert call["decision_kind"] == "VETOED"
+    assert call["outcome"] == "LOSS"
+    assert call["tag"] == "order_block"
+    assert call["session"] == "OVERLAP"
+    assert call["violated_rule"] == "RULE_3_PREMIUM_DISCOUNT"
+    assert call["limit"] == 21
+
+
+def test_signals_naive_datetimes_are_read_as_utc(client: TestClient, scenario: Scenario) -> None:
+    assert client.get("/api/signals", params={"since": "2026-10-19T00:00:00"}).status_code == 200
+    (call,) = scenario.store.calls_matching("LIMIT :limit")
+    assert call["since"] == "2026-10-19T00:00:00+00:00"
+
+
+def test_signals_invalid_enum_filters_are_422(client: TestClient) -> None:
+    assert client.get("/api/signals?kind=BOGUS").status_code == 422
+    assert client.get("/api/signals?outcome=MAYBE").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /api/signals/{id} (lifecycle)
+# ---------------------------------------------------------------------------
+
+
+def test_lifecycle_published_signal(client: TestClient, scenario: Scenario) -> None:
+    resp = client.get(f"/api/signals/{scenario.published.id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"signal", "steps", "evaluations", "resolution", "review", "setup"}
+
+    signal = body["signal"]
+    assert signal["id"] == str(scenario.published.id)
+    assert signal["decision_kind"] == "PUBLISHED" and signal["has_setup"] is True
+    assert signal["judge_ruling"] == "PUBLISH_WITH_CAVEAT" and signal["session"] == "LONDON"
+    assert signal["direction"] == "LONG" and signal["payload"]["entry_price"] == 100.0
+
+    steps = body["steps"]
+    assert [s["role"] for s in steps] == ["analyzer", "historian", "skeptic", "judge"]
+    assert [s["run_id"] for s in steps] == [str(r.id) for r in scenario.published_runs]
+    assert steps[0]["summary"] == {
+        "direction": "LONG",
+        "entry_price": 100.0,
+        "stop_loss": 98.0,
+        "take_profit_1": 106.0,
+        "take_profit_2": 110.0,
+        "risk_reward_ratio": 3.0,
+        "tags": ["fvg"],
+    }
+    historian = steps[1]["summary"]
+    assert set(historian) == {"win_rate", "sample_size", "wins", "losses", "matches"}
+    assert historian["win_rate"] == 1.0 and historian["sample_size"] == 1
+    assert [set(m) for m in historian["matches"]] == [{"signal_id", "symbol", "outcome"}]
+    assert steps[2]["summary"] == {
+        "severity": "LOW",
+        "recommends_against": False,
+        "headline": "USD mildly firm",
+    }
+    assert steps[3]["summary"] == {
+        "ruling": "PUBLISH_WITH_CAVEAT",
+        "confidence": "MEDIUM",
+        "caveat": "USD mildly firm",
+    }
+    # Trimmed means trimmed: the long texts are only on the runs endpoint.
+    assert all("reasoning" not in s["summary"] for s in steps)
+    assert "confluence_narrative" not in steps[0]["summary"]
+    assert (steps[3]["latency_ms"], steps[3]["cost_usd"]) == (2100, 0.02)
+    assert (steps[0]["latency_ms"], steps[0]["cost_usd"]) == (0, None)
+    assert datetime.fromisoformat(steps[0]["created_at"]) == _at(8, 3, 53)
+
+    evaluations = body["evaluations"]
+    assert [e["status"] for e in evaluations] == ["STILL_VALID", "AT_RISK"]  # oldest first
+    assert evaluations[1]["reasoning"] == "price near the stop"
+    assert evaluations[1]["setup_id"] == str(scenario.setup.id)
+    assert (evaluations[1]["latency_ms"], evaluations[1]["cost_usd"]) == (900, 0.005)
+
+    assert body["resolution"] is None and body["review"] is None
+    setup = body["setup"]
+    assert setup["setup_id"] == str(scenario.setup.id)
+    assert setup["age_seconds"] == 5 * 3600 + 6 * 60
+    assert setup["evaluation_age_seconds"] == 6 * 60
+    assert setup["latest_status"] == "AT_RISK" and setup["entry_price"] == 100.0
+
+
+def test_lifecycle_vetoed_signal(client: TestClient, scenario: Scenario) -> None:
+    resp = client.get(f"/api/signals/{scenario.vetoed.id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    signal = body["signal"]
+    assert signal["decision_kind"] == "VETOED" and signal["has_setup"] is False
+    assert signal["judge_ruling"] == "SKIP" and signal["status"] == "PUBLISHED"
+    assert signal["resolution_outcome"] == "LOSS" and signal["realized_r"] == -1.0
+
+    steps = body["steps"]
+    assert [s["role"] for s in steps] == ["analyzer", "historian", "skeptic", "judge"]
+    assert steps[2]["summary"] == {"no_macro_data": True}
+    assert steps[3]["summary"]["ruling"] == "SKIP"
+
+    assert body["evaluations"] == [] and body["setup"] is None
+    resolution = body["resolution"]
+    assert resolution["signal_id"] == str(scenario.vetoed.id)
+    assert resolution["decision_kind"] == "VETOED" and resolution["outcome"] == "LOSS"
+    assert resolution["realized_r"] == -1.0 and resolution["engine_version"] == "replay-v1"
+    review = body["review"]
+    assert review["signal_id"] == str(scenario.vetoed.id)
+    assert review["decision_kind"] == "VETOED" and review["model"] == "claude-sonnet-4-5"
+    assert review["review"] == {"judge_correct": True, "lesson": "the veto was right"}
+    assert review["token_usage"] == {"input_tokens": 100} and review["attempts"] == 1
+    # The setup lookup and the review lookup both went through the read seam.
+    assert scenario.store.calls_matching("WHERE signal_id = :signal_id::uuid\nORDER BY opened_at")
+    assert scenario.store.calls_matching("FROM decision_reviews")
+
+
+def test_lifecycle_404(client: TestClient, scenario: Scenario) -> None:
+    resp = client.get(f"/api/signals/{uuid4()}")
+    assert resp.status_code == 404
+    assert resp.json() == {"reason": "not_found"}
+    assert scenario.store.calls == []  # the typed get_signal miss short-circuits
+    assert client.get("/api/signals/not-a-uuid").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /api/signals/{id}/runs/{run_id}
+# ---------------------------------------------------------------------------
+
+
+def test_run_detail_full_output(client: TestClient, scenario: Scenario) -> None:
+    run = scenario.published_runs[0]
+    resp = client.get(f"/api/signals/{scenario.published.id}/runs/{run.id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == str(run.id) and body["scan_id"] == str(scenario.london_scan)
+    assert body["agent_role"] == "analyzer" and body["strategy"] == "smc"
+    assert body["input_hash"] == "hash-analyzer"
+    assert body["output"] == run.output  # full JSON, narrative included
+    assert body["output"]["confluence_narrative"] == NARRATIVE
+    assert body["latency_ms"] == 0 and body["token_usage"] == {} and body["cost_usd"] is None
+    assert datetime.fromisoformat(body["created_at"]) == run.created_at
+    assert set(body) == {
+        "id",
+        "scan_id",
+        "agent_role",
+        "strategy",
+        "input_hash",
+        "output",
+        "latency_ms",
+        "token_usage",
+        "cost_usd",
+        "created_at",
+    }
+
+
+def test_run_detail_wrong_scan_404(client: TestClient, scenario: Scenario) -> None:
+    # The run exists, but it belongs to the published signal's scan, not the vetoed one's.
+    run = scenario.published_runs[3]
+    resp = client.get(f"/api/signals/{scenario.vetoed.id}/runs/{run.id}")
+    assert resp.status_code == 404
+    assert resp.json() == {"reason": "not_found"}
+
+
+def test_run_detail_missing_run_or_signal_404(client: TestClient, scenario: Scenario) -> None:
+    run = scenario.published_runs[0]
+    assert client.get(f"/api/signals/{scenario.published.id}/runs/{uuid4()}").status_code == 404
+    assert client.get(f"/api/signals/{uuid4()}/runs/{run.id}").status_code == 404
+    assert client.get(f"/api/signals/{scenario.published.id}/runs/nope").status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI + Mangum
+# ---------------------------------------------------------------------------
+
+
+def test_openapi_lists_new_routes() -> None:
+    spec = TestClient(create_app(version="t")).get("/api/openapi.json").json()
+    for path in (
+        "/api/overview",
+        "/api/setups/open",
+        "/api/signals",
+        "/api/signals/{signal_id}",
+        "/api/signals/{signal_id}/runs/{run_id}",
+    ):
+        assert path in spec["paths"], path
+    journal = spec["paths"]["/api/signals"]["get"]
+    assert {"400", "502", "503"} <= set(journal["responses"])
+    assert "404" in spec["paths"]["/api/signals/{signal_id}"]["get"]["responses"]
+    params = {p["name"]: p for p in journal["parameters"]}
+    assert params["limit"]["schema"]["default"] == 50
+    assert params["limit"]["schema"]["maximum"] == 200 and params["limit"]["schema"]["minimum"] == 1
+    assert set(params) == {
+        "since",
+        "until",
+        "symbol",
+        "kind",
+        "outcome",
+        "tag",
+        "session",
+        "violated_rule",
+        "limit",
+        "cursor",
+    }
+
+
+@pytest.fixture
+def container_store(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeStore]:
+    """Route the import-time `handler` app's `get_store()` at the fake (no override hook)."""
+    monkeypatch.setenv("DB_CLUSTER_ARN", "arn:aws:rds:ap-south-1:123456789012:cluster:signals")
+    monkeypatch.setenv("DB_SECRET_ARN", "arn:aws:secretsmanager:ap-south-1:123456789012:secret:x")
+    monkeypatch.setenv("AWS_REGION", "ap-south-1")
+    get_dashboard_settings.cache_clear()
+    deps.reset_store()
+    monkeypatch.setattr(DataApiSignalStore, "from_arns", lambda **_kwargs: scenario.store)
+    yield scenario.store
+    deps.reset_store()
+    get_dashboard_settings.cache_clear()
+
+
+@pytest.mark.usefixtures("lambda_event_loop", "frozen_clock")
+def test_mangum_serves_overview_event(container_store: FakeStore) -> None:
+    result = handler(_v2_event("/api/overview"), _Ctx())
+    assert result["statusCode"] == 200
+    body = json.loads(result["body"])
+    assert body["risk"]["open_setups"] == 1 and body["risk"]["published_24h"] == 2
+    assert body["health"]["last_scan"]["label"] == "NY"
+    assert datetime.fromisoformat(body["generated_at"]) == NOW
+    assert container_store.calls_matching("FROM scan_runs")
+
+
+@pytest.mark.usefixtures("lambda_event_loop", "frozen_clock")
+def test_mangum_serves_lifecycle_404(container_store: FakeStore) -> None:
+    result = handler(_v2_event(f"/api/signals/{uuid4()}"), _Ctx())
+    assert result["statusCode"] == 404
+    assert json.loads(result["body"]) == {"reason": "not_found"}
