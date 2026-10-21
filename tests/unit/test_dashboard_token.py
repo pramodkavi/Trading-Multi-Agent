@@ -12,8 +12,10 @@ import base64
 import hashlib
 import io
 import queue
+import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -165,26 +167,46 @@ def test_call_api_http_error_returns_status() -> None:
     )
 
 
+class _FakeListener:
+    def __init__(self, events: list[str], state: str) -> None:
+        self.events = events
+        self.state = state
+
+    def __enter__(self) -> _FakeListener:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.events.append("close")
+
+    def wait(self, timeout_s: float = 120.0) -> str:
+        self.events.append(f"wait:{timeout_s:g}")
+        return "the-code"
+
+
 def _run_main(
     argv: list[str],
     opener: _RecordingOpener,
     capsys: pytest.CaptureFixture[str],
+    events: list[str] | None = None,
 ) -> tuple[int, str, str, list[str]]:
     opened: list[str] = []
+    events = events if events is not None else []
     seen_state: dict[str, str] = {}
+
+    def fake_listen(port: int, expected_state: str) -> _FakeListener:
+        assert port == 8765
+        seen_state["state"] = expected_state
+        events.append("bind")
+        return _FakeListener(events, expected_state)
 
     def fake_browser(url: str) -> bool:
         opened.append(url)
+        events.append("browser")
         q = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
-        seen_state["state"] = q["state"][0]
+        assert q["state"][0] == seen_state["state"]
         return True
 
-    def fake_wait(port: int, expected_state: str, timeout_s: float) -> str:
-        assert port == 8765
-        assert expected_state == seen_state["state"]
-        return "the-code"
-
-    rc = dt.main(argv, opener=opener, open_browser=fake_browser, wait=fake_wait)
+    rc = dt.main(argv, opener=opener, open_browser=fake_browser, listen=fake_listen)
     out, err = capsys.readouterr()
     return rc, out, err, opened
 
@@ -233,11 +255,88 @@ def test_errors_do_not_echo_token(capsys: pytest.CaptureFixture[str]) -> None:
     )
     assert rc != 0
     assert TOKEN not in err
+    assert "the-code" not in err
     assert "Traceback" not in err
-    assert len(err.strip().splitlines()) >= 1
-    assert "boom" in err
+    last = err.strip().splitlines()[-1]
+    assert last.startswith("error:")
+    assert "boom" in last
+    assert "<redacted>" in last
     # the token was already printed for the operator before --call failed
     assert out == TOKEN + "\n"
+
+
+def test_main_binds_before_opening_browser(capsys: pytest.CaptureFixture[str]) -> None:
+    events: list[str] = []
+    rc, _, _, _ = _run_main(
+        ["--domain", DOMAIN, "--client-id", CLIENT_ID],
+        _RecordingOpener([_token_response()]),
+        capsys,
+        events,
+    )
+    assert rc == 0
+    assert events == ["bind", "browser", "wait:120", "close"]
+
+
+def test_main_port_conflict_fails_before_browser(capsys: pytest.CaptureFixture[str]) -> None:
+    opened: list[str] = []
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as squatter:
+        squatter.bind(("127.0.0.1", 0))
+        squatter.listen(1)
+        busy = squatter.getsockname()[1]
+        rc = dt.main(
+            ["--domain", DOMAIN, "--client-id", CLIENT_ID, "--port", str(busy)],
+            opener=_RecordingOpener([]),
+            open_browser=lambda url: bool(opened.append(url)) or True,
+        )
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert opened == []
+    assert out == ""
+    assert err.strip().splitlines()[-1].startswith("error: cannot listen on 127.0.0.1:")
+
+
+def test_main_rejects_non_https_call(capsys: pytest.CaptureFixture[str]) -> None:
+    events: list[str] = []
+    rc, out, err, opened = _run_main(
+        ["--domain", DOMAIN, "--client-id", CLIENT_ID, "--call", "http://api.example/api/x"],
+        _RecordingOpener([]),
+        capsys,
+        events,
+    )
+    assert rc == 2
+    assert out == ""
+    assert opened == []
+    assert events == []
+    assert "--call must be an https://" in err
+
+
+def test_call_body_preview_strips_escape_sequences(capsys: pytest.CaptureFixture[str]) -> None:
+    body = b'{"msg": "\x1b[31mred\x1b]0;title\x07\r\nnext"}'
+    opener = _RecordingOpener([_token_response(), _FakeResponse(200, body)])
+    rc, _, err, _ = _run_main(
+        ["--domain", DOMAIN, "--client-id", CLIENT_ID, "--call", "https://api.example/api/x"],
+        opener,
+        capsys,
+    )
+    assert rc == 0
+    assert "\x1b" not in err
+    assert "\x07" not in err
+    assert "\r" not in err
+    assert "red" in err
+    assert "next" in err
+
+
+def test_callback_error_description_strips_escape_sequences() -> None:
+    with pytest.raises(dt.HelperError) as info:
+        dt.parse_callback("/callback?error=bad%1B%5B2J&error_description=x%07y&state=s1", "s1")
+    assert "\x1b" not in str(info.value)
+    assert "\x07" not in str(info.value)
+    assert "bad" in str(info.value)
+
+
+def test_callback_non_ascii_state_is_mismatch_not_typeerror() -> None:
+    with pytest.raises(dt.HelperError, match="state mismatch"):
+        dt.parse_callback("/callback?code=c&state=%C3%A9", "s1")
 
 
 def test_main_token_exchange_failure_exits_nonzero(capsys: pytest.CaptureFixture[str]) -> None:
@@ -285,6 +384,71 @@ def test_wait_for_code_real_socket_ephemeral_port() -> None:
     assert status == 200
     assert "close this tab" in page
     assert "real-code" not in page
+
+
+def _serve_in_thread(timeout_s: float) -> tuple[threading.Thread, int, dict[str, Any]]:
+    ports: queue.Queue[int] = queue.Queue()
+    result: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            result["code"] = dt.wait_for_code(0, "s1", timeout_s=timeout_s, on_ready=ports.put)
+        except Exception as exc:  # pragma: no cover - surfaced by the asserts
+            result["error"] = exc
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    return worker, ports.get(timeout=5), result
+
+
+def test_wait_for_code_favicon_then_callback() -> None:
+    worker, port, result = _serve_in_thread(10)
+    with pytest.raises(urllib.error.HTTPError) as info:
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.ico", timeout=5)
+    assert info.value.code == 404
+    info.value.close()
+    url = f"http://127.0.0.1:{port}/callback?code=real-code&state=s1"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        assert resp.status == 200
+        resp.read()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert result == {"code": "real-code"}
+
+
+def test_wait_for_code_idle_connection_does_not_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(dt._CallbackHandler, "timeout", 0.3)
+    worker, port, result = _serve_in_thread(10)
+    start = time.monotonic()
+    with socket.create_connection(("127.0.0.1", port), timeout=5):
+        # idle: sends nothing; the server must time this connection out and move on
+        url = f"http://127.0.0.1:{port}/callback?code=real-code&state=s1"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            assert resp.status == 200
+            resp.read()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert result == {"code": "real-code"}
+    assert time.monotonic() - start < 5
+
+
+def test_handler_has_connection_timeout() -> None:
+    assert dt._CallbackHandler.timeout == dt.CONNECTION_TIMEOUT_S == 5.0
+
+
+def test_http_error_body_is_closed() -> None:
+    fp = io.BytesIO(b'{"error":"invalid_grant"}')
+    err = urllib.error.HTTPError(DOMAIN + "/oauth2/token", 400, "Bad Request", None, fp)
+    with pytest.raises(dt.HelperError):
+        dt.exchange_code(DOMAIN, CLIENT_ID, "c", REDIRECT, "v", opener=_RecordingOpener([err]))
+    assert fp.closed
+    fp2 = io.BytesIO(b"denied")
+    err2 = urllib.error.HTTPError("https://api.example/x", 403, "Forbidden", None, fp2)
+    assert dt.call_api("https://api.example/x", TOKEN, opener=_RecordingOpener([err2])) == (
+        403,
+        "denied",
+    )
+    assert fp2.closed
 
 
 def test_wait_for_code_times_out() -> None:

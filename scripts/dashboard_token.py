@@ -6,27 +6,32 @@ one dashboard API URL with it (e.g. to verify the JWT authorizer end to end).
 
 Flow:
     1. Generate a PKCE S256 pair (64-char verifier) and a random ``state``.
-    2. Open the browser at ``{domain}/oauth2/authorize`` (the URL is also
+    2. Bind the one-shot callback listener on ``127.0.0.1:<port>`` -- a port
+       conflict fails here, before the operator is sent to sign in.
+    3. Open the browser at ``{domain}/oauth2/authorize`` (the URL is also
        printed to stderr in case no browser opens).
-    3. Wait (120 s) for the one redirect to ``http://localhost:<port>/callback``
-       on a one-shot HTTP server bound to 127.0.0.1 only; reject a mismatched
-       ``state``.
-    4. ``POST {domain}/oauth2/token`` (form-encoded, public client, no secret).
-    5. Print the **access token** to stdout -- nothing is written to disk.
+    4. Wait (120 s) for the redirect to ``http://localhost:<port>/callback``;
+       reject a mismatched ``state``. Each connection gets a 5 s socket timeout
+       so an idle connection cannot hold the single-threaded listener.
+    5. ``POST {domain}/oauth2/token`` (form-encoded, public client, no secret).
+    6. Print the **access token** to stdout -- nothing is written to disk.
 
 Usage:
     python -m scripts.dashboard_token \\
         --domain https://crypto-signals-dash-<account>.auth.ap-south-1.amazoncognito.com \\
-        --client-id <DashboardUserPoolClientId> [--port 8765] [--call <api-url>]
+        --client-id <DashboardUserPoolClientId> [--port 8765] [--call <https-api-url>]
 
 ``--domain`` and ``--client-id`` are the ``DashboardCognitoDomain`` and
 ``DashboardUserPoolClientId`` stack outputs. ``--port`` must match the
-registered callback (``http://localhost:8765/callback``). With ``--call`` the
-helper performs ``GET <api-url>`` with ``Authorization: Bearer <token>`` and
-reports the status and the first 500 characters of the body on stderr, so
-stdout stays exactly the token (``TOKEN=$(python -m scripts.dashboard_token ...)``).
+registered callback (``http://localhost:8765/callback``). With ``--call`` (an
+``https://`` URL) the helper performs ``GET <api-url>`` with
+``Authorization: Bearer <token>`` and reports the status and the first 500
+characters of the body on stderr, so stdout stays exactly the token
+(``TOKEN=$(python -m scripts.dashboard_token ...)``).
 
-Errors exit non-zero with a one-line message on stderr and never echo the token.
+Errors exit non-zero with a one-line message on stderr and never echo the
+token; anything echoed to the terminal is stripped of non-printable characters
+(no terminal escape sequences from remote text).
 
 This module ships in the Lambda code asset, so it imports the standard library
 only and does nothing at import time.
@@ -49,10 +54,11 @@ import urllib.request
 import webbrowser
 from collections.abc import Callable, Sequence
 from http.server import BaseHTTPRequestHandler
-from typing import Any
+from typing import Any, Protocol
 
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT_S = 120.0
+CONNECTION_TIMEOUT_S = 5.0
 HTTP_TIMEOUT_S = 30.0
 SCOPES = "openid email profile"
 CALLBACK_PATH = "/callback"
@@ -71,7 +77,6 @@ _FAILED_PAGE = (
 
 Opener = Callable[..., Any]
 BrowserOpener = Callable[[str], bool]
-WaitFn = Callable[[int, str, float], str]
 
 
 class HelperError(Exception):
@@ -80,6 +85,11 @@ class HelperError(Exception):
 
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _printable(text: str) -> str:
+    """Whitespace -> single spaces; drop every other non-printable character (e.g. ESC)."""
+    return "".join(c if c.isprintable() else (" " if c.isspace() else "") for c in text)
 
 
 def pkce_pair() -> tuple[str, str]:
@@ -118,10 +128,11 @@ def parse_callback(path: str, expected_state: str) -> str:
     error = _first(query, "error")
     if error is not None:
         description = _first(query, "error_description") or ""
-        detail = f"{error} {description}".strip()[:200]
+        detail = _printable(f"{error} {description}").strip()[:200]
         raise HelperError(f"authorization failed: {detail}")
     state = _first(query, "state")
-    if state is None or not hmac.compare_digest(state, expected_state):
+    # Compare bytes: compare_digest raises TypeError on non-ASCII str.
+    if state is None or not hmac.compare_digest(state.encode(), expected_state.encode()):
         raise HelperError("callback state mismatch (possible CSRF); aborting")
     code = _first(query, "code")
     if not code:
@@ -129,10 +140,24 @@ def parse_callback(path: str, expected_state: str) -> str:
     return code
 
 
-def _error_detail(exc: urllib.error.HTTPError) -> str:
+def _read_and_close(exc: urllib.error.HTTPError) -> bytes:
+    """Read an HTTPError body (if any) and always close it."""
+    if exc.fp is None:
+        return b""
     try:
-        payload = json.loads(exc.read().decode("utf-8", "replace"))
-    except (ValueError, OSError):
+        data: bytes = exc.read()
+        return data
+    except OSError:
+        return b""
+    finally:
+        exc.close()
+
+
+def _error_detail(exc: urllib.error.HTTPError) -> str:
+    raw = _read_and_close(exc)
+    try:
+        payload = json.loads(raw.decode("utf-8", "replace"))
+    except ValueError:
         return f"HTTP {exc.code}"
     if isinstance(payload, dict) and isinstance(payload.get("error"), str):
         return f"HTTP {exc.code} {payload['error']}"
@@ -193,22 +218,17 @@ def call_api(url: str, token: str, *, opener: Opener = urllib.request.urlopen) -
             raw = resp.read()
     except urllib.error.HTTPError as exc:
         status = exc.code
-        raw = exc.read()
+        raw = _read_and_close(exc)
     except urllib.error.URLError as exc:
         raise HelperError(f"API call failed: {exc.reason}") from None
     return status, raw.decode("utf-8", "replace")[:BODY_PREVIEW_CHARS]
 
 
-class _CallbackServer(socketserver.TCPServer):
-    # TCPServer (not HTTPServer) avoids the getfqdn() reverse lookup on bind.
-    allow_reuse_address = False
-    expected_state: str
-    code: str | None
-    failure: HelperError | None
-
-
 class _CallbackHandler(BaseHTTPRequestHandler):
-    server: _CallbackServer
+    # StreamRequestHandler applies this to the accepted socket: an idle or slow
+    # connection times out instead of holding the single-threaded listener.
+    timeout = CONNECTION_TIMEOUT_S
+    server: CallbackListener
 
     def do_GET(self) -> None:
         if urllib.parse.urlsplit(self.path).path != CALLBACK_PATH:
@@ -231,7 +251,68 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         self.wfile.write(page)
 
     def log_message(self, format: str, *args: Any) -> None:
-        return  # keep the code out of stderr
+        return  # keep request lines (which carry the code) out of stderr
+
+
+class CallbackListener(socketserver.TCPServer):
+    """One-shot callback server bound to 127.0.0.1 (bound on construction).
+
+    TCPServer (not HTTPServer) avoids the getfqdn() reverse lookup on bind.
+    """
+
+    allow_reuse_address = False
+
+    def __init__(self, port: int, expected_state: str) -> None:
+        super().__init__(("127.0.0.1", port), _CallbackHandler)
+        self.expected_state = expected_state
+        self.code: str | None = None
+        self.failure: HelperError | None = None
+
+    @property
+    def port(self) -> int:
+        return int(self.server_address[1])
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # Per-connection failures (timeouts, resets) must not print a traceback;
+        # the deadline loop simply keeps waiting.
+        print("note: a callback connection failed; still waiting", file=sys.stderr)
+
+    def wait(self, timeout_s: float = DEFAULT_TIMEOUT_S) -> str:
+        """Serve until one ``/callback`` arrives; return its code or raise."""
+        deadline = time.monotonic() + timeout_s
+        while self.code is None and self.failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HelperError(
+                    f"timed out after {timeout_s:g}s waiting for the sign-in callback"
+                )
+            self.timeout = remaining
+            self.handle_request()
+        if self.failure is not None:
+            raise self.failure
+        assert self.code is not None
+        return self.code
+
+
+class Listener(Protocol):
+    """What ``main`` needs from a bound callback listener (a test seam)."""
+
+    def __enter__(self) -> Listener: ...
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any, /) -> None: ...
+    def wait(self, timeout_s: float = ...) -> str: ...
+
+
+ListenFn = Callable[[int, str], Listener]
+
+
+def open_listener(port: int, expected_state: str) -> CallbackListener:
+    """Bind the callback listener; a bind failure becomes :class:`HelperError`."""
+    try:
+        return CallbackListener(port, expected_state)
+    except OSError as exc:
+        raise HelperError(
+            f"cannot listen on 127.0.0.1:{port} ({exc.strerror or exc}); is the port in use?"
+        ) from None
 
 
 def wait_for_code(
@@ -247,35 +328,16 @@ def wait_for_code(
     server is always closed. ``on_ready`` receives the bound port (useful with
     ``port=0``).
     """
-    with _CallbackServer(("127.0.0.1", port), _CallbackHandler) as server:
-        server.expected_state = expected_state
-        server.code = None
-        server.failure = None
+    with open_listener(port, expected_state) as listener:
         if on_ready is not None:
-            on_ready(int(server.server_address[1]))
-        deadline = time.monotonic() + timeout_s
-        while server.code is None and server.failure is None:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise HelperError(
-                    f"timed out after {timeout_s:g}s waiting for the sign-in callback"
-                )
-            server.timeout = remaining
-            server.handle_request()
-        if server.failure is not None:
-            raise server.failure
-        assert server.code is not None
-        return server.code
-
-
-def _wait_default(port: int, expected_state: str, timeout_s: float) -> str:
-    return wait_for_code(port, expected_state, timeout_s)
+            on_ready(listener.port)
+        return listener.wait(timeout_s)
 
 
 def _redact(message: str, secret: str | None) -> str:
     if secret:
         message = message.replace(secret, "<redacted>")
-    return " ".join(message.split())  # one line
+    return " ".join(_printable(message).split())  # one printable line
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -291,7 +353,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PORT,
         help="Local callback port; must match the registered callback URL (default 8765).",
     )
-    parser.add_argument("--call", metavar="API_URL", help="GET this URL with the token.")
+    parser.add_argument("--call", metavar="API_URL", help="GET this https:// URL with the token.")
     return parser
 
 
@@ -300,12 +362,15 @@ def main(
     *,
     opener: Opener = urllib.request.urlopen,
     open_browser: BrowserOpener = webbrowser.open,
-    wait: WaitFn = _wait_default,
+    listen: ListenFn = open_listener,
 ) -> int:
     args = _build_parser().parse_args(argv)
     domain = str(args.domain).rstrip("/")
     if not domain.startswith("https://"):
         print("error: --domain must be an https:// URL", file=sys.stderr)
+        return 2
+    if args.call is not None and not str(args.call).startswith("https://"):
+        print("error: --call must be an https:// URL", file=sys.stderr)
         return 2
 
     token: str | None = None
@@ -314,18 +379,21 @@ def main(
         state = secrets.token_urlsafe(32)
         redirect_uri = f"http://localhost:{args.port}{CALLBACK_PATH}"
         url = authorize_url(domain, args.client_id, redirect_uri, challenge, state)
-        print(f"Opening the sign-in page (or open it yourself):\n{url}", file=sys.stderr)
-        if not open_browser(url):
-            print("Could not open a browser; open the URL above manually.", file=sys.stderr)
-        code = wait(args.port, state, DEFAULT_TIMEOUT_S)
+        # Bind first: a port conflict must fail before the operator signs in.
+        with listen(args.port, state) as listener:
+            print(f"Opening the sign-in page (or open it yourself):\n{url}", file=sys.stderr)
+            if not open_browser(url):
+                print("Could not open a browser; open the URL above manually.", file=sys.stderr)
+            code = listener.wait(DEFAULT_TIMEOUT_S)
         tokens = exchange_code(domain, args.client_id, code, redirect_uri, verifier, opener=opener)
         token = str(tokens["access_token"])
         print(token)
         sys.stdout.flush()
         if args.call:
             status, body = call_api(args.call, token, opener=opener)
-            print(f"GET {args.call} -> HTTP {status}", file=sys.stderr)
-            print(body.replace(token, "<redacted>") or "(empty body)", file=sys.stderr)
+            print(f"GET {_printable(args.call)} -> HTTP {status}", file=sys.stderr)
+            preview = _printable(body.replace(token, "<redacted>"))
+            print(preview or "(empty body)", file=sys.stderr)
     except HelperError as exc:
         print(f"error: {_redact(str(exc), token)}", file=sys.stderr)
         return 1
