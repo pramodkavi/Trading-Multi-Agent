@@ -21,8 +21,10 @@ What it is (design §3.2):
   export, and every dependency bump would fail ``cdk deploy --all`` with
   "Cannot update export ... in use".
 - An **API Gateway HTTP API** (not a REST API; design §13): ~$1 per million
-  requests, and in Step 4.4 the Cognito **JWT authorizer** runs before the Lambda
-  so there is no auth code in Python and unauthenticated calls cost nothing. A
+  requests, and since Step 4.4 the Cognito **JWT authorizer** runs before the
+  Lambda, so authentication is not done in Python and unauthenticated calls cost
+  no Lambda/Aurora (each 401 still writes an access-log line; the stage throttle
+  is shared, so a flood can 429 the operator). A
   Lambda Function URL was rejected because it has no built-in JWT authorizer.
   The API is served on the ``$default`` stage (no stage prefix in paths), with
   access logging to its own log group and a conservative throttle.
@@ -55,8 +57,7 @@ app only, deliberately unrouted here (no auth yet); the one change 4.2 made to
 this stack is the JSON access-log format (``ACCESS_LOG_FORMAT``). Step 4.3
 added the funnel / analytics / Critic / system-health / market routes, again
 FastAPI-only; its only change here is the read-only CloudWatch IAM above. What
-the next steps add here: 4.4 the Cognito user pool + JWT authorizer and the
-``ANY /api/{proxy+}`` route that makes the data routes reachable; 4.5 the SPA
+the next steps add here: 4.5 the SPA
 (private S3 bucket + CloudFront, which also fronts ``/api/*`` so SPA and API
 share one origin); 4.7 the SSM parameter publishing the base URL for the
 Telegram deep links (design §7).
@@ -65,7 +66,9 @@ Step 4.4 (done) added the one-user Cognito pool (admin-created only, LITE plan,
 TOTP MFA required, RETAINED with deletion protection), its classic Hosted UI
 domain, the public PKCE app client (callback = the local token helper
 ``scripts/dashboard_token.py``; 4.5 adds the CloudFront URLs), the
-``HttpUserPoolAuthorizer`` and the ``ANY /api/{proxy+}`` route that uses it.
+``HttpUserPoolAuthorizer`` and the ``ANY /api/{proxy+}`` route that uses it
+(``openid`` scope required, so only access tokens pass -- ID tokens carry no
+``scope`` claim); that route makes the 4.2 / 4.3 data routes reachable.
 The app adds a second layer (``src/dashboard/api/auth.py``): under Lambda, a
 non-health request without JWT claims is a 401. Runbook: docs/operations.md §8.7.
 """
@@ -281,8 +284,8 @@ class DashboardStack(Stack):
             api_name="crypto-signals-dashboard",
             create_default_stage=False,
             description=(
-                "Crypto-signals dashboard API. Step 4.1: GET /api/health only (open); "
-                "Step 4.4 puts every other route behind a Cognito JWT authorizer."
+                "Crypto-signals dashboard API (read-only). GET /api/health is open; "
+                "ANY /api/{proxy+} is behind the Cognito JWT authorizer (access tokens)."
             ),
         )
         self.stage = self.http_api.add_stage(
@@ -315,9 +318,10 @@ class DashboardStack(Stack):
         # LITE tier (threat protection is a paid add-on); TOTP MFA REQUIRED, never
         # SMS (no SNS role / cost) -- operator decision 2026-10-21: optional MFA
         # had no enrolment path on the classic Hosted UI, while required MFA makes
-        # the Hosted UI enrol an authenticator app at first sign-in. RETAINED + deletion protection (operator
-        # decision 2026-10-21): an accidental stack delete must not wipe the
-        # account -- a recreated stack gets a new empty pool and the orphan is free.
+        # the Hosted UI enrol an authenticator app at first sign-in. RETAINED +
+        # deletion protection (operator decision 2026-10-21): an accidental stack
+        # delete must not wipe the account -- a recreated stack gets a new empty
+        # pool and the orphan is free.
         self.user_pool = cognito.UserPool(
             self,
             "DashboardUserPool",
@@ -373,7 +377,8 @@ class DashboardStack(Stack):
 
         # ---- JWT authorizer + the authenticated proxy route ------------------
         # API Gateway validates issuer, audience (client_id) and expiry before the
-        # Lambda runs, so a rejected request costs nothing and touches no DB.
+        # Lambda runs, so a rejected request invokes no Lambda and touches no DB
+        # (it still writes an access-log line and counts against the throttle).
         self.jwt_authorizer = authorizers.HttpUserPoolAuthorizer(
             "DashboardJwtAuthorizer",
             self.user_pool,

@@ -348,8 +348,9 @@ one step, its own tests.
 
 ## 8. Security posture (deliberately minimal, per C1)
 
-- Cognito user pool, one user, strong password policy, **no self-signup**, optional TOTP MFA
-  left to the operator. Hosted UI callback restricted to the CloudFront domain.
+- Cognito user pool, one user, strong password policy, **no self-signup**, TOTP MFA
+  required (operator decision 2026-10-21: optional MFA had no enrolment path on the
+  classic Hosted UI). Hosted UI callback restricted to the CloudFront domain.
 - JWT authorizer on API Gateway validates issuer, audience/client, expiry. Lambda trusts the
   authorizer; it additionally rejects any request without the `requestContext.authorizer`
   claims (defence against direct Function/API misconfiguration).

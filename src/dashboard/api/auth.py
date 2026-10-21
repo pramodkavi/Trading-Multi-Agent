@@ -1,10 +1,16 @@
 """Lambda-side defence behind the HTTP API JWT authorizer (design §8, Step 4.4).
 
-The HTTP API validates the Cognito access token (issuer, `client_id`, expiry) on
-`ANY /api/{proxy+}` before invoking the Lambda; `GET /api/health` has no
-authorizer. This middleware is the second layer: a request that reaches the
-function some other way -- a console test event, a direct `lambda:InvokeFunction`,
-a route mis-wired without the authorizer -- must not run a data route.
+The HTTP API validates the Cognito access token (issuer, `client_id`, expiry,
+`openid` scope) on `ANY /api/{proxy+}` before invoking the Lambda;
+`GET /api/health` has no authorizer. This middleware is the second layer, a
+defence against **mis-wired routes** (a route added without the authorizer) and
+**naive test events** (a console event without claims): such a request must not
+run a data route.
+
+It is NOT an authentication boundary against a direct `lambda:InvokeFunction`:
+whoever may invoke the function can put any claims in the event (nothing
+validates them here), so that path is governed by IAM -- only API Gateway's
+resource-scoped permissions and principals with invoke rights can call it.
 
 Rule: when the request runs under Lambda (Mangum puts the raw event in
 `scope["aws.event"]`) and the path is not in `PUBLIC_PATHS`, the event must

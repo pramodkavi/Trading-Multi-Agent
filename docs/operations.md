@@ -489,7 +489,7 @@ FROM agent_runs WHERE agent_role = 'critic' GROUP BY 1 ORDER BY 1;
 Design: `docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md`
 (serverless, read-only Phase 1; its §10 table is SPEC §4 Slice 4).
 
-### 8.1 What the stack is (Step 4.1 scaffold)
+### 8.1 What the stack is (since Step 4.1)
 
 `CryptoSignals-Dashboard` (`infrastructure/stacks/dashboard_stack.py`, declared
 **last** in `infrastructure/app.py`, coupled only to `CryptoSignals-Data` via the
@@ -500,7 +500,7 @@ cluster ARN + DB secret ARN imports):
 | Lambda `DashboardApi` | python3.11, 512 MB, 25 s timeout, **outside the VPC**; handler `src.dashboard.api.app.handler` (FastAPI wrapped by Mangum); env `PERSISTENCE_BACKEND=dataapi`, `DB_CLUSTER_ARN`, `DB_SECRET_ARN`, `DB_NAME`, `APP_VERSION`, `LOG_LEVEL` |
 | Its own `DepsLayer` | built by `lambda_assets.deps_layer(..., extras=("dashboard",))` — base deps + `fastapi` + `mangum` (~136 MB); the scan Lambda's layer is unchanged |
 | HTTP API `crypto-signals-dashboard` | two routes, one shared Lambda integration: `GET /api/health` (**open**, no authorizer) and, since Step 4.4, `ANY /api/{proxy+}` behind the Cognito JWT authorizer `DashboardJwtAuthorizer` (validates issuer, client id and expiry); `$default` stage, auto-deploy, throttle 10 rps / burst 20, no CORS |
-| Cognito (Step 4.4) | user pool `crypto-signals-dashboard`: one admin-created user (no self-signup), email sign-in (case-insensitive), password ≥ 12 with lower + upper + digit + symbol, temp password valid 3 days, optional TOTP MFA (no SMS), email-only recovery, LITE plan; **retained** on stack delete + deletion protection. Hosted UI prefix domain `crypto-signals-dash-<account-id>` (classic Hosted UI). Public app client `DashboardSpaClient`: authorization code + PKCE only, SRP, scopes `openid email profile`, callback `http://localhost:8765/callback` (the token helper; Step 4.5 adds CloudFront), access / ID tokens 1 h, refresh 30 d, token revocation on |
+| Cognito (Step 4.4) | user pool `crypto-signals-dashboard`: one admin-created user (no self-signup), email sign-in (case-insensitive), password ≥ 12 with lower + upper + digit + symbol, temp password valid 3 days, **TOTP MFA required** (no SMS; enrolled at first sign-in, §8.7), email-only recovery, LITE plan; **retained** on stack delete + deletion protection. Hosted UI prefix domain `crypto-signals-dash-<account-id>` (classic Hosted UI). Public app client `DashboardSpaClient`: authorization code + PKCE only, SRP, scopes `openid email profile`, callback `http://localhost:8765/callback` (the token helper; Step 4.5 adds CloudFront), access / ID tokens 1 h, refresh 30 d, token revocation on |
 | Log groups | `DashboardApiLogs` (function) + `DashboardApiAccessLogs` (API access log), 14-day retention |
 | IAM role | RDS Data API on the one cluster + read of its secret, CloudWatch Logs write; since Step 4.3 CloudWatch read (`DescribeAlarms` on `CryptoSignals-Monitoring-*`, `ListMetrics` + `GetMetricData` on `*`) — **no SSM, no S3, no Lambda** |
 | Outputs | `DashboardApiUrl`, `DashboardFunctionName`; since Step 4.4 `DashboardUserPoolId`, `DashboardUserPoolClientId`, `DashboardCognitoDomain` (Hosted UI base URL `https://<prefix>.auth.<region>.amazoncognito.com`), `DashboardJwtIssuer` |
@@ -516,9 +516,14 @@ browsing it never wakes the cluster; the Data API grant is what the data routes 
 The user pool is **retained**: deleting the stack (§8.5) leaves the pool (and its
 user) in place, and a recreated stack creates a **new, empty** pool — re-create the
 user there (§8.7) and delete the orphan by hand once deletion protection is turned
-off, if wanted (it costs nothing). cdk-nag `AwsSolutions-COG2` (MFA not required),
-`-COG3` (advanced security) and `-COG8` (Plus plan) are suppressed on the pool only,
-with reasons in `dashboard_stack.py` (single operator; paid tiers).
+off, if wanted (it costs nothing). The same happens on a **template change that
+forces user-pool replacement** (e.g. changing the sign-in attributes / username
+configuration): under RETAIN CloudFormation creates a new **empty** pool (new pool
+id, new client id, new issuer) and orphans the old one — re-create the user and
+re-enrol TOTP (§8.7) and use the new outputs. cdk-nag `AwsSolutions-COG3`
+(advanced security) and `-COG8` (Plus plan) are suppressed on the pool only, with
+reasons in `dashboard_stack.py` (single operator; paid tiers); `-COG2` (MFA) is
+satisfied — TOTP MFA is required (operator decision 2026-10-21).
 
 ### 8.2 Where the API URL is
 
@@ -570,7 +575,8 @@ The stack is independent: deleting `CryptoSignals-Dashboard` in the CloudFormati
 console removes the API, function, layer and log groups without touching the
 pipeline stacks. The Cognito user pool is **retained** (RETAIN + deletion
 protection, Step 4.4): it survives the delete, and the recreated stack makes a new
-empty pool (§8.1). No workflow exposes `cdk destroy` for it (the deploy workflow's
+empty pool (§8.1) — re-create the user and re-enrol TOTP there (§8.7); a
+template change that forces pool replacement has the same effect. No workflow exposes `cdk destroy` for it (the deploy workflow's
 `recreate_stateless_stacks` covers Monitoring / Scheduling / Compute only), and the
 hard rule rules out a local CLI — the console delete is the path. Note that the next
 `cdk deploy --all` recreates it.
@@ -707,7 +713,10 @@ authorizer would have passed); the rest is filler:
 For another route change **all three** path copies together — `rawPath`,
 `routeKey` and `requestContext.http.path`. Mangum's HTTP-API handler routes on
 **`requestContext.http.path`**, not `rawPath` (the event above works because the
-three agree; edit only `rawPath` and the old route still answers). Query
+three agree; edit only `rawPath` and the old route still answers). The `routeKey`
+values are illustrative only: a request proxied by API Gateway actually carries the
+matched route, `ANY /api/{proxy+}`, and Mangum ignores `routeKey` — keeping them in
+step with the path just makes the event self-describing. Query
 parameters go in `rawQueryString` (e.g. `"limit=5&symbol=BTCUSDT"` — Mangum reads
 that field, not `queryStringParameters`). The response is the Lambda proxy
 shape: `{"statusCode": 200, "headers": {...}, "body": "<JSON string>",
@@ -793,27 +802,40 @@ S256 through the classic Hosted UI; nothing is written to disk).
    ```
 
    It binds `127.0.0.1:8765`, opens the browser at the Hosted UI (the URL is also
-   printed on stderr), and waits up to 120 s for the callback. The **first sign-in
-   forces the password change** from the temporary password. **stdout is the access
+   printed on stderr), and waits up to 120 s for the callback. **stdout is the access
    token only** (so `$token = .\.venv\Scripts\python.exe -m scripts.dashboard_token ...`
    works); with `--call` (must be `https://`) the HTTP status and the first 500
    characters of the body go to **stderr**. Errors are one `error:` line, exit
-   non-zero, the token redacted.
-4. **Optional TOTP MFA.** MFA is optional (TOTP only, never SMS). Enrol an
-   authenticator app at the Hosted UI prompt or from the Cognito console (user →
-   MFA); later sign-ins then ask for the code.
-5. **Call the API** (`<api>` = `DashboardApiUrl`):
+   non-zero, the token redacted. Only an **access** token works: the proxy route
+   requires the `openid` scope and an ID token has no `scope` claim, so API Gateway
+   rejects ID tokens with 401.
+4. **TOTP MFA is required** (TOTP only, never SMS; operator decision 2026-10-21).
+   The **first sign-in** through the helper goes: the Hosted UI forces the
+   **password change** from the temporary password, then shows a **QR code** to
+   enrol an authenticator app (TOTP), then asks for a **6-digit code** from that app
+   to finish. Every later sign-in asks for the current code after the password.
+   **Lost authenticator:** there is no self-service recovery of the second factor —
+   an admin resets it in the Cognito console via the user's MFA settings (or resets
+   the user's password / re-creates the user, step 2); the next sign-in then
+   enrols a new authenticator.
+5. **Call the API** (`<api>` = `DashboardApiUrl`; PowerShell, with `$token` from
+   step 3 — `curl.exe`, not the `curl` alias):
 
-   ```bash
-   curl -s -i <api>/api/overview                                   # 401 {"message":"Unauthorized"} (no token; Lambda not invoked)
-   curl -s -i -H "Authorization: Bearer $TOKEN" <api>/api/overview # 200 (first call after idle may be 503 db_resuming)
-   curl -s <api>/api/health                                        # 200 without a token
+   ```powershell
+   curl.exe -s -i <api>/api/overview                                       # 401 {"message":"Unauthorized"} (no token; Lambda not invoked)
+   curl.exe -s -i -H "Authorization: Bearer $token" <api>/api/overview     # 200 (first call after idle may be 503 db_resuming)
+   curl.exe -s <api>/api/health                                            # 200 without a token
    ```
 
 **Token validity.** Access and ID tokens last **1 h**, refresh tokens 30 d (the
 helper uses only the access token; re-run it after an hour). The authorizer checks
 the issuer (`DashboardJwtIssuer`), the client id and expiry; an expired token is a
-401 from API Gateway. **Where 401s show up:** API Gateway's rejections only in
+401 from API Gateway. **Revocation window:** the JWT authorizer validates tokens
+locally (signature, issuer, audience, expiry) and never asks Cognito whether a token
+was revoked, so signing out or revoking the refresh token does **not** kill an
+already-issued access token — it keeps working until it expires (≤ 1 h). To cut
+access immediately, disable the user in the Cognito console (no new tokens, no
+refresh) and wait out the hour. **Where 401s show up:** API Gateway's rejections only in
 `DashboardApiAccessLogs` (`status` 401, no `integrationLatency`, §8.6); the app's
 own `{"reason":"unauthorized"}` (missing claims) is a normal invocation in the
 function log. `/api/docs` needs a token, so it is not browsable directly until the
