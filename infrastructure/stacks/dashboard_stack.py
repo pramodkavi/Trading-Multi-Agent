@@ -50,12 +50,14 @@ pin that (``Fn::ImportValue`` names all start with ``Data:``).
 Step 4.2 shipped the read-only query module and the first data routes
 (``/api/overview``, ``/api/setups/open``, ``/api/signals...``) -- in the FastAPI
 app only, deliberately unrouted here (no auth yet); the one change 4.2 made to
-this stack is the JSON access-log format (``ACCESS_LOG_FORMAT``). What the next
-steps add here: 4.3 the SPA (private S3 bucket + CloudFront, which also fronts
-``/api/*`` so SPA and API share one origin); 4.4 the Cognito user pool + JWT
-authorizer and the ``ANY /api/{proxy+}`` route that makes the data routes
-reachable; 4.5 the SSM parameter publishing the base URL for the Telegram deep
-links (design §7).
+this stack is the JSON access-log format (``ACCESS_LOG_FORMAT``). Step 4.3
+added the funnel / analytics / Critic / system-health / market routes, again
+FastAPI-only; its only change here is the read-only CloudWatch IAM above. What
+the next steps add here: 4.4 the Cognito user pool + JWT authorizer and the
+``ANY /api/{proxy+}`` route that makes the data routes reachable; 4.5 the SPA
+(private S3 bucket + CloudFront, which also fronts ``/api/*`` so SPA and API
+share one origin); 4.7 the SSM parameter publishing the base URL for the
+Telegram deep links (design §7).
 """
 
 from __future__ import annotations

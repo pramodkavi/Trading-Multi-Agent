@@ -6,7 +6,7 @@
 > **not** cloned, so everything durable has been written here instead. Read this file
 > first; it points to everything else.
 >
-> **Last updated:** 2026-10-21 (**Slice 4 Step 4.2 shipped** on `feat/slice-4-step-4.2-read-only-queries` — read-only queries + overview/setups/signals endpoints, FastAPI-only until 4.4; see §2 / §7 / §8. Earlier: Critic v0 / Step 2.14 merged via PR #12; Step 4.0 merged via PR #13 and Step 4.1 `DashboardStack` scaffold merged via PR #14 — both DEPLOYED and live-verified 2026-10-20, see §3. ⚠️ Anthropic credits are exhausted again since 2026-10-19 — see §7.)
+> **Last updated:** 2026-10-21 (**Slice 4 Step 4.3 shipped** on `feat/slice-4-step-4.3-analytics-system-endpoints`, stacked on 4.2 — funnel / analytics / Critic / system-health / market endpoints + CloudWatch read IAM, FastAPI-only until 4.4; **Step 4.2 shipped** on `feat/slice-4-step-4.2-read-only-queries` — read-only queries + overview/setups/signals endpoints; see §2 / §7 / §8. Earlier: Critic v0 / Step 2.14 merged via PR #12; Step 4.0 merged via PR #13 and Step 4.1 `DashboardStack` scaffold merged via PR #14 — both DEPLOYED and live-verified 2026-10-20, see §3. ⚠️ Anthropic credits are exhausted again since 2026-10-19 — see §7.)
 > **Authority order:** `SPEC.md` (authoritative spec) → `CLAUDE.md` (index/rules) → this file (current state).
 
 ---
@@ -38,7 +38,7 @@ UTC cron (crypto never closes). Full detail in `SPEC.md`; quick index in `CLAUDE
 
 ---
 
-## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Steps 4.0 + 4.1 merged, deployed & live-verified; Step 4.2 shipped (branch, awaiting review + merge)**
+## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Steps 4.0 + 4.1 merged, deployed & live-verified; Steps 4.2 + 4.3 shipped (stacked branches, awaiting review + merge)**
 
 Slice 1 (1.1 → 1.22) and Slice 2 build steps **2.1 → 2.14** are done, on `main`, and
 **running in production** (ap-south-1). **Live-verified 2026-06-27:** a manual scan returned
@@ -217,8 +217,8 @@ merge is the `$default` stage's access-log format (JSON, below):
    no `payload` / `features` / `outcome_metadata`; the analyzer summary `entry_price` …
    `risk_reward_ratio` / `skip_reason` / `skip_details` is lifted out of the payload in SQL),
    `GET /api/signals/{id}` (lifecycle: the **full** signal as `SignalDetailOut` + trimmed per-step
-   summaries), `GET /api/signals/{id}/runs/{run_id}` (full output). Placeholders until Step 4.3:
-   `alarms: null` on the overview, `unrealised_r: null` on open setups.
+   summaries), `GET /api/signals/{id}/runs/{run_id}` (full output). The 4.2 placeholders
+   (`alarms: null` on the overview, `unrealised_r: null` on open setups) are filled by Step 4.3.
 4. **Step 4.1 follow-ups closed** — the stage access log is now an HTTP-API **JSON** format
    (`ACCESS_LOG_FORMAT` in `dashboard_stack.py`: `requestId`, `ip`, `requestTime`, `method`,
    `routeKey`, `path`, `status`, `responseLength`, `integrationLatency`, `integrationError`;
@@ -242,6 +242,43 @@ merge is the `$default` stage's access-log format (JSON, below):
    `RecursionError` map to 400 `bad_cursor`, a malformed setup row is skipped with a WARNING
    instead of failing the page, the Skeptic's `NoMacroData` step is detected by its `provider`
    key, and a Critic step trims to the `DecisionReview` fields.
+
+**Step 4.3 shipped — funnel + analytics + Critic + system-health + market endpoints** (branch
+`feat/slice-4-step-4.3-analytics-system-endpoints`, **stacked on 4.2** — merge 4.2 first; design
+§10 row 4.3 / §4.2 P4–P7 / §5.2a / §8). Still **FastAPI-only — nothing new is routed through the
+HTTP API until Step 4.4**; the **only live change on merge is the dashboard role's CloudWatch read
+IAM** (`cloudwatch:DescribeAlarms` on `CryptoSignals-Monitoring-*` alarms; `cloudwatch:ListMetrics`
++ `GetMetricData` on `*` — no resource-level permissions, justified `AwsSolutions-IAM5`
+suppression). Route table, error bodies and console examples: `docs/operations.md §8.6`.
+1. **Market** (`market.py`, `routers/market.py`) — `GET /api/market/klines?symbol&tf=4h&limit=200`
+   (watchlist symbols only → 400 `unknown_symbol`; `limit` 1..500; any `ProviderError` → 502
+   `market_unavailable`; `BinanceProvider` per request, imported lazily) and
+   `GET /api/signals/{id}/chart?before=60&after=30` (candles + entry/stop/TP/POI overlay).
+   **Unrealised R** on overview + `/api/setups/open` is best-effort: one concurrent latest-price
+   fetch per OPEN-setup symbol under a 5 s budget; failure → `null` + `"price unavailable"`.
+2. **Funnel** — `GET /api/funnel?since&until&group_by=day|window|symbol` (default 30 d, ≤ 365 d;
+   `AD_HOC` its own window group; `judge_*` incl. `judge_none` sum to `gate_passed`; top
+   rejections 7 / 30 d anchored to now).
+3. **Analytics + Critic** — `/api/analytics/win-rate?by=tag|session|strategy|time`,
+   `/skeptic-value`, `/equity-curve` (default 90 d, ≤ 365 d; outcome = the `decision_resolutions`
+   replay when present else the Forecaster's `signals.outcome`; `source_counts`; counterfactuals
+   from replays only; `win_rate: null` with 0 decisive); `/api/critic/reports`,
+   `/api/critic/reports/{id}`, `/api/critic/reviews`.
+4. **System health (P7)** — `/api/system/scans`, `/agents?days=7` (≤ 30), `/sweeps`, `/alarms`,
+   `/metrics`, `/config` (inferred values flagged `"inferred": true`). **LLM cost source rule:**
+   `agent_runs` = runs + cost for every role (Critic successes included); `decision_reviews` adds
+   only failed reviews (zero cost); `setup_evaluations` = the Forecaster. CloudWatch sections (and
+   the overview alarm strip, 5 s budget) degrade to `null` + `"cloudwatch unavailable"`, HTTP 200.
+5. **Data API 1 MB cap** — the funnel and outcome-row fetches read long ranges in 1,000-row
+   ascending keyset pages (`queries.read_all_pages`, 20-page guard). `/api/markets` (P5 tiles) is
+   deferred to its page step. **`src/providers/__init__` is now a lazy package** (PEP 562, same
+   pattern as 4.2's orchestration fix): the dashboard imports `src.providers.base`, and the old
+   eager `__init__` pulled in ccxt + aiohttp (≈3.5 s) on every cold start, `/api/health` included.
+   Now `import src.dashboard.api.app` loads no ccxt / aiohttp / httpx / boto3 (pinned by
+   `tests/unit/test_providers_lazy_import.py`). Measured 2026-10-21 on the same machine: ≈2.2 s
+   at 4.3 vs ≈2.0 s at the 4.2 base (`f813a63`). The 4.2 "1.2 s" was measured on a quieter run;
+   fastapi alone is ≈1.4 s today. The remaining ≈0.2 s is mostly `cloudwatch.py`'s botocore
+   `Config`. `/api/health` stays DB- and AWS-free.
 
 ---
 
@@ -422,7 +459,8 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | ✅ Done (Step 4.0) | ~~**Observability — Forecaster failures are invisible:** `Forecaster.run` swallowed per-setup exceptions, the Lambda returned `ok`, and no alarm fired.~~ **Fixed:** every per-setup exception now logs `PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` — the dedicated `ForecasterErrorAlarm` (metric filter on both terms, threshold 1/h) fires on the first one; the shared `ProviderErrorAlarm` counts it too — and journals a `setup_evaluations` row with `status='ERROR'`; every successful evaluation journals its verdict row too. Also closes the Step 2.7 deferral "per-agent token/cost on `agent_runs`": skeptic/judge rows now carry `latency_ms` / `token_usage` / `cost_usd` (`LlmUsage`). |
 | 🟡 Verify after deploy (Step 4.0) — **partially verified 2026-10-20** | Schema is applied (`to_regclass('setup_evaluations')` is non-null). (b) ✅ the 08:05 sweep wrote a `setup_evaluations` row (an `ERROR` row — credits, see the 🔴 Ops item — which is exactly the journaling 4.0 added). (c) ✅ the 08:03 scan's four `scan_runs` rows carry `session='LONDON'`; all 16 rows from 10-19 are `AD_HOC` (pre-4.0 deploy). **Still open:** (a) skeptic/judge `cost_usd` / `latency_ms` — unobservable so far because every proposal since 10-19 was gate-rejected (`RULE_2_MIN_RR`, `RULE_3_PREMIUM_DISCOUNT`, `RULE_9_CORRELATED_EXPOSURE`), so no skeptic/judge rows exist post-4.0; needs credits + a gate-passing proposal. (d) rule 7 — the first post-4.0 Cooldown scan is 2026-10-20 22:03 UTC; check `scan_runs.session='COOLDOWN'` and any `RULE_7_SESSION_BLOCK` skip after it. |
 | ✅ Verified (Step 4.1, 2026-10-20) | `GET https://s2bc8yifa1.execute-api.ap-south-1.amazonaws.com/api/health` → **200** `{"status":"ok","version":"c3ecb80"}` = the PR #14 merge commit; `/api/docs` → 404 (not routed, as documented). The `DashboardApiAccessLogs` group received one CLF line per request with **the path field logged as `-`** (`"GET - HTTP/1.1" 200 35`) because CDK's default format uses REST-era `$context.resourcePath` → ✅ **fixed in Step 4.2: the stage now uses an HTTP-API JSON format** (`routeKey`, `path`, `status`, `integrationLatency`, `requestId`, …) — verify after the 4.2 deploy (row below). Deploy created the stack last with no pipeline-stack changes beyond the shared code asset. |
-| 🟡 Verify after deploy (Step 4.2) | (a) `GET /api/health` once, then read the newest `DashboardApiAccessLogs` event: a JSON object whose `routeKey` is `GET /api/health` and `path` is `/api/health` (no more `-`). (b) Lambda console → `DashboardApi…` → Test with the v2 event from `docs/operations.md §8.6` against `/api/system/db`: `statusCode` 200 and a body `{"db":"ok","latency_ms":…}` — the first try after idle may say `"resuming"`, re-run after ~10 s. (c) The same event with `requestContext.http.path` (plus `rawPath` / `routeKey` — Mangum routes on the `http.path` field) set to `/api/overview`: 200 with today's windows (one `WindowOutcome` per window that has run — `LONDON` / `NY` / `OVERLAP` / `DAILY_WRAP` labels, worst per-symbol `status`, the four symbols — grouped from the per-symbol `scan_runs` rows), the risk budget, and `alarms: null`; a 503 `db_resuming` on the first try is expected. (d) `/api/signals?limit=5` (in `rawQueryString`): 200, five rows with a `kind`, and a `next_cursor` that pages when fed back as `cursor=`. |
+| 🟡 Verify after deploy (Step 4.2) | (a) `GET /api/health` once, then read the newest `DashboardApiAccessLogs` event: a JSON object whose `routeKey` is `GET /api/health` and `path` is `/api/health` (no more `-`). (b) Lambda console → `DashboardApi…` → Test with the v2 event from `docs/operations.md §8.6` against `/api/system/db`: `statusCode` 200 and a body `{"db":"ok","latency_ms":…}` — the first try after idle may say `"resuming"`, re-run after ~10 s. (c) The same event with `requestContext.http.path` (plus `rawPath` / `routeKey` — Mangum routes on the `http.path` field) set to `/api/overview`: 200 with today's windows (one `WindowOutcome` per window that has run — `LONDON` / `NY` / `OVERLAP` / `DAILY_WRAP` labels, worst per-symbol `status`, the four symbols — grouped from the per-symbol `scan_runs` rows), the risk budget, and `alarms: null` (once 4.3 is deployed: the alarm list, see the 4.3 row); a 503 `db_resuming` on the first try is expected. (d) `/api/signals?limit=5` (in `rawQueryString`): 200, five rows with a `kind`, and a `next_cursor` that pages when fed back as `cursor=`. |
+| 🟡 Verify after deploy (Step 4.3) | Lambda console Test events per `docs/operations.md §8.6`: (a) `/api/system/alarms` returns the **five** `CryptoSignals-Monitoring-*` alarms — not `"alarms": null` + `"cloudwatch unavailable"` (the AccessDenied degradation), which confirms the `DescribeAlarms` resource scoping; (b) `/api/market/klines` with `rawQueryString` `symbol=BTCUSDT` returns candles from ap-south-1 (Binance reachable from the dashboard Lambda); (c) `/api/funnel` for one day (`since` / `until` one UTC day apart) matches a manual count of that day's `signals` / `scan_runs` rows; (d) **NFR-4.3**: re-run `EXPLAIN (ANALYZE, BUFFERS)` of the funnel (`_DECISIONS_BETWEEN_SQL`) and outcome-rows (`_OUTCOME_ROWS_SQL`) queries over 365 days through the aws-mcp Data API path and record planning + execution time (< 500 ms budget) — **not run on 2026-10-21 because the MCP token had expired** (re-auth with `/mcp`, then run). |
 | 🟡 Test debt (Step 4.0) | Run `.\.venv\Scripts\python.exe -m pytest -m integration tests/integration/test_repositories_integration.py` the next time a local Postgres (Docker, port 5433) is available — the asyncpg `setup_evaluations` record/list round-trip was written in Step 4.0 but has never executed (no Docker on the build machine). |
 | 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |
 | ✅ Done | ~~Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking.~~ **Shipped (`fix/aurora-resume-retry`):** `_execute` retries `DatabaseResumingException` up to 6× with linear backoff (5/10/15/20/25s, ≤75s, well under the 10-min Lambda timeout). This was the production failure — every scheduled scan was dying on its first DB call (`start_scan`) because Aurora had scaled to zero, so no Telegram ever fired. Verified in the live Lambda logs (`log-events-viewer-result.csv`). |
@@ -431,23 +469,17 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 
 ## 8. What's next
 
-**Next step: Slice 4 Step 4.3 — funnel + analytics + system endpoints + klines proxy**, per
-`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md §10` row 4.3 (also SPEC §4
-Slice 4; serverless, read-only Phase 1): the P4 / P6 / P7 data — `GET /api/funnel?period=&group_by=`
-(funnel counts + rejections by rule), `/api/analytics/win-rate?by=` / `skeptic-value` /
-`equity-curve` (FR-7.3), `/api/system/scans` / `agents` / `alarms` / `metrics` / `config`
-(design §4.2 P7, incl. the **CloudWatch alarm strip** that fills the overview's `alarms: null`
-placeholder — this needs a `cloudwatch:DescribeAlarms` grant on the dashboard role, design §8),
-`/api/critic/reports` + `/reviews` (404 with a reason until the tables exist), `/api/markets`, and
-the `GET /api/market/klines?symbol=&tf=&limit=` proxy over `BinanceProvider` — which also
-unlocks **unrealised R** on open setups (`unrealised_r: null` since 4.2). Same test pattern as
-4.2 (SQL shape + parsing against the Data API backend; asyncpg integration opt-in); checkpoint
-`EXPLAIN` on the funnel query under 500 ms at 10 k signals (NFR-4.3). Preconditions: merge 4.2
-(this branch) and run its 🟡 verify row in §7 — the 4.2 routes stay console-only until **Step
-4.4** (Cognito + JWT authorizer + `ANY /api/{proxy+}`), which is also when `/api/docs` becomes
-reachable. The lazy `src/agents/orchestration/__init__` (§5 cold-start gotcha) landed in 4.2's
-final review wave (7.2 s → 1.2 s). Operational blocker unchanged: **top up Anthropic credits** (🔴 Ops row);
-4.3 itself needs no LLM.
+**Next step: Slice 4 Step 4.4 — Cognito user pool + JWT authorizer + `ANY /api/{proxy+}`**, per
+`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md §10` row 4.4 (also SPEC §4
+Slice 4; serverless, read-only Phase 1). This is the step that finally routes the 4.2 + 4.3 data
+routes (and `/api/docs`) through the HTTP API, behind the authorizer. Include an
+**authorizer-claims defence** in the app (reject a proxied request that arrives without the
+authorizer's JWT claims in the v2 event, so a mis-wired route can never serve data
+unauthenticated) and document the **two 422 body shapes** in the API docs (FastAPI validation
+list `{"detail":[…]}` vs the period checks' plain-string `{"detail":"…"}`, `docs/operations.md
+§8.6`). Preconditions: merge 4.2 then 4.3 (stacked) and run both 🟡 verify rows in §7 (incl. the
+NFR-4.3 `EXPLAIN` re-run). Operational blocker unchanged: **top up Anthropic credits** (🔴 Ops
+row); 4.4 itself needs no LLM.
 
 ### 8.1 Slice 2 progress log (Weeks 4–7, per `SPEC.md §4`) — historical
 

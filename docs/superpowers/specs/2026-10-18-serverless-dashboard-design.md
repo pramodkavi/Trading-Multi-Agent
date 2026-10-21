@@ -297,6 +297,8 @@ OpenAPI served at `/api/docs` (behind the authorizer). Pagination is `?limit=&cu
 
 Step 4.2 implemented `/api/system/db`, `/api/overview`, `/api/setups/open`, `/api/signals`, `/api/signals/{id}` (+ `/runs/{run_id}`) in the FastAPI app; they are routed through the HTTP API from Step 4.4 together with the authorizer.
 
+Step 4.3 implemented `/api/signals/{id}/chart`, `/api/funnel` (`?since=&until=&group_by=day|window|symbol` instead of `period=`), `/api/analytics/win-rate` / `skeptic-value` / `equity-curve`, `/api/critic/reports` (+ `/{id}`) / `/api/critic/reviews`, `/api/market/klines` and `/api/system/scans` / `agents` / `sweeps` / `alarms` / `metrics` / `config` — FastAPI-only until Step 4.4 like the 4.2 routes; `/api/markets` moves to the P5 page step (4.9).
+
 ### 6.2 Module layout
 
 ```
