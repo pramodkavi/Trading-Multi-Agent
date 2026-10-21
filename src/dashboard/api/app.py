@@ -30,7 +30,15 @@ from fastapi import FastAPI
 from mangum import Mangum
 
 from src.dashboard.api.errors import register_error_handlers
-from src.dashboard.api.routers import health, market, overview, setups, signals, system
+from src.dashboard.api.routers import (
+    funnel,
+    health,
+    market,
+    overview,
+    setups,
+    signals,
+    system,
+)
 
 
 def create_app(*, version: str | None = None) -> FastAPI:
@@ -57,6 +65,8 @@ def create_app(*, version: str | None = None) -> FastAPI:
     app.include_router(signals.router)
     # Step 4.3 market data (candle proxy; the chart route lives in `signals`).
     app.include_router(market.router)
+    # Step 4.3 aggregates.
+    app.include_router(funnel.router)
     return app
 
 

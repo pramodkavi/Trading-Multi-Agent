@@ -1,0 +1,347 @@
+"""Slice 4 Step 4.3 -- the decision funnel (design §4.2 P4): `GET /api/funnel`.
+
+Pure counting is tested on `DecisionRow` lists built here; the SQL shape and the
+route run against a small fake reader that serves the one funnel statement
+(dispatching on its `scan_started_at` alias) and records the bound parameters.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+
+from src.dashboard.api import overview as assembly
+from src.dashboard.api.app import create_app
+from src.dashboard.api.classify import DecisionKind
+from src.dashboard.api.deps import get_store
+from src.dashboard.api.funnel import FunnelGroup, build_funnel, top_rejections
+from src.dashboard.api.queries import DecisionRow, list_decisions_between
+
+NOW = datetime(2026, 10, 21, 12, 0, 0, tzinfo=UTC)
+
+
+def _ts(day: int, hour: int, minute: int = 0, second: int = 0) -> datetime:
+    return datetime(2026, 10, day, hour, minute, second, tzinfo=UTC)
+
+
+def _row(
+    kind: DecisionKind,
+    *,
+    scan_at: datetime,
+    symbol: str = "BTCUSDT",
+    created_at: datetime | None = None,
+    judge_ruling: str | None = None,
+    violated_rule: str | None = None,
+    has_setup: bool = False,
+) -> DecisionRow:
+    return DecisionRow(
+        id=uuid4(),
+        created_at=created_at if created_at is not None else scan_at + timedelta(minutes=1),
+        symbol=symbol,
+        scan_started_at=scan_at,
+        decision_kind=kind,
+        judge_ruling=judge_ruling,
+        violated_rule=violated_rule,
+        has_setup=has_setup,
+    )
+
+
+def _published(scan_at: datetime, *, symbol: str = "BTCUSDT", caveat: bool = False) -> DecisionRow:
+    return _row(
+        DecisionKind.PUBLISHED,
+        scan_at=scan_at,
+        symbol=symbol,
+        judge_ruling="PUBLISH_WITH_CAVEAT" if caveat else "PUBLISH",
+        has_setup=True,
+    )
+
+
+def _vetoed(scan_at: datetime, *, symbol: str = "BTCUSDT") -> DecisionRow:
+    return _row(DecisionKind.VETOED, scan_at=scan_at, symbol=symbol, judge_ruling="SKIP")
+
+
+def _gate(scan_at: datetime, rule: str, *, symbol: str = "BTCUSDT") -> DecisionRow:
+    return _row(DecisionKind.GATE_REJECTED, scan_at=scan_at, symbol=symbol, violated_rule=rule)
+
+
+def _no_setup(scan_at: datetime, *, symbol: str = "BTCUSDT") -> DecisionRow:
+    return _row(DecisionKind.NO_SETUP, scan_at=scan_at, symbol=symbol)
+
+
+LONDON_20 = _ts(20, 8, 3, 5)
+NY_20 = _ts(20, 13, 3, 4)
+LONDON_21 = _ts(21, 8, 3, 2)
+AD_HOC_20 = _ts(20, 10, 41)  # a console test invoke
+
+
+def _fixture_rows() -> list[DecisionRow]:
+    return [
+        # 2026-10-20 LONDON: four symbols, one scan invocation.
+        _published(LONDON_20, symbol="BTCUSDT"),
+        _vetoed(LONDON_20, symbol="ETHUSDT"),
+        _gate(LONDON_20, "premium_discount", symbol="SOLUSDT"),
+        _no_setup(LONDON_20, symbol="BNBUSDT"),
+        # 2026-10-20 NY.
+        _published(NY_20, symbol="ETHUSDT", caveat=True),
+        _gate(NY_20, "min_rr", symbol="BTCUSDT"),
+        # 2026-10-20 AD_HOC console invoke.
+        _gate(AD_HOC_20, "premium_discount", symbol="BTCUSDT"),
+        # 2026-10-21 LONDON.
+        _no_setup(LONDON_21, symbol="BTCUSDT"),
+        _no_setup(LONDON_21, symbol="ETHUSDT"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# build_funnel
+# ---------------------------------------------------------------------------
+
+
+def test_build_funnel_by_day() -> None:
+    groups = build_funnel(_fixture_rows(), group_by="day")
+    assert [g.key for g in groups] == ["2026-10-20", "2026-10-21"]
+    day20, day21 = groups
+    assert day20 == FunnelGroup(
+        key="2026-10-20",
+        scans=3,  # LONDON, NY, AD_HOC
+        symbols_scanned=7,
+        proposals=6,
+        gate_rejected=3,
+        gate_passed=3,
+        judge_publish=1,
+        judge_caveat=1,
+        judge_skip=1,
+        published=2,
+        rejections_by_rule={"premium_discount": 2, "min_rr": 1},
+    )
+    assert day21.scans == 1
+    assert day21.symbols_scanned == 2
+    assert day21.proposals == 0
+    assert day21.rejections_by_rule == {}
+
+
+def test_build_funnel_by_window() -> None:
+    groups = {g.key: g for g in build_funnel(_fixture_rows(), group_by="window")}
+    assert list(groups) == ["LONDON", "NY", "AD_HOC"]  # schedule order, AD_HOC last
+    london = groups["LONDON"]
+    assert london.scans == 2  # 2026-10-20 and 2026-10-21
+    assert london.symbols_scanned == 6
+    assert london.proposals == 3
+    assert london.gate_passed == 2
+    assert london.judge_publish == 1
+    assert london.judge_skip == 1
+    assert london.published == 1
+    assert groups["NY"].judge_caveat == 1
+
+
+def test_funnel_ad_hoc_window_group() -> None:
+    """Review Focus 4: AD_HOC rows are their own group -- not dropped, not folded."""
+    rows = _fixture_rows()
+    groups = {g.key: g for g in build_funnel(rows, group_by="window")}
+    ad_hoc = groups["AD_HOC"]
+    assert ad_hoc.scans == 1
+    assert ad_hoc.symbols_scanned == 1
+    assert ad_hoc.gate_rejected == 1
+    assert ad_hoc.rejections_by_rule == {"premium_discount": 1}
+    # Nothing is lost between the groups.
+    assert sum(g.symbols_scanned for g in groups.values()) == len(rows)
+    # A run 30 minutes after a fire time is AD_HOC too (tolerance boundary).
+    late = build_funnel([_no_setup(_ts(20, 13, 33))], group_by="window")
+    assert [g.key for g in late] == ["AD_HOC"]
+
+
+def test_build_funnel_by_symbol() -> None:
+    groups = {g.key: g for g in build_funnel(_fixture_rows(), group_by="symbol")}
+    assert list(groups) == ["BNBUSDT", "BTCUSDT", "ETHUSDT", "SOLUSDT"]
+    btc = groups["BTCUSDT"]
+    assert btc.symbols_scanned == 4
+    assert btc.scans == 4  # LONDON 20, NY 20, AD_HOC 20, LONDON 21
+    assert btc.proposals == 3
+    assert btc.gate_rejected == 2
+    assert btc.published == 1
+    assert btc.rejections_by_rule == {"min_rr": 1, "premium_discount": 1}
+
+
+def test_funnel_scans_count_invocations_not_rows() -> None:
+    # One invocation over four symbols: started_at differs by milliseconds per
+    # symbol row (one scan_runs row per symbol) yet it is ONE scan.
+    rows = [
+        _no_setup(LONDON_20 + timedelta(milliseconds=i), symbol=s)
+        for i, s in enumerate(["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"])
+    ]
+    (group,) = build_funnel(rows, group_by="day")
+    assert group.symbols_scanned == 4
+    assert group.scans == 1
+
+
+def test_build_funnel_empty() -> None:
+    assert build_funnel([], group_by="day") == []
+
+
+# ---------------------------------------------------------------------------
+# top_rejections
+# ---------------------------------------------------------------------------
+
+
+def test_top_rejections_order() -> None:
+    rows = [
+        _gate(_ts(20, 8, 3), "min_rr"),
+        _gate(_ts(20, 13, 3), "session"),
+        _gate(_ts(20, 15, 3), "session"),
+        _gate(_ts(20, 22, 3), "premium_discount"),
+        _gate(_ts(21, 8, 3), "premium_discount"),
+        _gate(_ts(10, 8, 3), "max_concurrent"),  # before `since`
+        _published(_ts(21, 8, 3)),  # not a rejection
+    ]
+    assert top_rejections(rows, since=_ts(15, 0)) == [
+        ("premium_discount", 2),
+        ("session", 2),
+        ("min_rr", 1),
+    ]
+    assert top_rejections(rows, since=_ts(1, 0))[-1] == ("min_rr", 1)
+    assert ("max_concurrent", 1) in top_rejections(rows, since=_ts(1, 0))
+
+
+# ---------------------------------------------------------------------------
+# SQL + route (fake reader)
+# ---------------------------------------------------------------------------
+
+
+def _wire(row: DecisionRow) -> dict[str, Any]:
+    """A `DecisionRow` as the Data API returns it (strings / bools)."""
+    return {
+        "id": str(row.id),
+        "created_at": row.created_at.isoformat(),
+        "symbol": row.symbol,
+        "scan_started_at": row.scan_started_at.isoformat(),
+        "decision_kind": row.decision_kind.value,
+        "judge_ruling": row.judge_ruling,
+        "violated_rule": row.violated_rule,
+        "has_setup": row.has_setup,
+    }
+
+
+@dataclass
+class FunnelReader:
+    """Serves the funnel statement only, honouring the bound `since` / `until`."""
+
+    rows: list[DecisionRow] = field(default_factory=list)
+    calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+
+    async def read_rows(self, sql: str, parameters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        params = {p["name"]: p["value"]["stringValue"] for p in parameters}
+        self.calls.append((sql, params))
+        if "AS scan_started_at" not in sql:
+            raise AssertionError(f"unexpected SQL: {sql}")
+        since = datetime.fromisoformat(params["since"])
+        until = datetime.fromisoformat(params["until"])
+        return [_wire(r) for r in self.rows if since <= r.created_at < until]
+
+
+def test_decisions_between_sql_shape_minimal_columns() -> None:
+    reader = FunnelReader(rows=_fixture_rows())
+    rows = asyncio.run(list_decisions_between(reader, since=_ts(20, 0), until=_ts(21, 0)))
+    assert len(rows) == 7
+    assert rows[0].decision_kind is DecisionKind.PUBLISHED
+    assert rows[0].scan_started_at == LONDON_20
+
+    ((sql, params),) = reader.calls
+    assert params == {"since": _ts(20, 0).isoformat(), "until": _ts(21, 0).isoformat()}
+    # Minimal columns (Data API 1 MB cap): no whole JSONB, no journal extras.
+    for forbidden in ("payload::text", "output::text", "features", "outcome_metadata", "SELECT *"):
+        assert forbidden not in sql
+    assert "decision_resolutions" not in sql
+    assert "s.payload->>'violated_rule' AS violated_rule" in sql
+    # One statement: scan join, LATERAL judge, EXISTS setup probe, bound range.
+    assert "JOIN scan_runs r ON r.id = s.scan_id" in sql
+    assert "LEFT JOIN LATERAL" in sql
+    assert "EXISTS (SELECT 1 FROM active_setups t WHERE t.signal_id = s.id) AS has_setup" in sql
+    assert "s.created_at >= :since::timestamptz AND s.created_at < :until::timestamptz" in sql
+    assert "ORDER BY s.created_at" in sql
+    # Every value is bound: the timestamps never appear in the SQL text.
+    assert "2026-10" not in sql
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
+    monkeypatch.setattr(assembly, "utcnow", lambda: NOW)
+    return NOW
+
+
+def _client(reader: FunnelReader) -> TestClient:
+    app = create_app(version="test")
+    app.dependency_overrides[get_store] = lambda: reader
+    return TestClient(app)
+
+
+def test_funnel_route_defaults_and_422(frozen_clock: datetime) -> None:
+    reader = FunnelReader(rows=_fixture_rows())
+    client = _client(reader)
+
+    # Defaults: the last 30 days, grouped by day; one fetch serves both tables.
+    response = client.get("/api/funnel")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["group_by"] == "day"
+    assert datetime.fromisoformat(body["until"]) == NOW
+    assert datetime.fromisoformat(body["since"]) == NOW - timedelta(days=30)
+    assert [g["key"] for g in body["groups"]] == ["2026-10-20", "2026-10-21"]
+    assert body["totals"]["key"] == "total"
+    assert body["totals"]["symbols_scanned"] == 9
+    assert body["totals"]["scans"] == 4
+    assert body["totals"]["rejections_by_rule"] == {"premium_discount": 2, "min_rr": 1}
+    assert body["top_rejections_7d"] == [
+        {"rule": "premium_discount", "count": 2},
+        {"rule": "min_rr", "count": 1},
+    ]
+    assert body["top_rejections_30d"] == body["top_rejections_7d"]
+    assert len(reader.calls) == 1
+
+    # A short window still fetches 30 days for the rejection tables, but the groups
+    # cover only the requested range.
+    reader.calls.clear()
+    response = client.get(
+        "/api/funnel",
+        params={"since": "2026-10-21T00:00:00Z", "until": "2026-10-21T12:00:00Z"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [g["key"] for g in body["groups"]] == ["2026-10-21"]
+    assert body["totals"]["symbols_scanned"] == 2
+    assert body["top_rejections_30d"][0] == {"rule": "premium_discount", "count": 2}
+    ((_, params),) = reader.calls
+    assert datetime.fromisoformat(params["since"]) == NOW - timedelta(days=30)
+    assert datetime.fromisoformat(params["until"]) == NOW
+
+    # group_by=window keeps AD_HOC; naive timestamps are read as UTC.
+    response = client.get(
+        "/api/funnel",
+        params={"since": "2026-10-01T00:00:00", "group_by": "window"},
+    )
+    assert response.status_code == 200, response.text
+    assert [g["key"] for g in response.json()["groups"]] == ["LONDON", "NY", "AD_HOC"]
+
+    # Exactly 365 days is allowed; one second more is 422, as is an empty / inverted range
+    # and an unknown grouping. None of them touches the database.
+    ok = client.get(
+        "/api/funnel",
+        params={"since": "2025-10-21T12:00:00Z", "until": "2026-10-21T12:00:00Z"},
+    )
+    assert ok.status_code == 200, ok.text
+    reader.calls.clear()
+    for params in (
+        {"since": "2025-10-21T11:59:59Z", "until": "2026-10-21T12:00:00Z"},
+        {"since": "2020-01-01T00:00:00Z"},
+        {"since": "2026-10-21T12:00:00Z", "until": "2026-10-21T12:00:00Z"},
+        {"since": "2026-10-21T12:00:00Z", "until": "2026-10-20T12:00:00Z"},
+        {"group_by": "week"},
+    ):
+        response = client.get("/api/funnel", params=params)
+        assert response.status_code == 422, (params, response.text)
+    assert reader.calls == []

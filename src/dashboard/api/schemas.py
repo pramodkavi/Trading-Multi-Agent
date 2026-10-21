@@ -24,7 +24,8 @@ Step 4.2 adds the read-only data payloads (design §4.2 P1 / P2 / P3, §3.4):
   by `AgentRunOut`.
 
 Step 4.3 adds the market payloads (`KlinesResponse`, `SignalChartResponse` with
-its `ChartOverlay`) and fills `SetupCardOut.unrealised_r` best-effort from a
+its `ChartOverlay`), the decision funnel (`FunnelResponse`, reusing the pure
+`funnel.FunnelGroup`) and fills `SetupCardOut.unrealised_r` best-effort from a
 live price. Fields still marked "pending Step 4.3" (CloudWatch alarm states)
 are placeholders the UI can already bind to until the system endpoints land.
 """
@@ -41,6 +42,7 @@ from src.agents.critic.models import Resolution
 from src.agents.orchestration.risk_gates import MAX_CONCURRENT_SETUPS, MAX_SIGNALS_PER_24H
 from src.common.models import ScanStatus, SignalDirection, SignalOutcome, SignalStatus
 from src.dashboard.api.classify import DecisionKind
+from src.dashboard.api.funnel import FunnelGroup
 from src.persistence.models import StoredAgentRun, StoredReview, StoredSetupEvaluation
 from src.providers.base import Timeframe
 
@@ -375,3 +377,35 @@ class SignalChartResponse(BaseModel):
         description="Null for a NO_SETUP decision (no proposal ever existed) or when the "
         "rejected proposal of a gate-rejected decision cannot be found."
     )
+
+
+# ---------------------------------------------------------------------------
+# Decision funnel (P4, Step 4.3)
+# ---------------------------------------------------------------------------
+
+
+class RejectionCount(BaseModel):
+    """One row of a top-rejections table: a gate rule and how often it fired."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule: str
+    count: int = Field(ge=1)
+
+
+class FunnelResponse(BaseModel):
+    """`GET /api/funnel` body: the funnel per group, the totals and the top gate rules.
+
+    `groups` / `totals` cover `[since, until)`. The two rejection tables are the
+    7 and 30 days before `until`, whatever the requested range.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: datetime
+    until: datetime
+    group_by: Literal["day", "window", "symbol"]
+    groups: list[FunnelGroup]
+    totals: FunnelGroup = Field(description='The same counts over every row (key "total").')
+    top_rejections_7d: list[RejectionCount]
+    top_rejections_30d: list[RejectionCount]

@@ -45,12 +45,14 @@ from src.persistence.store import _cursor_params, _long_param, _str_param, _utc_
 
 __all__ = [
     "DashboardReader",
+    "DecisionRow",
     "JournalRow",
     "SetupCard",
     "SignalFilters",
     "count_evaluations_since",
     "get_review",
     "get_setup_for_signal",
+    "list_decisions_between",
     "list_open_setup_cards",
     "list_scan_runs_since",
     "list_signals_for_scans",
@@ -126,6 +128,25 @@ class JournalRow(BaseModel):
     realized_r: float | None = Field(description="decision_resolutions.realized_r.")
 
 
+class DecisionRow(BaseModel):
+    """One decision reduced to what the funnel counts (design §4.2 P4).
+
+    Minimal on purpose (Data API 1 MB cap): no payload, no analyzer summary --
+    a year of rows must fit one response.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    created_at: datetime
+    symbol: str
+    scan_started_at: datetime = Field(description="scan_runs.started_at of the signal's scan.")
+    decision_kind: DecisionKind
+    judge_ruling: str | None
+    violated_rule: str | None
+    has_setup: bool
+
+
 class SetupCard(BaseModel):
     """An OPEN setup with the prices the UI renders; ages are the router's job."""
 
@@ -166,18 +187,20 @@ _JOURNAL_COLUMNS = f"""s.id::text AS id, s.scan_id::text AS scan_id, s.symbol, s
 # ``has_setup`` is an EXISTS probe rather than a LEFT JOIN: a signal with more than
 # one ``active_setups`` row (re-opened after a console edit, a replayed setup) must
 # never fan out into duplicate journal lines or a wrong page length.
+_HAS_SETUP_SQL = "EXISTS (SELECT 1 FROM active_setups t WHERE t.signal_id = s.id) AS has_setup"
+
 _JOURNAL_SELECT = f"""SELECT {_JOURNAL_COLUMNS},
        ({DECISION_KIND_SQL}) AS decision_kind,
        j.ruling AS judge_ruling,
        r.session AS session,
-       EXISTS (SELECT 1 FROM active_setups t WHERE t.signal_id = s.id) AS has_setup,
+       {_HAS_SETUP_SQL},
        s.payload->>'violated_rule' AS violated_rule,
        d.outcome AS resolution_outcome,
        d.realized_r::double precision AS realized_r"""
 
 # ``j`` is the latest Judge run sharing the signal's scan (one scan_runs row per
-# symbol, design §5.1); ``d`` is the Critic's replay (one row per signal, PK).
-_JOURNAL_FROM = """FROM signals s
+# symbol, design §5.1). Shared by the journal and the funnel.
+_SIGNAL_SCAN_JUDGE_FROM = """FROM signals s
 JOIN scan_runs r ON r.id = s.scan_id
 LEFT JOIN LATERAL (
     SELECT a.output->>'ruling' AS ruling
@@ -185,7 +208,10 @@ LEFT JOIN LATERAL (
     WHERE a.scan_id = s.scan_id AND a.agent_role = 'judge'
     ORDER BY a.created_at DESC
     LIMIT 1
-) j ON TRUE
+) j ON TRUE"""
+
+# ``d`` is the Critic's replay (one row per signal, PK).
+_JOURNAL_FROM = f"""{_SIGNAL_SCAN_JUDGE_FROM}
 LEFT JOIN decision_resolutions d ON d.signal_id = s.id"""
 
 _JOURNAL_ORDER = "ORDER BY s.created_at DESC, s.id DESC"
@@ -280,6 +306,36 @@ WHERE s.scan_id = ANY(string_to_array(:ids, ',')::uuid[])
         sql, [_str_param("ids", ",".join(str(scan_id) for scan_id in scan_ids))]
     )
     return [_row_to_journal(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Funnel (P4)
+# ---------------------------------------------------------------------------
+
+# The funnel projection: eight short columns per decision, nothing from the payload
+# but the one ``violated_rule`` extract. ``scan_started_at`` is the funnel's marker.
+_DECISIONS_BETWEEN_SQL = f"""SELECT s.id::text AS id,
+       {_utc_iso("s.created_at", alias="created_at")},
+       s.symbol,
+       {_utc_iso("r.started_at", alias="scan_started_at")},
+       ({DECISION_KIND_SQL}) AS decision_kind,
+       j.ruling AS judge_ruling,
+       s.payload->>'violated_rule' AS violated_rule,
+       {_HAS_SETUP_SQL}
+{_SIGNAL_SCAN_JUDGE_FROM}
+WHERE s.created_at >= :since::timestamptz AND s.created_at < :until::timestamptz
+ORDER BY s.created_at ASC, s.id ASC"""
+
+
+async def list_decisions_between(
+    reader: DashboardReader, *, since: datetime, until: datetime
+) -> list[DecisionRow]:
+    """Every decision with ``since <= created_at < until``, oldest first (the funnel)."""
+    rows = await reader.read_rows(
+        _DECISIONS_BETWEEN_SQL,
+        [_str_param("since", since.isoformat()), _str_param("until", until.isoformat())],
+    )
+    return [DecisionRow.model_validate(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
