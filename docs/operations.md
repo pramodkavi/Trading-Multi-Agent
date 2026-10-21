@@ -501,13 +501,15 @@ cluster ARN + DB secret ARN imports):
 | Its own `DepsLayer` | built by `lambda_assets.deps_layer(..., extras=("dashboard",))` — base deps + `fastapi` + `mangum` (~136 MB); the scan Lambda's layer is unchanged |
 | HTTP API `crypto-signals-dashboard` | one route `GET /api/health` (no authorizer yet — Step 4.4 adds the Cognito JWT authorizer); `$default` stage, auto-deploy, throttle 10 rps / burst 20 |
 | Log groups | `DashboardApiLogs` (function) + `DashboardApiAccessLogs` (API access log), 14-day retention |
-| IAM role | RDS Data API on the one cluster + read of its secret, CloudWatch Logs write — **no SSM, no S3** |
+| IAM role | RDS Data API on the one cluster + read of its secret, CloudWatch Logs write; since Step 4.3 CloudWatch read (`DescribeAlarms` on `CryptoSignals-Monitoring-*`, `ListMetrics` + `GetMetricData` on `*`) — **no SSM, no S3, no Lambda** |
 | Outputs | `DashboardApiUrl`, `DashboardFunctionName` |
 
-Nothing else is reachable until Step 4.2+ (queries + overview/setups/signals
-endpoints). In 4.1 **nothing in the stack touches Aurora** — the health route does
-not open a DB call, so browsing it never wakes the cluster. The Data API grant is
-in place for 4.2.
+Nothing else is reachable until **Step 4.4** adds the Cognito JWT authorizer and the
+`ANY /api/{proxy+}` route: the Step 4.2 and 4.3 data routes (overview / setups /
+signals, market, funnel, analytics, Critic, system health) exist in the FastAPI app
+but are console-only until then (§8.6). The
+health route does not open a DB call, so browsing it never wakes the cluster; the
+Data API grant is what the 4.2 routes use.
 
 ### 8.2 Where the API URL is
 
@@ -535,20 +537,22 @@ ran from a different commit than expected (`APP_VERSION` is baked at synth time)
 The FastAPI app also defines `/api/openapi.json` and `/api/docs` (`openapi_url` /
 `docs_url` in `create_app()`), but in Step 4.1 the HTTP API routes **only**
 `GET /api/health` — any other path (including those two) returns API Gateway's
-`{"message":"Not Found"}`. They become reachable when a later step adds the routes
-behind the JWT authorizer (design §6: "OpenAPI served at `/api/docs` (behind the
-authorizer)").
+`{"message":"Not Found"}`. They become reachable in **Step 4.4**, which routes
+`ANY /api/{proxy+}` behind the JWT authorizer (design §6: "OpenAPI served at
+`/api/docs` (behind the authorizer)").
 
-A request also produces one line in `DashboardApiAccessLogs`; the fields should be
-real values, not all `-` (CDK's default access-log format uses REST-era variables —
-if they come out blank, switch to an HTTP-API-specific format in Step 4.4).
+A request also produces one line in `DashboardApiAccessLogs` — since Step 4.2 a
+JSON object per request (`routeKey`, `path`, `status`, … — fields in §8.6). Before
+4.2 the stage used CDK's default Common Log Format, whose REST-era
+`$context.resourcePath` an HTTP API logs as `-` (`"GET - HTTP/1.1" 200 35`).
 
 ### 8.4 Console editing
 
 The function is zip-packaged like the scan Lambda (§4.1): **Code** tab shows
 `src/dashboard/api/…`, Deploy, then call the URL. The same caveat applies — any
-`cdk deploy` replaces console edits with the git contents. There is no console
-**Test** event for an HTTP API Lambda worth saving; use the URL.
+`cdk deploy` replaces console edits with the git contents. For `/api/health` use
+the URL; for the data routes, which are not routed until Step 4.4, use the
+console **Test** event in §8.6.
 
 ### 8.5 Removal
 
@@ -558,3 +562,184 @@ pipeline stacks. No workflow exposes `cdk destroy` for it (the deploy workflow's
 `recreate_stateless_stacks` covers Monitoring / Scheduling / Compute only), and the
 hard rule rules out a local CLI — the console delete is the path. Note that the next
 `cdk deploy --all` recreates it.
+
+### 8.6 Data routes before Step 4.4 (console-only)
+
+Step 4.2 added the first data routes to the FastAPI app (`src/dashboard/api/routers/`):
+
+| Route | Returns |
+|---|---|
+| `GET /api/system/db` | `{"db": "ok" \| "resuming" \| "error", "latency_ms": …}` — the DB probe; **always 200** (it catches the Data API error itself because it *is* the probe) |
+| `GET /api/overview` | health strip, risk budget (the §1.6 gates via `risk_gates`), open setups, today's scan windows (`src/common/schedule.py`), Forecaster coverage (`last_sweep_at`). Since Step 4.3 the strip carries the CloudWatch alarm states (`alarms`, 5 s budget; on failure `alarms: null` + `alarms_note: "cloudwatch unavailable"` or `"cloudwatch access denied"`) and each setup card a best-effort `unrealised_r` (below); the alarm and price fetches run concurrently with the DB reads |
+| `GET /api/setups/open` | OPEN setups with signal summary + latest evaluation + best-effort `unrealised_r` (since Step 4.3) |
+| `GET /api/signals?since&until&symbol&kind&outcome&tag&session&violated_rule&limit&cursor` | journal page with the derived decision kind (`classify.py`); `limit` 1..200 (default 50); `cursor` is the opaque keyset cursor from the previous page. **Rows are trimmed** (design §3.4, Data API 1 MB response cap): the `signals` columns *without* `payload` / `features` / `outcome_metadata`, plus the analyzer summary lifted out of the payload in SQL — `entry_price`, `stop_loss`, `take_profit_1`, `take_profit_2`, `risk_reward_ratio` (proposals) and `skip_reason`, `skip_details` (first 200 chars; skips) — and the derived `decision_kind`, `judge_ruling`, `session`, `has_setup`, `violated_rule`, `resolution_outcome`, `realized_r` |
+| `GET /api/signals/{id}` | lifecycle: the **full** signal (`SignalDetailOut` = the journal row plus `payload` / `features` / `outcome_metadata` — the only place the payload travels), agent runs in order (trimmed per-step summaries), Forecaster evaluations, the Critic's resolution + review, setup card (no live price: `unrealised_r: null`, `unrealised_r_note: "not fetched on this view"`) |
+| `GET /api/signals/{id}/runs/{run_id}` | one agent run's full output |
+
+Step 4.3 added the market, funnel, analytics, Critic and system-health routes
+(same app, same console-only status):
+
+| Route | Returns |
+|---|---|
+| `GET /api/market/klines?symbol&tf=4h&limit=200` | Binance candles (`BinanceProvider` built **per request**, closed in `finally`; markets cached per container, 12 s bound — below). `symbol` must be in the dashboard's watchlist (`DashboardSettings.scan_symbols`) else 400 `unknown_symbol` before any provider is built; `tf` ∈ `Timeframe`; `limit` 1..500 |
+| `GET /api/signals/{id}/chart?before=60&after=30` | H4 candles around the signal (`before` 1..500, `after` 0..500, window capped at now) + the chart overlay (entry/stop/TPs/POI for PUBLISHED/VETOED from the payload, GATE_REJECTED from the Analyzer run, `null` for NO_SETUP); 404 before any provider call |
+| `GET /api/funnel?since&until&group_by=day\|window\|symbol` | decision funnel (scans → proposals → gate-passed → Judge rulings → published, rejections by rule) per group + `totals`; default 30 d, ≤ 365 d. `judge_*` incl. `judge_none` sum to `gate_passed`. `AD_HOC` console scans are their own group under `group_by=window`. `top_rejections_7d` / `_30d` are anchored to **now**, not `until` |
+| `GET /api/analytics/win-rate?by=tag\|session\|strategy\|time&since&until` | published win rate per bucket; `win_rate: null` when 0 decisive (WIN/LOSS) |
+| `GET /api/analytics/skeptic-value?since&until` | counted objections (`recommends_against` or `severity == "HIGH"`) by Judge ruling: `respected` / `overruled_with_caveat` / `overruled`; NoMacroData runs excluded (`no_macro_data_excluded`); a counted objection with no Judge ruling recorded is counted in `unruled` (no outcome) |
+| `GET /api/analytics/equity-curve?since&until` | cumulative R for published, plus vetoed / gate-rejected counterfactuals **from replays only** |
+| `GET /api/critic/reports?limit=10` | latest Critic reports (no markdown); `limit` 1..50 |
+| `GET /api/critic/reports/{id}` | one report: full JSONB + markdown; 404 `not_found` |
+| `GET /api/critic/reviews?limit=50&cursor` | Critic reviews newest first (keyset cursor, `error` trimmed to 500 chars); `limit` 1..200; 400 `bad_cursor` |
+| `GET /api/system/scans` | the latest 50 scan runs with `window` and `duration_s` |
+| `GET /api/system/agents?days=7` | per (UTC day, role) runs / errors / LLM cost + cost per day, plus the cost-free `scan` pseudo-role; `errors: null` = no failure source (below); `days` 1..30 |
+| `GET /api/system/sweeps?days=7` | Forecaster evaluations / errors per scheduled sweep (empty sweeps listed as 0/0); `days` 1..30 |
+| `GET /api/system/alarms` | the `CryptoSignals-Monitoring-*` alarm states; **always 200** (CloudWatch failure → `alarms: null` + note) |
+| `GET /api/system/metrics?days=7` | the scan Lambda's daily invocations / errors / p95 duration (function discovered via `ListMetrics`); **always 200** (`note: "scan function not found"`, `"cloudwatch unavailable"` or `"cloudwatch access denied"`); `days` 1..30. **Fetch on page load / every 5–15 min, not on the 60 s poll** — `GetMetricData` is billed per metric (≈ $1.3/month at a 60 s cadence) |
+| `GET /api/system/config` | config panel **inferred** from the DB (watchlist = symbols scanned in 7 d, model = latest `agent_runs` model, macro providers = any real objection in the last 10 Skeptic outputs, Langfuse = the dashboard's own `LANGFUSE_BASE_URL`); every value carries `"inferred": true` except the schedule (`SCAN_WINDOWS`) |
+
+Analytics semantics (design §5.2a): default 90 d, ≤ 365 d (longer → 422, no SQL);
+the effective outcome is the `decision_resolutions` replay when a row exists, else
+the Forecaster's `signals.outcome`; every response carries
+`source_counts: {"replayed": n, "forecaster": m}`.
+
+**Cost / failure source rule** (`/api/system/agents`, `queries._USAGE_BY_DAY_SQL`,
+`queries.UsageDay`):
+
+- `agent_runs` is the source of runs and cost for **every** role, the Critic's
+  successful reviews included. A row is written only on success, so it is **no
+  failure source**: a (day, role) fed by `agent_runs` alone (analyzer, historian,
+  skeptic, judge) reports **`errors: null`** — "unknown", never a claimed 0.
+- `decision_reviews` adds only **failed** reviews (`error IS NOT NULL`, zero cost —
+  never in `agent_runs`) as `critic` runs + errors. Reviews are upserted per
+  signal, so **critic failures = signals whose latest review attempt failed**.
+- `setup_evaluations` is the Forecaster's source (`ERROR` rows count as errors).
+- `scan_runs` is the **`scan` pseudo-role**: runs = rows (one per symbol per
+  invocation), errors = `FAILED` rows, cost 0 — this is where pipeline failures
+  show. It is left out of `cost_per_day.by_role` (a scan-only day lists at $0).
+
+**Long ranges are paged.** The funnel and outcome-row fetches read 365 days in
+1,000-row ascending keyset pages (`queries.read_all_pages`, 20-page guard) so no
+single Data API response approaches the 1 MB cap.
+
+**Unrealised R** (overview + `/api/setups/open`): one latest-price fetch per
+distinct OPEN-setup symbol, concurrent, 5 s overall budget. On timeout, a
+provider error or any unexpected failure (logged with its traceback) the card
+answers 200 with `unrealised_r: null` and `unrealised_r_note: "price unavailable"`
+— Binance being slow never fails the page. The lifecycle page does not fetch a
+price; its card says `"not fetched on this view"`.
+
+**Market data cost + bound.** A fresh ccxt client would download Binance's full
+`exchangeInfo` (spot + linear + inverse, several MB) before its first candle. The
+dashboard's provider loads **linear (USDT-M) markets only** and keeps the loaded
+table in a module global for the container's life (`market._MARKETS`, captured
+after the first successful fetch), so only a cold container pays the market load.
+The klines and chart routes are bounded by `market.MARKET_BUDGET_S` = **12 s**
+(`asyncio.wait_for`); a blown budget is a `ProviderTimeoutError` → 502
+`market_unavailable`, well inside the 25 s function timeout (never a gateway 5xx).
+The scan pipeline's `BinanceProvider()` (no arguments) is unchanged.
+
+**CloudWatch degradation.** `/api/system/alarms`, `/api/system/metrics` and the
+overview alarm strip read CloudWatch with a bounded client (3 s connect, 10 s read,
+one attempt). Any `ClientError` / `BotoCoreError` (throttling, no endpoint) — or
+the overview's 5 s budget expiring — yields a `null` section with
+`"cloudwatch unavailable"` (WARNING in the log) and HTTP **200**. An error code
+starting `AccessDenied` is an IAM gap, not a hiccup: the section note is
+**`"cloudwatch access denied"`** and the function log has it at **ERROR** — fix the
+dashboard role grants below. IAM (Step 4.3): `cloudwatch:DescribeAlarms` on
+`arn:aws:cloudwatch:<region>:<account>:alarm:CryptoSignals-Monitoring-*`;
+`cloudwatch:ListMetrics` + `cloudwatch:GetMetricData` on `*` (these two have no
+resource-level permissions — the `AwsSolutions-IAM5` suppression is justified in
+`dashboard_stack.py`). Still no `ssm:`, `s3:` or `lambda:`.
+
+**None of these is routed through the HTTP API yet.** The API still has the single
+route `GET /api/health`; every other path returns API Gateway's
+`{"message":"Not Found"}`. The data routes read Aurora, and there is no
+authentication until Step 4.4 adds the Cognito JWT authorizer — routing them earlier
+would let any scanner read the journal and keep the cluster awake. Step 4.4 adds
+`ANY /api/{proxy+}` behind the authorizer; until then the only way to exercise a
+data route is the Lambda console.
+
+**Exercising one from the Lambda console.** Lambda → `DashboardApi…` function →
+**Test** → create a new event (name it e.g. `api-overview`) with a minimal API
+Gateway **v2** (HTTP API) payload — Mangum needs `version`, `rawPath`,
+`rawQueryString`, `headers` and `requestContext.http`; the rest is filler:
+
+```json
+{
+  "version": "2.0",
+  "routeKey": "GET /api/overview",
+  "rawPath": "/api/overview",
+  "rawQueryString": "",
+  "headers": {"host": "s2bc8yifa1.execute-api.ap-south-1.amazonaws.com"},
+  "requestContext": {
+    "http": {"method": "GET", "path": "/api/overview", "protocol": "HTTP/1.1",
+             "sourceIp": "127.0.0.1", "userAgent": "console"},
+    "requestId": "console", "stage": "$default", "routeKey": "GET /api/overview",
+    "accountId": "097853039368", "apiId": "s2bc8yifa1",
+    "domainName": "s2bc8yifa1.execute-api.ap-south-1.amazonaws.com",
+    "domainPrefix": "s2bc8yifa1", "time": "21/Oct/2026:00:00:00 +0000", "timeEpoch": 0
+  },
+  "isBase64Encoded": false
+}
+```
+
+For another route change **all three** path copies together — `rawPath`,
+`routeKey` and `requestContext.http.path`. Mangum's HTTP-API handler routes on
+**`requestContext.http.path`**, not `rawPath` (the event above works because the
+three agree; edit only `rawPath` and the old route still answers). Query
+parameters go in `rawQueryString` (e.g. `"limit=5&symbol=BTCUSDT"` — Mangum reads
+that field, not `queryStringParameters`). The response is the Lambda proxy
+shape: `{"statusCode": 200, "headers": {...}, "body": "<JSON string>",
+"isBase64Encoded": false}`. Save the event — it survives in the console and is the
+smoke test for any console edit of a data route (§8.4).
+
+Two Step 4.3 examples, as edits of the event above (everything else unchanged):
+
+- **Funnel by window** (`api-funnel`): `"rawPath": "/api/funnel"`,
+  `"routeKey": "GET /api/funnel"`, `requestContext.routeKey` `"GET /api/funnel"`,
+  `requestContext.http.path` `"/api/funnel"`, and
+  `"rawQueryString": "group_by=window"` (add e.g.
+  `&since=2026-10-20T00:00:00Z&until=2026-10-21T00:00:00Z` for one day).
+- **Alarm strip** (`api-alarms`): `rawPath` / `requestContext.http.path`
+  `"/api/system/alarms"`, both `routeKey`s `"GET /api/system/alarms"`,
+  `"rawQueryString": ""`. Expect 200 with the five `CryptoSignals-Monitoring-*`
+  alarms (display names without the prefix / CDK hash); `"alarms": null` with
+  `"note": "cloudwatch unavailable"` means the CloudWatch call failed (the function
+  log has the AWS error code); `"cloudwatch access denied"` means the role lacks the
+  grant (check the `DescribeAlarms` resource scoping; ERROR in the log).
+  This route does not touch Aurora, so it does not wake the cluster.
+
+**Error bodies** (`src/dashboard/api/errors.py`, app-wide; uniform `{"reason": …}`):
+
+| Status | Body | When |
+|---|---|---|
+| 503 + `Retry-After: 10` | `{"reason":"db_resuming"}` | Aurora is waking from scale-to-zero (`DatabaseResumingException`). The dashboard store is built with `resume_attempts=1` — **no retry**, the first resume error propagates at once (the scan Lambda's default budget is 6 attempts / ~75 s) — because an HTTP request behind API Gateway's 30 s cap cannot wait out the resume. |
+| 502 | `{"reason":"db_error"}` | any other Data API `ClientError`; the AWS code + message are in the function log at WARNING, never in the body |
+| 404 | `{"reason":"not_found"}` | `/api/signals/{id}` or `/runs/{run_id}` addresses a row that does not exist |
+| 400 | `{"reason":"bad_cursor"}` | `cursor` is not one this deployment issued (also any cursor longer than 512 characters) |
+| 400 | `{"reason":"unknown_symbol"}` | `/api/market/klines` for a symbol outside the dashboard watchlist (exact match — `btcusdt` is rejected); no provider is built |
+| 502 | `{"reason":"market_unavailable"}` | `/api/market/klines` or `/api/signals/{id}/chart` when Binance fails (any `ProviderError`: down, rate-limited, timed out, malformed) or the 12 s market budget expires; the provider message is logged at WARNING, never echoed. The setup cards' unrealised R never raises this — it degrades to `null` instead |
+| 422 | FastAPI validation body (`{"detail":[{"loc":…,"msg":…,"type":…}]}`) | request validation: `limit` outside its range (rejected, not clamped), a non-UUID `{id}` / `{run_id}`, an unknown `kind` / `outcome` / `group_by` / `by` / `tf` value, a malformed `since` / `until`, `days` outside 1..30 (`/api/system/agents`, `/sweeps`, `/metrics`) |
+| 422 | `{"detail":"since must be before until"}` / `{"detail":"period exceeds 365 days"}` | funnel / analytics period checks (`period.py`) — a plain-string `detail`, not the validation list above; raised before any SQL |
+
+The dashboard store's boto3 client is itself bounded (`deps.py`: 3 s connect, 15 s
+read, one attempt) so the slowest Data API call fails inside the function's 25 s
+timeout and one of the bodies above is returned — API Gateway's own 504 (30 s)
+should never be what the UI sees.
+
+**Expect the first call after idle to return 503 `db_resuming`** (Aurora takes
+~10–30 s to resume); re-run the Test after ~10 s and it answers 200. `/api/system/db`
+reports the same state as `{"db":"resuming"}` with a 200 instead. Every Test
+invocation of a data route wakes the cluster (the usual scale-to-zero cost note
+applies — do not poll it in a loop).
+
+**Access-log fields.** Since Step 4.2 the `$default` stage writes one JSON object
+per request to `DashboardApiAccessLogs` (`ACCESS_LOG_FORMAT` in
+`infrastructure/stacks/dashboard_stack.py`): `requestId`, `ip`, `requestTime`,
+`method`, `routeKey`, `path`, `status`, `responseLength`, `integrationLatency`,
+`integrationError`. `routeKey` is the matched route (`GET /api/health`), `path`
+the raw request path (populated even when no route matched); `integrationError`
+is non-empty only when API Gateway, not the app, produced the 5xx. From Step 4.4 these
+lines are also the only record of requests the JWT authorizer rejects before the
+Lambda runs. Console Test invocations bypass the API and therefore write no access-log
+line — only the function log.

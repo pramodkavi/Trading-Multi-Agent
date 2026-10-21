@@ -595,14 +595,17 @@ def to_skip_decision(proposal: SignalProposal, report: RiskGateReport) -> SkipDe
 async def gather_risk_context(
     *,
     store: SignalStore,
-    snapshot: MarketSnapshot,
+    snapshot: MarketSnapshot | None,
     now: datetime,
 ) -> RiskContext:
     """Read the journal + snapshot to build the stateful-rule inputs.
 
     The only IO in this module. Open setups are bounded by rule 4 (<= a few), so
     fetching each one's signal to learn its (symbol, direction) is cheap. Recent
-    signals power the rolling-window and loss-streak counts.
+    signals power the rolling-window and loss-streak counts. ``snapshot`` only
+    supplies ``funding_rate`` (rule 10); pass ``None`` when there is no market
+    snapshot -- the Slice 4 dashboard reads the journal-derived caps without one
+    -- and ``funding_rate`` is reported as unknown (``None``).
     """
     open_setups = await store.list_open_active_setups()
     open_exposure: list[tuple[str, SignalDirection]] = []
@@ -626,7 +629,7 @@ async def gather_risk_context(
         consecutive_losses=consecutive_losses,
         latest_loss_at=latest_loss_at,
         open_exposure=tuple(open_exposure),
-        funding_rate=snapshot.funding_rate,
+        funding_rate=None if snapshot is None else snapshot.funding_rate,
     )
 
 

@@ -295,6 +295,10 @@ OpenAPI served at `/api/docs` (behind the authorizer). Pagination is `?limit=&cu
 | `GET /api/market/klines?symbol=&tf=H4&limit=` | P5, P2 | OHLCV via `BinanceProvider` |
 | `GET /api/system/scans` , `/api/system/agents` , `/api/system/alarms` , `/api/system/metrics` , `/api/system/config` | P7 | as described in §4.2 P7 |
 
+Step 4.2 implemented `/api/system/db`, `/api/overview`, `/api/setups/open`, `/api/signals`, `/api/signals/{id}` (+ `/runs/{run_id}`) in the FastAPI app; they are routed through the HTTP API from Step 4.4 together with the authorizer.
+
+Step 4.3 implemented `/api/signals/{id}/chart`, `/api/funnel` (`?since=&until=&group_by=day|window|symbol` instead of `period=`), `/api/analytics/win-rate` / `skeptic-value` / `equity-curve`, `/api/critic/reports` (+ `/{id}`) / `/api/critic/reviews`, `/api/market/klines` and `/api/system/scans` / `agents` / `sweeps` / `alarms` / `metrics` / `config` — FastAPI-only until Step 4.4 like the 4.2 routes; `/api/markets` moves to the P5 page step (4.9).
+
 ### 6.2 Module layout
 
 ```
@@ -368,12 +372,20 @@ Operator usage assumption: ~20 dashboard sessions/week, ~10 minutes each, 60 s p
 | API Gateway HTTP API | ~$0.00–0.02 | $1.00 per million requests after the first year |
 | Cognito | $0.00 | free under 50 k MAU; advanced security off |
 | S3 + CloudFront | ~$0.00–0.05 | KBs of assets; CloudFront free tier 1 TB/month |
-| CloudWatch GetMetricData | ~$0.01 | $0.01 per 1 000 metrics requested; P7 only |
+| CloudWatch GetMetricData | ~$0.01 | $0.01 per 1 000 metrics requested; P7 only — **fetched on page load / every 5–15 min, not on the 60 s poll** (see note below) |
 | Aurora | **+$0.20–0.60** | Dashboard use wakes Aurora (0.5 ACU min while awake, ~$0.07/ACU-h in ap-south-1) for the session plus the auto-pause window. This is the only line that scales with how much the operator browses. |
 | **Total added** | **≈ $0.25–0.70** | vs. ≈ $12–15 for the SPEC's Fargate + ALB shape |
 
 Guardrail: an AWS Budget alert at **$15/month total** on the account (one CDK resource,
 free) — belongs to `MonitoringStack`; shipped in Step 4.0.
+
+**P7 metrics cadence (Step 4.3 final review).** `GET /api/system/metrics` issues
+`GetMetricData`, billed per metric requested (three per call: Invocations, Errors,
+p95 Duration). On the 60 s
+`refetchInterval` it would cost ≈ $1.3/month at the usage assumption above — more
+than the whole rest of the dashboard. The P7 page therefore fetches metrics **on page
+load and then every 5–15 minutes** (a separate TanStack Query `refetchInterval`), never
+on the 60 s poll; alarms (`DescribeAlarms`, free) may stay on the 60 s poll.
 
 ## 10. Build steps (replaces SPEC §4 Steps 4.1–4.11; each is one session)
 

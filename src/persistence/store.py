@@ -79,6 +79,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import AsyncIterator, Mapping, Sequence
     from datetime import datetime
 
+    # Typing-only: ``botocore`` is imported lazily in ``from_arns`` alongside boto3.
+    from botocore.config import Config
+
     # Typing-only: ``src.agents.critic.models`` itself imports
     # ``src.persistence.models`` (-> this package's __init__ -> this module), so a
     # runtime import here would be a cycle whenever the critic package loads first.
@@ -102,6 +105,9 @@ logger = logging.getLogger(__name__)
 # _RESUME_MAX_ATTEMPTS is the *default* budget; DataApiSignalStore(resume_attempts=)
 # lets request-scoped callers (API Gateway, 30 s cap) shrink it.
 _RESUME_RETRY_CODES: frozenset[str] = frozenset({"DatabaseResumingException"})
+# Public alias: the dashboard's error mapping (``src.dashboard.api.errors``)
+# classifies the same codes as "resuming" so its 503 can never drift from the loop.
+RESUME_RETRY_CODES = _RESUME_RETRY_CODES
 _RESUME_MAX_ATTEMPTS: int = 6
 _RESUME_BACKOFF_SECONDS: float = 5.0
 
@@ -198,6 +204,10 @@ def _signal_projection(prefix: str) -> str:
                    {q}payload::text AS payload,
                    {q}tags, {q}features::text AS features, {q}outcome,
                    {q}outcome_metadata::text AS outcome_metadata"""
+
+
+# Public alias so the Slice 4 dashboard queries never import a private name.
+signal_projection = _signal_projection
 
 
 # Unresolved decision (design §5.1): a proposal (direction set) or a gate-rejected
@@ -520,7 +530,9 @@ class DataApiSignalStore:
     scan Lambda, which can afford to wait out a scale-from-zero resume.
     Request-scoped callers behind API Gateway's 30 s cap -- the Slice 4
     dashboard -- must pass a small budget (``1`` fails fast) rather than let a
-    cold cluster time out the HTTP request (dashboard design §3.4).
+    cold cluster time out the HTTP request (dashboard design §3.4). The
+    dashboard reads through :meth:`read_rows` (its only SQL seam, design §6.2)
+    and maps ``signal_projection`` rows with :meth:`row_to_signal`.
     """
 
     def __init__(
@@ -549,17 +561,22 @@ class DataApiSignalStore:
         database: str,
         region_name: str | None = None,
         resume_attempts: int = _RESUME_MAX_ATTEMPTS,
+        client_config: Config | None = None,
     ) -> DataApiSignalStore:
         """Construct with a fresh boto3 ``rds-data`` client.
 
         ``boto3`` is imported lazily so importing this module (and the unit
         tests, which inject a mock) never depends on AWS credentials or region
         resolution. ``resume_attempts`` is forwarded to the constructor; see the
-        class docstring for when to lower it.
+        class docstring for when to lower it. ``client_config`` is handed to
+        ``boto3.client(config=...)`` untouched -- request-scoped callers (the
+        dashboard, ``deps.py``) use it to bound the connect / read timeouts and
+        the botocore retries so the HTTP request fails inside its own budget;
+        ``None`` keeps botocore's defaults (the scan Lambda).
         """
         import boto3
 
-        client = boto3.client("rds-data", region_name=region_name)
+        client = boto3.client("rds-data", region_name=region_name, config=client_config)
         return cls(
             client=client,
             cluster_arn=cluster_arn,
@@ -618,6 +635,24 @@ class DataApiSignalStore:
         # The loop returns on success or re-raises on the final attempt; this line
         # is unreachable but satisfies the type checker's return-path analysis.
         raise AssertionError("unreachable: _execute retry loop exited")  # pragma: no cover
+
+    async def read_rows(
+        self,
+        sql: str,
+        parameters: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Run a read-only statement and return its rows as plain dicts.
+
+        The dashboard's read seam (Slice 4 Step 4.2, dashboard design §6.2):
+        the **only** public SQL entry point the dashboard queries use, so the
+        pipeline's typed methods stay the only writers and the Data API wiring
+        (ARNs, resume retry, typed-field parsing) lives in one place. Executes
+        with ``includeResultMetadata=True`` and zips column labels to values via
+        :func:`_parse_records`. Raises whatever :meth:`_execute` raises; not part
+        of the :class:`SignalStore` protocol.
+        """
+        response = await self._execute(sql, parameters, with_metadata=True)
+        return _parse_records(response)
 
     # ---- scan_runs --------------------------------------------------------
 
@@ -945,6 +980,10 @@ class DataApiSignalStore:
         if row.get("outcome_metadata") is not None:
             row["outcome_metadata"] = _parse_jsonb_field(row["outcome_metadata"])
         return StoredSignal.model_validate(row)
+
+    # Public alias for the Slice 4 dashboard: a ``signal_projection`` row from
+    # ``read_rows`` -> StoredSignal, without importing a private name.
+    row_to_signal = _row_to_signal
 
     # ---- agent_runs -------------------------------------------------------
 

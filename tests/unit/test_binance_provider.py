@@ -384,6 +384,133 @@ class TestLifecycle:
 
 
 # ---------------------------------------------------------------------------
+# Market-loading seam (Slice 4 Step 4.3: dashboard caches markets per container).
+# The scan pipeline passes no new argument; its client must be built exactly as before.
+# ---------------------------------------------------------------------------
+
+
+class TestMarketSeam:
+    async def test_default_constructs_client_exactly_as_before(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.providers import binance as binance_module
+
+        built = MagicMock()
+        built.close = AsyncMock()
+        factory = MagicMock(return_value=built)
+        monkeypatch.setattr(binance_module.ccxt_async, "binance", factory)
+        provider = BinanceProvider()
+        try:
+            # The one and only constructor argument, byte-for-byte the pre-4.3 config.
+            factory.assert_called_once_with(
+                {"enableRateLimit": True, "options": {"defaultType": "future"}}
+            )
+            built.set_markets.assert_not_called()
+            assert provider._client is built
+            assert built.session is provider._session  # ThreadedResolver session attached
+        finally:
+            await provider.aclose()
+
+    async def test_default_real_client_options_unchanged(self) -> None:
+        provider = BinanceProvider()
+        try:
+            client = provider._client
+            assert client.options["defaultType"] == "future"
+            # ccxt's own default market types stay in force (spot + linear + inverse).
+            assert client.options["fetchMarkets"]["types"] == ["spot", "linear", "inverse"]
+            assert not client.markets
+            assert provider.loaded_markets() is None
+        finally:
+            await provider.aclose()
+
+    async def test_market_types_restricts_fetch_markets(self) -> None:
+        provider = BinanceProvider(market_types=["linear"])
+        try:
+            client = provider._client
+            assert client.options["fetchMarkets"]["types"] == ["linear"]
+            assert client.options["defaultType"] == "future"
+            assert client.enableRateLimit is True
+        finally:
+            await provider.aclose()
+
+    async def test_markets_are_set_and_fetch_klines_skips_market_load(self) -> None:
+        markets: dict[str, Any] = {"BTC/USDT:USDT": {"id": "BTCUSDT"}}
+        exchange = MagicMock()
+        start = datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        exchange.fetch_ohlcv = AsyncMock(
+            return_value=[[int(start.timestamp() * 1000), 1.0, 2.0, 0.5, 1.5, 3.0]]
+        )
+        exchange.load_markets = AsyncMock()
+        exchange.close = AsyncMock()
+        exchange.markets = markets
+        provider = BinanceProvider(client=exchange, markets=markets)
+        exchange.set_markets.assert_called_once_with(markets)
+        out = await provider.fetch_klines(
+            "BTCUSDT", Timeframe.M5, start=start, end=start + timedelta(minutes=5)
+        )
+        assert len(out) == 1
+        exchange.load_markets.assert_not_awaited()
+        assert provider.loaded_markets() is markets
+
+    async def test_markets_preloaded_real_client_never_loads_over_network(self) -> None:
+        # A real ccxt client: once markets are set, `load_markets` returns them without
+        # calling `fetch_markets` (the multi-MB exchangeInfo download).
+        seed = BinanceProvider(market_types=["linear"])
+        try:
+            seed._client.fetch_markets = AsyncMock(  # type: ignore[method-assign]
+                return_value=[_linear_market()]
+            )
+            seed._client.fetch_currencies = AsyncMock(  # type: ignore[method-assign]
+                return_value=None
+            )
+            await seed._client.load_markets()
+            markets = seed.loaded_markets()
+            assert markets is not None and "BTC/USDT:USDT" in markets
+        finally:
+            await seed.aclose()
+
+        provider = BinanceProvider(market_types=["linear"], markets=markets)
+        try:
+            provider._client.fetch_markets = AsyncMock(  # type: ignore[method-assign]
+                side_effect=AssertionError("network market load")
+            )
+            loaded = await provider._client.load_markets()
+            assert "BTC/USDT:USDT" in loaded
+            assert provider._client.market("BTCUSDT")["id"] == "BTCUSDT"
+            provider._client.fetch_markets.assert_not_awaited()
+        finally:
+            await provider.aclose()
+
+
+def _linear_market() -> dict[str, Any]:
+    """A minimal ccxt unified market for the BTCUSDT perpetual."""
+    return {
+        "id": "BTCUSDT",
+        "symbol": "BTC/USDT:USDT",
+        "base": "BTC",
+        "quote": "USDT",
+        "settle": "USDT",
+        "baseId": "BTC",
+        "quoteId": "USDT",
+        "settleId": "USDT",
+        "type": "swap",
+        "spot": False,
+        "margin": False,
+        "swap": True,
+        "future": False,
+        "option": False,
+        "active": True,
+        "contract": True,
+        "linear": True,
+        "inverse": False,
+        "contractSize": 1.0,
+        "precision": {"amount": 0.001, "price": 0.1},
+        "limits": {"amount": {"min": 0.001, "max": None}},
+        "info": {},
+    }
+
+
+# ---------------------------------------------------------------------------
 # Historical candle paging (Critic v0, Task 4)
 # ---------------------------------------------------------------------------
 

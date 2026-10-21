@@ -34,36 +34,50 @@ woke Aurora would let any scanner keep it awake (~$25/month). It is the ONLY
 unauthenticated route; every other route lands behind the authorizer.
 
 Why the role is so small (design §8): ``grant_data_api_access`` on the one
-cluster + its credential secret, and CloudWatch Logs write. **No** SSM access
-(the dashboard needs no third-party keys), no ``lambda:*`` (it must not read the
-scan function's configuration), no S3 in Phase 1.
+cluster + its credential secret, CloudWatch Logs write and -- since Step 4.3 --
+read-only CloudWatch for the alarm strip and the P7 Lambda metrics
+(``DescribeAlarms`` on the ``CryptoSignals-Monitoring-*`` alarms only,
+``ListMetrics`` + ``GetMetricData`` on ``*`` because they have no resource-level
+permissions). **No** SSM access (the dashboard needs no third-party keys), no
+``lambda:*`` (it must not read the scan function's configuration -- the scan
+function's name is discovered from its metrics), no S3 in Phase 1.
 
 Why it is declared LAST and coupled only to DataStack (design §3.5 / anti-goal
 §4.4): a broken dashboard deploy must never break or delay a pipeline deploy, so
 this stack imports nothing from Compute / Scheduling / Monitoring -- the tests
 pin that (``Fn::ImportValue`` names all start with ``Data:``).
 
-What the next steps add here: 4.2 the read-only query module + the first real
-routes; 4.3 the SPA (private S3 bucket + CloudFront, which also fronts ``/api/*``
-so SPA and API share one origin); 4.4 the Cognito user pool + JWT authorizer on
-every non-health route; 4.5 the SSM parameter publishing the base URL for the
+Step 4.2 shipped the read-only query module and the first data routes
+(``/api/overview``, ``/api/setups/open``, ``/api/signals...``) -- in the FastAPI
+app only, deliberately unrouted here (no auth yet); the one change 4.2 made to
+this stack is the JSON access-log format (``ACCESS_LOG_FORMAT``). Step 4.3
+added the funnel / analytics / Critic / system-health / market routes, again
+FastAPI-only; its only change here is the read-only CloudWatch IAM above. What
+the next steps add here: 4.4 the Cognito user pool + JWT authorizer and the
+``ANY /api/{proxy+}`` route that makes the data routes reachable; 4.5 the SPA
+(private S3 bucket + CloudFront, which also fronts ``/api/*`` so SPA and API
+share one origin); 4.7 the SSM parameter publishing the base URL for the
 Telegram deep links (design §7).
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import jsii
 from aws_cdk import (
+    ArnFormat,
     CfnOutput,
     Duration,
     RemovalPolicy,
     Stack,
     Tags,
 )
+from aws_cdk import aws_apigateway as apigw
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_integrations as integrations
+from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_rds as rds
@@ -84,11 +98,38 @@ THROTTLE_RATE_RPS = 10
 THROTTLE_BURST = 20
 # The one unauthenticated route (design §6.1).
 HEALTH_PATH = "/api/health"
+# MonitoringStack's CDK-generated alarm names start with its stack name; the
+# dashboard may describe only those (mirrors `src.dashboard.api.cloudwatch.ALARM_PREFIX`).
+MONITORING_ALARM_PREFIX = "CryptoSignals-Monitoring-"
+
+# HTTP-API access-log line, one JSON object per request. CDK's default (Common
+# Log) format uses the REST-era ``$context.resourcePath``, which an HTTP API
+# logs as ``-`` (live-verified on Step 4.1: ``"GET - HTTP/1.1" 200 35``), so the
+# path of a rejected or slow request was invisible. ``$context.routeKey`` /
+# ``$context.path`` are the HTTP-API variables; ``integrationError`` is the only
+# record of a Lambda-side failure when the integration (not the app) 5xx's, and
+# from Step 4.4 these lines are also the only record of requests the JWT
+# authorizer rejects before the Lambda runs. Values are $context variables, not
+# user input, so the JSON cannot be broken by a request.
+ACCESS_LOG_FORMAT = json.dumps(
+    {
+        "requestId": "$context.requestId",
+        "ip": "$context.identity.sourceIp",
+        "requestTime": "$context.requestTime",
+        "method": "$context.httpMethod",
+        "routeKey": "$context.routeKey",
+        "path": "$context.path",
+        "status": "$context.status",
+        "responseLength": "$context.responseLength",
+        "integrationLatency": "$context.integrationLatency",
+        "integrationError": "$context.integrationErrorMessage",
+    }
+)
 
 
 @jsii.implements(apigwv2.IAccessLogSettings)
 class _AccessLogSettings:
-    """Stage access-log settings: a destination, default (Common Log) format.
+    """Stage access-log settings: a destination + the HTTP-API JSON format above.
 
     ``HttpStage.access_log_settings`` takes the jsii *interface*
     ``IAccessLogSettings`` (``destination`` + optional ``format``), and
@@ -106,8 +147,8 @@ class _AccessLogSettings:
         return self._destination
 
     @property
-    def format(self) -> None:
-        return None  # CDK's default Common Log Format (includes the request id)
+    def format(self) -> apigw.AccessLogFormat:
+        return apigw.AccessLogFormat.custom(ACCESS_LOG_FORMAT)
 
 
 class DashboardStack(Stack):
@@ -179,8 +220,35 @@ class DashboardStack(Stack):
 
         # ---- Least-privilege grant (design §8) -------------------------------
         # RDS Data API to the one cluster + read of its credentials secret.
-        # Deliberately nothing else: no SSM, no S3, no lambda:*.
+        # Deliberately no SSM, no S3, no lambda:*.
         cluster.grant_data_api_access(self.function)
+        # Step 4.3: read-only CloudWatch for the alarm strip + the P7 Lambda metrics.
+        # DescribeAlarms is limited to MonitoringStack's alarms by name prefix ...
+        self.function.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="ReadMonitoringAlarms",
+                actions=["cloudwatch:DescribeAlarms"],
+                resources=[
+                    self.format_arn(
+                        service="cloudwatch",
+                        resource="alarm",
+                        resource_name=f"{MONITORING_ALARM_PREFIX}*",
+                        arn_format=ArnFormat.COLON_RESOURCE_NAME,
+                    )
+                ],
+            )
+        )
+        # ... ListMetrics / GetMetricData support no resource-level permissions, so
+        # they can only be granted on `*` (suppressed as AwsSolutions-IAM5 below).
+        # The scan function's name is discovered from its metrics, not read from
+        # the function (no lambda:GetFunctionConfiguration).
+        self.function.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="ReadLambdaMetrics",
+                actions=["cloudwatch:ListMetrics", "cloudwatch:GetMetricData"],
+                resources=["*"],
+            )
+        )
 
         # ---- HTTP API + $default stage + the health route (design §3.2 / §13) -
         # create_default_stage=False so the stage is declared explicitly below
@@ -240,9 +308,31 @@ class DashboardStack(Stack):
                         "logging policy. Its only other access is the Data-API grant below."
                     ),
                 },
-                # No AwsSolutions-IAM5 suppression: grant_data_api_access emits
-                # exact-ARN statements only (verified Compliant in the synth nag
-                # report), unlike Compute's S3 prefix grant.
+                # grant_data_api_access emits exact-ARN statements only (verified
+                # Compliant in the synth nag report); the only wildcards are the two
+                # read-only CloudWatch statements (Step 4.3), scoped by appliesTo so
+                # any other future IAM5 finding still surfaces.
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "Read-only CloudWatch for the dashboard (design §8): "
+                        "cloudwatch:ListMetrics and cloudwatch:GetMetricData have no "
+                        "resource-level permissions, so they can only be granted on '*'; "
+                        "cloudwatch:DescribeAlarms is limited to the "
+                        "CryptoSignals-Monitoring-* alarm name prefix. No write actions."
+                    ),
+                    "appliesTo": [
+                        "Resource::*",
+                        # Partition / region / account render as `<AWS::...>` tokens
+                        # (which contain colons) or literals, depending on the env.
+                        {
+                            "regex": (
+                                r"/^Resource::arn:(<[^>]+>|[^:]+):cloudwatch:(<[^>]+>|[^:]+):"
+                                r"(<[^>]+>|[^:]+):alarm:CryptoSignals-Monitoring-\*$/g"
+                            )
+                        },
+                    ],
+                },
                 {
                     "id": "AwsSolutions-L1",
                     "reason": (

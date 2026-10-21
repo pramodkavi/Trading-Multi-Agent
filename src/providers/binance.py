@@ -80,6 +80,8 @@ class BinanceProvider(DataProvider):
         *,
         client: ccxt_async.binance | None = None,
         rate_limiter: TokenBucket | None = None,
+        market_types: Sequence[str] | None = None,
+        markets: dict[str, Any] | None = None,
     ) -> None:
         """Construct a BinanceProvider.
 
@@ -89,6 +91,18 @@ class BinanceProvider(DataProvider):
             rate_limiter: Optional token bucket metering request weight. Defaults
                 to Binance Futures' 2400 weight/minute budget (Step 2.2). Tests
                 inject one with a fake clock to assert blocking deterministically.
+            market_types: Optional ccxt ``fetchMarkets`` types (e.g. ``["linear"]``)
+                for the client this provider builds; ignored when ``client`` is
+                injected. None (the scan pipeline) keeps ccxt's default
+                spot + linear + inverse market load.
+            markets: Optional already-loaded ccxt markets (see
+                :meth:`loaded_markets`), installed with ``set_markets`` so the
+                first request skips the network market load. None (the scan
+                pipeline) keeps the lazy load on first use.
+
+        Both new arguments exist for the dashboard (Step 4.3), which caches one
+        linear-only market table per container. With both left at None the
+        client and its options are exactly the pre-4.3 ones.
 
         Resolver note:
             When we build the client ourselves, we attach an aiohttp session
@@ -108,15 +122,25 @@ class BinanceProvider(DataProvider):
         if client is not None:
             self._client: ccxt_async.binance = client
         else:
+            options: dict[str, Any] = {"defaultType": "future"}
+            if market_types is not None:
+                options["fetchMarkets"] = {"types": list(market_types)}
             self._client = ccxt_async.binance(
                 {
                     "enableRateLimit": True,
-                    "options": {"defaultType": "future"},
+                    "options": options,
                 }
             )
             connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
             self._session = aiohttp.ClientSession(connector=connector)
             self._client.session = self._session
+        if markets is not None:
+            self._client.set_markets(markets)
+
+    def loaded_markets(self) -> dict[str, Any] | None:
+        """The ccxt client's loaded markets, or None before the first market load."""
+        markets = self._client.markets
+        return markets if markets else None
 
     async def aclose(self) -> None:
         # ccxt's close() shuts down the session it holds (ours, when we set

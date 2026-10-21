@@ -1,10 +1,12 @@
-"""Slice 4 Step 4.1 — dashboard API skeleton: app factory, /api/health, Mangum handler."""
+"""Slice 4 Step 4.1 — dashboard API skeleton: app factory, /api/health, Mangum handler.
+
+The `lambda_event_loop` fixture used by the direct `handler(...)` tests lives in
+`tests/unit/conftest.py` (shared with the Step 4.2 route tests).
+"""
 
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import Iterator
 from typing import Any
 
 import boto3
@@ -13,30 +15,6 @@ from fastapi.testclient import TestClient
 from mangum.types import LambdaCognitoIdentity, LambdaMobileClientContext
 
 from src.dashboard.api.app import create_app, handler
-
-# `Mangum(...)` resolves the main thread's current event loop when `handler` is built at
-# import (creating one if none is set) and drives every invocation on it -- exactly what
-# the Lambda runtime provides: one loop per container. Under pytest-asyncio that loop is
-# unset after the first async test and would be garbage-collected unclosed (a
-# ResourceWarning, which this suite promotes to an error), so keep a reference, re-install
-# it for the handler tests, and close it at module teardown.
-_HANDLER_LOOP = asyncio.get_event_loop()
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _close_handler_loop() -> Iterator[None]:
-    yield
-    _HANDLER_LOOP.close()
-
-
-@pytest.fixture
-def lambda_event_loop() -> Iterator[None]:
-    """Make the import-time loop current again for a direct `handler(...)` call."""
-    asyncio.set_event_loop(_HANDLER_LOOP)
-    try:
-        yield
-    finally:
-        asyncio.set_event_loop(None)
 
 
 def _v2_event(path: str = "/api/health", method: str = "GET") -> dict[str, Any]:
