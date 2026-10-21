@@ -8,6 +8,7 @@ route run against a small fake reader that serves the one funnel statement
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -22,6 +23,8 @@ from src.dashboard.api.classify import DecisionKind
 from src.dashboard.api.deps import get_store
 from src.dashboard.api.funnel import FunnelGroup, build_funnel, top_rejections
 from src.dashboard.api.queries import (
+    _DECISIONS_BETWEEN_SQL,
+    ASC_KEYSET_ORDER,
     ASC_KEYSET_PREDICATE,
     PAGE_LIMIT_SQL,
     DecisionRow,
@@ -124,6 +127,7 @@ def test_build_funnel_by_day() -> None:
         judge_publish=1,
         judge_caveat=1,
         judge_skip=1,
+        judge_none=0,
         published=2,
         rejections_by_rule={"premium_discount": 2, "min_rr": 1},
     )
@@ -131,6 +135,21 @@ def test_build_funnel_by_day() -> None:
     assert day21.symbols_scanned == 2
     assert day21.proposals == 0
     assert day21.rejections_by_rule == {}
+
+
+def test_judge_buckets_sum_to_gate_passed() -> None:
+    # A Slice-1-era proposal: PUBLISHED (direction set) but no Judge run at all.
+    no_judge = _row(DecisionKind.PUBLISHED, scan_at=NY_20, judge_ruling=None, has_setup=True)
+    rows = [*_fixture_rows(), no_judge]
+    for group_by in ("day", "window", "symbol"):
+        groups = build_funnel(rows, group_by=group_by)
+        for g in groups:
+            total = g.judge_publish + g.judge_caveat + g.judge_skip + g.judge_none
+            assert total == g.gate_passed, (group_by, g)
+    (day20, _) = build_funnel(rows, group_by="day")
+    assert day20.judge_none == 1
+    assert day20.gate_passed == 4
+    assert day20.published == 3
 
 
 def test_build_funnel_by_window() -> None:
@@ -284,7 +303,9 @@ class PagedReader:
         return self.pages[len(self.calls) - 1]
 
 
-_PAGED_SQL = f"SELECT 1 FROM signals s WHERE {ASC_KEYSET_PREDICATE} {PAGE_LIMIT_SQL}"
+_PAGED_SQL = (
+    f"SELECT 1 FROM signals s WHERE {ASC_KEYSET_PREDICATE} {ASC_KEYSET_ORDER} {PAGE_LIMIT_SQL}"
+)
 
 
 def _page(n: int, *, start: datetime) -> list[dict[str, Any]]:
@@ -333,7 +354,30 @@ def test_read_all_pages_guard_raises() -> None:
     # A statement without the keyset / page limit is refused before any call.
     with pytest.raises(ValueError, match="keyset"):
         asyncio.run(read_all_pages(reader, "SELECT 1", []))
+    # ... and so is one whose ORDER BY is not the ascending keyset order.
+    descending = _PAGED_SQL.replace(ASC_KEYSET_ORDER, "ORDER BY s.created_at DESC, s.id DESC")
+    with pytest.raises(ValueError, match=re.escape(ASC_KEYSET_ORDER)):
+        asyncio.run(read_all_pages(reader, descending, []))
     assert len(reader.calls) == 3
+
+
+def test_read_all_pages_ties_on_created_at() -> None:
+    # Three rows share one created_at: the id half of the keyset must carry the
+    # second page past the first without skipping or repeating a row.
+    at = _ts(20, 8, 4)
+    rows = [
+        _row(DecisionKind.NO_SETUP, scan_at=LONDON_20, created_at=at, symbol=s)
+        for s in ("A", "B", "C")
+    ]
+    reader = FunnelReader(rows=rows)
+    params = [
+        _str_param("since", _ts(20, 0).isoformat()),
+        _str_param("until", _ts(21, 0).isoformat()),
+    ]
+    got = asyncio.run(read_all_pages(reader, _DECISIONS_BETWEEN_SQL, params, page_size=2))
+    assert [r["id"] for r in got] == sorted(str(r.id) for r in rows)
+    assert len(reader.calls) == 2
+    assert reader.calls[1][1]["after_id"] == got[1]["id"]
 
 
 def test_decisions_between_pages_through_fake_reader() -> None:
@@ -417,8 +461,8 @@ def test_funnel_route_defaults_and_422(frozen_clock: datetime) -> None:
     assert body["top_rejections_30d"] == body["top_rejections_7d"]
     assert len(reader.calls) == 1
 
-    # A short window still fetches 30 days for the rejection tables, but the groups
-    # cover only the requested range.
+    # A short window: the groups cover only the requested range; the rejection
+    # tables come from one extra fetch of the last 30 days.
     reader.calls.clear()
     response = client.get(
         "/api/funnel",
@@ -429,9 +473,10 @@ def test_funnel_route_defaults_and_422(frozen_clock: datetime) -> None:
     assert [g["key"] for g in body["groups"]] == ["2026-10-21"]
     assert body["totals"]["symbols_scanned"] == 2
     assert body["top_rejections_30d"][0] == {"rule": "premium_discount", "count": 2}
-    ((_, params),) = reader.calls
-    assert datetime.fromisoformat(params["since"]) == NOW - timedelta(days=30)
-    assert datetime.fromisoformat(params["until"]) == NOW
+    (_, requested), (_, recent) = reader.calls
+    assert datetime.fromisoformat(requested["since"]) == _ts(21, 0)
+    assert datetime.fromisoformat(recent["since"]) == NOW - timedelta(days=30)
+    assert datetime.fromisoformat(recent["until"]) == NOW
 
     # group_by=window keeps AD_HOC; naive timestamps are read as UTC.
     response = client.get(
@@ -459,3 +504,34 @@ def test_funnel_route_defaults_and_422(frozen_clock: datetime) -> None:
         response = client.get("/api/funnel", params=params)
         assert response.status_code == 422, (params, response.text)
     assert reader.calls == []
+
+
+def test_funnel_top_rejections_anchored_to_now(frozen_clock: datetime) -> None:
+    """A historical range keeps the rejection tables on the last 7 / 30 days of NOW."""
+    old_scan = NOW - timedelta(days=70)
+    old = [_gate(old_scan, "max_concurrent"), _gate(old_scan, "max_concurrent")]
+    recent = [
+        _gate(NOW - timedelta(days=20), "min_rr"),  # in the 30d table only
+        _gate(NOW - timedelta(days=2), "session"),  # in both tables
+    ]
+    reader = FunnelReader(rows=[*old, *recent])
+    client = _client(reader)
+
+    until = NOW - timedelta(days=60)
+    response = client.get(
+        "/api/funnel",
+        params={"since": (until - timedelta(days=30)).isoformat(), "until": until.isoformat()},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["totals"]["rejections_by_rule"] == {"max_concurrent": 2}
+    assert body["top_rejections_7d"] == [{"rule": "session", "count": 1}]
+    assert body["top_rejections_30d"] == [
+        {"rule": "min_rr", "count": 1},
+        {"rule": "session", "count": 1},
+    ]
+    # Two fetches: the requested range, then exactly [now - 30d, now).
+    (_, requested), (_, last_30d) = reader.calls
+    assert datetime.fromisoformat(requested["until"]) == until
+    assert datetime.fromisoformat(last_30d["since"]) == NOW - timedelta(days=30)
+    assert datetime.fromisoformat(last_30d["until"]) == NOW

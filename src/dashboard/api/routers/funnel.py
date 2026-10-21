@@ -6,11 +6,13 @@ The period defaults to the last 30 days and is capped at 365 (`period.py`; a
 longer, empty or inverted range is 422 before any SQL runs). Naive timestamps
 are read as UTC.
 
-One statement serves the whole response: the decisions of
-`[min(since, until - 30 d), until)` are fetched once; the groups and totals use
-the rows of the requested range, the top-rejection tables the rows of the 7 /
-30 days before `until`. The projection is minimal (eight short columns, no
-payload) so a capped year stays inside the Data API's 1 MB response.
+The groups and totals cover the requested `[since, until)`. The top-rejection
+tables are always the **last** 7 / 30 days, anchored to now (design §4.2 P4),
+whatever range was asked for: when the requested range already covers
+`[now - 30 d, now)` its rows are reused, otherwise one extra fetch of exactly
+that window serves both tables. Both fetches use the minimal, keyset-paged
+projection (`queries.list_decisions_between`), so a capped year stays inside the
+Data API's 1 MB response.
 """
 
 from __future__ import annotations
@@ -47,18 +49,22 @@ async def decision_funnel(
     group_by: Annotated[GroupBy, Query(description="Group key.")] = "day",
 ) -> FunnelResponse:
     """Scans -> symbols -> proposals -> gate -> Judge -> published, per group."""
-    start, end = resolve_period(
-        since, until, now=assembly.utcnow(), default_days=DEFAULT_FUNNEL_DAYS
-    )
-    fetch_since = min(start, end - _TOP_REJECTIONS_LONG)
-    rows = await list_decisions_between(store, since=fetch_since, until=end)
-    in_range = [r for r in rows if r.created_at >= start]
+    now = assembly.utcnow()
+    start, end = resolve_period(since, until, now=now, default_days=DEFAULT_FUNNEL_DAYS)
+    rows = await list_decisions_between(store, since=start, until=end)
+
+    recent_since = now - _TOP_REJECTIONS_LONG
+    if start <= recent_since and end >= now:
+        recent = [r for r in rows if recent_since <= r.created_at < now]
+    else:  # a historical or partial range: fetch the last 30 days once for both tables
+        recent = await list_decisions_between(store, since=recent_since, until=now)
+
     return FunnelResponse(
         since=start,
         until=end,
         group_by=group_by,
-        groups=build_funnel(in_range, group_by=group_by),
-        totals=summarise(in_range, key="total"),
-        top_rejections_7d=_table(top_rejections(rows, since=end - _TOP_REJECTIONS_SHORT)),
-        top_rejections_30d=_table(top_rejections(rows, since=end - _TOP_REJECTIONS_LONG)),
+        groups=build_funnel(rows, group_by=group_by),
+        totals=summarise(rows, key="total"),
+        top_rejections_7d=_table(top_rejections(recent, since=now - _TOP_REJECTIONS_SHORT)),
+        top_rejections_30d=_table(top_rejections(recent, since=recent_since)),
     )

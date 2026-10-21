@@ -9,7 +9,8 @@ Stages, per group and for the totals:
 - ``proposals`` = PUBLISHED + VETOED + GATE_REJECTED (the Analyzer proposed);
   ``gate_passed`` = proposals - gate_rejected.
 - ``judge_publish`` / ``judge_caveat`` / ``judge_skip`` -- the Judge ruling on
-  gate-passed rows (a gate-passed row with no Judge run counts in none).
+  gate-passed rows; ``judge_none`` counts gate-passed rows with no (or an
+  unrecognised) Judge ruling, so the four buckets sum to ``gate_passed``.
 - ``published`` -- an ``active_setups`` row exists (``has_setup``).
 - ``rejections_by_rule`` -- ``violated_rule`` of GATE_REJECTED rows.
 
@@ -27,7 +28,7 @@ from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from src.common.models import JudgeRuling
 from src.common.schedule import AD_HOC, SCAN_WINDOWS, window_for
@@ -41,6 +42,9 @@ GroupBy = Literal["day", "window", "symbol"]
 _PROPOSAL_KINDS = frozenset(
     {DecisionKind.PUBLISHED, DecisionKind.VETOED, DecisionKind.GATE_REJECTED}
 )
+# A ruling outside these (NULL: no Judge run) lands in ``judge_none``, so the four
+# judge buckets always sum to ``gate_passed``.
+_KNOWN_RULINGS = frozenset(r.value for r in JudgeRuling)
 _WINDOW_ORDER = {label: index for index, label in enumerate([w.label for w in SCAN_WINDOWS])}
 
 
@@ -55,10 +59,17 @@ class FunnelGroup(BaseModel):
     proposals: int
     gate_rejected: int
     gate_passed: int
-    judge_publish: int
-    judge_caveat: int
-    judge_skip: int
-    published: int
+    judge_publish: int = Field(description="Gate-passed rows the Judge ruled PUBLISH.")
+    judge_caveat: int = Field(description="Gate-passed rows ruled PUBLISH_WITH_CAVEAT.")
+    judge_skip: int = Field(description="Gate-passed rows ruled SKIP (vetoes).")
+    judge_none: int = Field(
+        description="Gate-passed rows with no Judge run (Slice-1 era); the four judge_* "
+        "buckets sum to gate_passed."
+    )
+    published: int = Field(
+        description="Rows with an active setup; can be < judge_publish + judge_caveat "
+        "(e.g. a publish that never opened a setup)."
+    )
     rejections_by_rule: dict[str, int]
 
 
@@ -97,6 +108,7 @@ def summarise(rows: Sequence[DecisionRow], *, key: str) -> FunnelGroup:
         judge_publish=rulings[JudgeRuling.PUBLISH.value],
         judge_caveat=rulings[JudgeRuling.PUBLISH_WITH_CAVEAT.value],
         judge_skip=rulings[JudgeRuling.SKIP.value],
+        judge_none=sum(n for ruling, n in rulings.items() if ruling not in _KNOWN_RULINGS),
         published=sum(1 for r in rows if r.has_setup),
         rejections_by_rule=dict(sorted(rules.items(), key=lambda item: (-item[1], item[0]))),
     )

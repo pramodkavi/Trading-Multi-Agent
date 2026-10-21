@@ -397,7 +397,8 @@ class FunnelResponse(BaseModel):
     """`GET /api/funnel` body: the funnel per group, the totals and the top gate rules.
 
     `groups` / `totals` cover `[since, until)`. The two rejection tables are the
-    7 and 30 days before `until`, whatever the requested range.
+    last 7 and 30 days **anchored to now** (design §4.2 P4), whatever the
+    requested range -- a historical `until` does not move them.
     """
 
     model_config = ConfigDict(extra="forbid")

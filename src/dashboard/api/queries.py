@@ -44,6 +44,7 @@ from src.persistence.repositories import _parse_jsonb_field
 from src.persistence.store import _cursor_params, _long_param, _str_param, _utc_iso
 
 __all__ = [
+    "ASC_KEYSET_ORDER",
     "ASC_KEYSET_PREDICATE",
     "PAGE_LIMIT_SQL",
     "DashboardReader",
@@ -322,6 +323,7 @@ ASC_KEYSET_PREDICATE = (
     "(s.created_at, s.id) > (:after_ts::timestamptz, :after_id::uuid))"
 )
 PAGE_LIMIT_SQL = "LIMIT :page_limit"
+ASC_KEYSET_ORDER = "ORDER BY s.created_at ASC, s.id ASC"
 
 
 async def read_all_pages(
@@ -338,14 +340,19 @@ async def read_all_pages(
     readers (the funnel's :func:`list_decisions_between`, Task 3's
     ``list_outcome_rows``) page through it instead of reading it in one call.
     ``sql_with_keyset`` must contain :data:`ASC_KEYSET_PREDICATE` in its
-    ``WHERE``, end with ``ORDER BY s.created_at ASC, s.id ASC`` +
-    :data:`PAGE_LIMIT_SQL`, and project ``id`` and ``created_at`` (the
+    ``WHERE``, end with :data:`ASC_KEYSET_ORDER` + :data:`PAGE_LIMIT_SQL` (a
+    missing fragment is ``ValueError`` before any call), and project ``id`` and ``created_at`` (the
     ``_utc_iso`` string). The cursor advances from the last row of each page
     until a page returns fewer than ``page_size`` rows. More than
     ``max_pages * page_size`` rows raises ``RuntimeError`` rather than looping on.
     """
-    if ASC_KEYSET_PREDICATE not in sql_with_keyset or PAGE_LIMIT_SQL not in sql_with_keyset:
-        raise ValueError("statement lacks the ascending keyset predicate / LIMIT :page_limit")
+    missing = [
+        fragment
+        for fragment in (ASC_KEYSET_PREDICATE, ASC_KEYSET_ORDER, PAGE_LIMIT_SQL)
+        if fragment not in sql_with_keyset
+    ]
+    if missing:
+        raise ValueError(f"paged statement lacks the ascending keyset fragment(s): {missing}")
     if page_size < 1 or max_pages < 1:
         raise ValueError("page_size and max_pages must be >= 1")
     rows: list[dict[str, Any]] = []
@@ -360,6 +367,7 @@ async def read_all_pages(
             return rows
         last = page[-1]
         after = (datetime.fromisoformat(str(last["created_at"])), UUID(str(last["id"])))
+    # Unreachable at today's volume (~7k rows/yr vs the 20k cap); a 500 by design until mapped.
     raise RuntimeError(f"result too large: more than {max_pages * page_size} rows")
 
 
@@ -376,7 +384,7 @@ _DECISIONS_BETWEEN_SQL = f"""SELECT s.id::text AS id,
 {_SIGNAL_SCAN_JUDGE_FROM}
 WHERE s.created_at >= :since::timestamptz AND s.created_at < :until::timestamptz
   AND {ASC_KEYSET_PREDICATE}
-ORDER BY s.created_at ASC, s.id ASC
+{ASC_KEYSET_ORDER}
 {PAGE_LIMIT_SQL}"""
 
 
