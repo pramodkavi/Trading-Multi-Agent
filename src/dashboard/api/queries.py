@@ -53,6 +53,7 @@ __all__ = [
     "ASC_KEYSET_ORDER",
     "ASC_KEYSET_PREDICATE",
     "PAGE_LIMIT_SQL",
+    "SCAN_ROLE",
     "ConfigFacts",
     "CriticReportSummary",
     "DashboardReader",
@@ -716,12 +717,18 @@ class UsageDay(BaseModel):
       the Critic included -- a successful review is written to ``agent_runs``
       (role ``critic``, same ``cost_usd``) *and* to ``decision_reviews``, and the
       Critic's report call exists only in ``agent_runs``. A row is only written on
-      success, so these rows carry ``errors`` = 0.
+      success, so ``agent_runs`` is **no failure source**: its rows carry
+      ``errors`` = NULL, and a (day, role) fed only by ``agent_runs`` (analyzer,
+      historian, skeptic, judge) reports ``errors: None`` -- "unknown", not 0.
+      Pipeline failures surface on the ``scan`` pseudo-role instead.
     * ``decision_reviews`` contributes **only failures**: rows with ``error`` set
       (never in ``agent_runs``, NULL cost) add one run + one error to ``critic``
-      and zero cost.
+      and zero cost. Reviews are upserted per signal, so these are the signals
+      whose *latest* review attempt failed.
     * ``setup_evaluations`` is the Forecaster (role ``forecaster``; it has no
       ``agent_runs`` rows -- no scan id): runs, ``ERROR`` rows as errors, cost.
+    * ``scan_runs`` is the :data:`SCAN_ROLE` pseudo-role: runs = rows (one per
+      symbol per invocation), errors = ``FAILED`` rows, cost 0 (no LLM call).
 
     Unpriced calls (NULL cost) add 0.
     """
@@ -731,7 +738,9 @@ class UsageDay(BaseModel):
     date: date_type
     role: str
     runs: int = Field(ge=0)
-    errors: int = Field(ge=0)
+    errors: int | None = Field(
+        ge=0, description="Failures; null when the role's only source has no failure rows."
+    )
     cost_usd: float = Field(ge=0, description="Sum of cost_usd; NULL (unpriced) counts as 0.")
 
 
@@ -774,20 +783,32 @@ def _utc_day(column: str) -> str:
     return f"to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
 
 
-# One statement, three sources, aggregated per (UTC day, role). A bounded result:
-# at most 30 days x 6 roles rows. Source rule in `UsageDay`: decision_reviews adds
-# only its FAILED rows (successful reviews are already in agent_runs as `critic`).
+# The scan_runs pseudo-role in `agent_usage_by_day` (pipeline runs / failures, no cost).
+SCAN_ROLE = "scan"
+
+# One statement, four sources, aggregated per (UTC day, role). A bounded result:
+# at most 30 days x 7 roles rows. Source rule in `UsageDay`: decision_reviews adds
+# only its FAILED rows (successful reviews are already in agent_runs as `critic`);
+# agent_runs has no failure rows, so its errors are NULL and `sum(errors)` stays
+# NULL for a (day, role) fed by agent_runs alone (SQL sum ignores NULLs otherwise).
 _USAGE_BY_DAY_SQL = f"""SELECT day, role,
        sum(runs)::bigint AS runs,
        sum(errors)::bigint AS errors,
        COALESCE(sum(cost_usd), 0)::double precision AS cost_usd
 FROM (
     SELECT {_utc_day("created_at")} AS day, agent_role AS role,
-           count(*) AS runs, 0::bigint AS errors,
+           count(*) AS runs, NULL::bigint AS errors,
            sum(cost_usd)::double precision AS cost_usd
     FROM agent_runs
     WHERE created_at >= :since::timestamptz
     GROUP BY 1, 2
+    UNION ALL
+    SELECT {_utc_day("started_at")} AS day, '{SCAN_ROLE}' AS role,
+           count(*) AS runs, count(*) FILTER (WHERE status = 'FAILED') AS errors,
+           0::double precision AS cost_usd
+    FROM scan_runs
+    WHERE started_at >= :since::timestamptz
+    GROUP BY 1
     UNION ALL
     SELECT {_utc_day("evaluated_at")} AS day, 'forecaster' AS role,
            count(*) AS runs, count(*) FILTER (WHERE status = 'ERROR') AS errors,
@@ -815,7 +836,7 @@ async def agent_usage_by_day(reader: DashboardReader, *, since: datetime) -> lis
             date=date_type.fromisoformat(str(row["day"])),
             role=str(row["role"]),
             runs=int(row.get("runs") or 0),
-            errors=int(row.get("errors") or 0),
+            errors=None if row.get("errors") is None else int(row["errors"]),
             cost_usd=float(row.get("cost_usd") or 0.0),
         )
         for row in rows

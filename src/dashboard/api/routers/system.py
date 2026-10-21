@@ -10,8 +10,10 @@
 - `GET /api/system/scans` -- the latest 50 `scan_runs` rows (window, status,
   duration, symbols, error).
 - `GET /api/system/agents?days=7` -- per-role runs / failures / LLM cost per UTC
-  day (`agent_runs` + `setup_evaluations` + `decision_reviews`) and the cost
-  per day; `days` 1..30.
+  day (`agent_runs` + `setup_evaluations` + `decision_reviews`, plus the
+  cost-free `scan` pseudo-role from `scan_runs`) and the cost per day; `days`
+  1..30. `errors` is null for roles fed only by `agent_runs` (rows exist only on
+  success, so there is no failure source -- see `queries.UsageDay`).
 - `GET /api/system/sweeps?days=7` -- Forecaster evaluations / errors per sweep.
 - `GET /api/system/alarms` -- the `CryptoSignals-Monitoring-*` alarm states.
 - `GET /api/system/metrics?days=7` -- the scan Lambda's daily Invocations /

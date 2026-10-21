@@ -6,8 +6,9 @@ through ``queries`` / ``cloudwatch`` and hands the results here.
 * :func:`scan_history_out` -- one scan-history line per ``scan_runs`` row, with
   its schedule window (``schedule.window_for``) and duration.
 * :func:`cost_per_day` -- LLM spend per UTC day, total and per role, summed over
-  the three sources ``queries.agent_usage_by_day`` reads (``agent_runs``,
-  ``setup_evaluations`` as ``forecaster``, ``decision_reviews`` as ``critic``).
+  the priced sources ``queries.agent_usage_by_day`` reads (``agent_runs``,
+  ``setup_evaluations`` as ``forecaster``; ``decision_reviews`` failures add 0);
+  the ``scan`` pseudo-role (``scan_runs``) carries no cost and is left out.
 * :func:`forecaster_sweeps` -- Forecaster evaluations bucketed per sweep with the
   ``overview.last_sweep_at`` semantics: a sweep starts at fire time +
   :data:`overview.SWEEP_OFFSET` and an evaluation belongs to the **latest sweep
@@ -27,7 +28,7 @@ from datetime import UTC, date, datetime, timedelta
 
 from src.common.schedule import SCAN_WINDOWS, window_for, windows_for_day
 from src.dashboard.api.overview import SWEEP_OFFSET
-from src.dashboard.api.queries import ConfigFacts, EvaluationStamp, UsageDay
+from src.dashboard.api.queries import SCAN_ROLE, ConfigFacts, EvaluationStamp, UsageDay
 from src.dashboard.api.schemas import (
     ConfigResponse,
     CostDay,
@@ -90,10 +91,18 @@ def scan_history_out(scans: Sequence[StoredScanRun]) -> list[ScanRowOut]:
 
 
 def cost_per_day(usage: Iterable[UsageDay]) -> list[CostDay]:
-    """Spend per UTC day (ascending): the total and the per-role split."""
+    """Spend per UTC day (ascending): the total and the per-role split.
+
+    The cost-free ``scan`` pseudo-role (``scan_runs``) is not an LLM spender and
+    stays out of ``by_role``; a day it alone covers is listed at 0. ``errors`` is
+    irrelevant here (it may be null).
+    """
     by_day: dict[date, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for line in usage:
-        by_day[line.date][line.role] += line.cost_usd
+        roles = by_day[line.date]  # a scan-only day is still a (zero-spend) day
+        if line.role == SCAN_ROLE:
+            continue
+        roles[line.role] += line.cost_usd
     return [
         CostDay(date=day, total_usd=sum(roles.values()), by_role=dict(roles))
         for day, roles in sorted(by_day.items())

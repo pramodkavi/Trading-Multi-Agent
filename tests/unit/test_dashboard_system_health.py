@@ -201,6 +201,24 @@ def test_cost_per_day_sums_three_sources() -> None:
     assert system.cost_per_day([]) == []
 
 
+def test_cost_per_day_ignores_null_errors_and_scan_pseudo_role() -> None:
+    # `errors: None` (agent_runs has no failure source) and the cost-free `scan`
+    # pseudo-role (scan_runs) leave the totals exactly as the LLM sources make them.
+    d1 = date(2026, 10, 20)
+    usage = [
+        UsageDay(date=d1, role="analyzer", runs=4, errors=None, cost_usd=0.10),
+        UsageDay(date=d1, role="scan", runs=4, errors=1, cost_usd=0.0),
+        UsageDay(date=d1, role="skeptic", runs=3, errors=None, cost_usd=0.05),
+    ]
+    (day,) = system.cost_per_day(usage)
+    assert day.total_usd == pytest.approx(0.15)
+    assert day.by_role == pytest.approx({"analyzer": 0.10, "skeptic": 0.05})
+    assert "scan" not in day.by_role
+    # A day with scan rows only still appears, at zero spend.
+    (quiet,) = system.cost_per_day([UsageDay(date=d1, role="scan", runs=4, errors=4, cost_usd=0)])
+    assert quiet.total_usd == 0.0 and quiet.by_role == {}
+
+
 def test_system_agents_route_reads_three_tables(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = SqlFake(
         usage_rows=[
@@ -230,6 +248,7 @@ def test_system_agents_route_reads_three_tables(monkeypatch: pytest.MonkeyPatch)
         assert table in sql
     assert "cost_usd::double precision" in sql or "::double precision" in sql
     assert "status = 'ERROR'" in sql and "error IS NOT NULL" in sql
+    assert "FROM scan_runs" in sql  # the `scan` pseudo-role
     assert datetime.fromisoformat(params["since"]) == _at(0, 0, day=date(2026, 10, 14))
     assert ":since" in sql and "2026" not in sql  # bound, never formatted
 
@@ -239,7 +258,7 @@ def _usage_branches(sql: str) -> dict[str, str]:
     inner = sql.split("FROM (", 1)[1].rsplit(") u", 1)[0]
     branches: dict[str, str] = {}
     for branch in inner.split("UNION ALL"):
-        for table in ("agent_runs", "setup_evaluations", "decision_reviews"):
+        for table in ("agent_runs", "setup_evaluations", "decision_reviews", "scan_runs"):
             if f"FROM {table}" in branch:
                 branches[table] = branch
     return branches
@@ -253,7 +272,7 @@ def test_agent_usage_sql_does_not_double_count_critic(monkeypatch: pytest.Monkey
     assert _client(fake, monkeypatch).get("/api/system/agents").status_code == 200
     ((sql, _),) = fake.calls
     branches = _usage_branches(sql)
-    assert set(branches) == {"agent_runs", "setup_evaluations", "decision_reviews"}
+    assert set(branches) == {"agent_runs", "setup_evaluations", "decision_reviews", "scan_runs"}
 
     reviews = branches["decision_reviews"]
     assert "WHERE error IS NOT NULL" in reviews
@@ -268,6 +287,49 @@ def test_agent_usage_sql_does_not_double_count_critic(monkeypatch: pytest.Monkey
     # The Forecaster has no agent_runs rows; setup_evaluations is its whole source.
     evals = branches["setup_evaluations"]
     assert "'forecaster' AS role" in evals and "sum(cost_usd)" in evals
+
+
+def test_agent_usage_errors_null_without_failure_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    # agent_runs rows exist only on success: claiming 0 errors would be a lie, so the
+    # branch reports NULL and the outer sum stays NULL for a (day, role) with only
+    # agent_runs rows. Forecaster / Critic failures keep their counts; scan_runs adds
+    # the pipeline's own failures as the cost-free `scan` pseudo-role.
+    fake = SqlFake()
+    assert _client(fake, monkeypatch).get("/api/system/agents").status_code == 200
+    ((sql, _),) = fake.calls
+    branches = _usage_branches(sql)
+    assert "NULL::bigint AS errors" in branches["agent_runs"]
+    assert "0::bigint AS errors" not in branches["agent_runs"]
+    assert "count(*) FILTER (WHERE status = 'ERROR') AS errors" in branches["setup_evaluations"]
+    assert "count(*) AS errors" in branches["decision_reviews"]
+    scan = branches["scan_runs"]
+    assert "'scan' AS role" in scan
+    assert "count(*) AS runs" in scan
+    assert "count(*) FILTER (WHERE status = 'FAILED') AS errors" in scan
+    assert "0::double precision AS cost_usd" in scan
+    assert "started_at >= :since::timestamptz" in scan
+    assert "sum(errors)::bigint AS errors" in sql  # NULL-preserving outer aggregate
+
+
+def test_system_agents_route_errors_null(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = SqlFake(
+        usage_rows=[
+            {"day": "2026-10-20", "role": "scan", "runs": 8, "errors": 1, "cost_usd": 0.0},
+            {"day": "2026-10-20", "role": "skeptic", "runs": 3, "errors": None, "cost_usd": 0.05},
+        ]
+    )
+    body = _client(fake, monkeypatch).get("/api/system/agents").json()
+    scan, skeptic = body["usage"]
+    assert skeptic == {
+        "date": "2026-10-20",
+        "role": "skeptic",
+        "runs": 3,
+        "errors": None,
+        "cost_usd": 0.05,
+    }
+    assert scan["errors"] == 1 and scan["runs"] == 8 and scan["cost_usd"] == 0.0
+    (day,) = body["cost_per_day"]
+    assert day["total_usd"] == pytest.approx(0.05) and day["by_role"] == {"skeptic": 0.05}
 
 
 @pytest.mark.parametrize("path", ["/api/system/agents", "/api/system/sweeps"])
