@@ -62,7 +62,7 @@ share one origin); 4.7 the SSM parameter publishing the base URL for the
 Telegram deep links (design §7).
 
 Step 4.4 (done) added the one-user Cognito pool (admin-created only, LITE plan,
-optional TOTP, RETAINED with deletion protection), its classic Hosted UI
+TOTP MFA required, RETAINED with deletion protection), its classic Hosted UI
 domain, the public PKCE app client (callback = the local token helper
 ``scripts/dashboard_token.py``; 4.5 adds the CloudFront URLs), the
 ``HttpUserPoolAuthorizer`` and the ``ANY /api/{proxy+}`` route that uses it.
@@ -312,8 +312,10 @@ class DashboardStack(Stack):
 
         # ---- Cognito: one-user pool, Hosted UI domain, public PKCE client ----
         # (Step 4.4, design §8.) Admin-created users only; email sign-in; the
-        # LITE tier (threat protection is a paid add-on); optional TOTP, never
-        # SMS (no SNS role / cost). RETAINED + deletion protection (operator
+        # LITE tier (threat protection is a paid add-on); TOTP MFA REQUIRED, never
+        # SMS (no SNS role / cost) -- operator decision 2026-10-21: optional MFA
+        # had no enrolment path on the classic Hosted UI, while required MFA makes
+        # the Hosted UI enrol an authenticator app at first sign-in. RETAINED + deletion protection (operator
         # decision 2026-10-21): an accidental stack delete must not wipe the
         # account -- a recreated stack gets a new empty pool and the orphan is free.
         self.user_pool = cognito.UserPool(
@@ -332,7 +334,7 @@ class DashboardStack(Stack):
                 require_symbols=True,
                 temp_password_validity=Duration.days(3),
             ),
-            mfa=cognito.Mfa.OPTIONAL,
+            mfa=cognito.Mfa.REQUIRED,
             mfa_second_factor=cognito.MfaSecondFactor(otp=True, sms=False),
             account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
             deletion_protection=True,
@@ -474,15 +476,11 @@ class DashboardStack(Stack):
             ],
         )
         # The proxy route needs no APIG4 suppression -- the authorizer satisfies it.
-        # Cognito: only the deliberate cost/UX choices (optional MFA, LITE plan /
-        # no advanced security), on the pool only.
+        # Cognito: only the deliberate cost choices (LITE plan / no advanced
+        # security), on the pool only. COG2 (MFA) is satisfied: TOTP is required.
         NagSuppressions.add_resource_suppressions(
             self.user_pool,
             [
-                {
-                    "id": "AwsSolutions-COG2",
-                    "reason": "optional TOTP left to the single operator (design §8)",
-                },
                 {
                     "id": "AwsSolutions-COG3",
                     "reason": "paid tier; single user (design §3.2 / §9)",

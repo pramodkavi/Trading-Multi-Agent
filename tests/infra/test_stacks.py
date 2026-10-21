@@ -568,9 +568,11 @@ def test_user_pool_password_policy(templates: dict[str, Any]) -> None:
     assert policy["TemporaryPasswordValidityDays"] == 3
 
 
-def test_user_pool_mfa_optional_totp_only(templates: dict[str, Any]) -> None:
+def test_user_pool_mfa_required_totp_only(templates: dict[str, Any]) -> None:
+    # Operator decision 2026-10-21: TOTP MFA required (optional MFA had no
+    # enrolment path on the classic Hosted UI).
     props = _user_pool(templates)["Properties"]
-    assert props["MfaConfiguration"] == "OPTIONAL"
+    assert props["MfaConfiguration"] == "ON"
     assert props["EnabledMfas"] == ["SOFTWARE_TOKEN_MFA"]  # no SMS (no SNS cost/role)
     assert "SmsConfiguration" not in props
 
@@ -676,8 +678,9 @@ def test_cognito_outputs(templates: dict[str, Any]) -> None:
 
 def test_dashboard_nag_clean_with_cognito() -> None:
     # Full AwsSolutions pack on the dashboard stack: no error or warning at all,
-    # with COG2/COG3/COG8 the only Cognito suppressions (pool only) and APIG4 on the
-    # health route only (the proxy route is satisfied by the authorizer).
+    # with COG3/COG8 the only Cognito suppressions (pool only) and APIG4 on the
+    # health route only (the proxy route is satisfied by the authorizer). COG2
+    # (MFA) is satisfied by required TOTP and must not be suppressed anywhere.
     import aws_cdk as core
     from aws_cdk import assertions as cdk_assertions
     from cdk_nag import AwsSolutionsChecks
@@ -704,7 +707,8 @@ def test_dashboard_nag_clean_with_cognito() -> None:
     pool_ids = {
         lid for lid, r in template["Resources"].items() if r["Type"] == "AWS::Cognito::UserPool"
     }
-    allowed_cog = ("AwsSolutions-COG2", "AwsSolutions-COG3", "AwsSolutions-COG8")
+    assert "AwsSolutions-COG2" not in suppressed, suppressed.get("AwsSolutions-COG2")
+    allowed_cog = ("AwsSolutions-COG3", "AwsSolutions-COG8")
     for rule in allowed_cog:  # pool-scoped only: on any other construct this fails
         assert suppressed[rule] == pool_ids, rule
     assert not any(
