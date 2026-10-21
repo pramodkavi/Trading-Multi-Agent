@@ -504,10 +504,11 @@ cluster ARN + DB secret ARN imports):
 | IAM role | RDS Data API on the one cluster + read of its secret, CloudWatch Logs write — **no SSM, no S3** |
 | Outputs | `DashboardApiUrl`, `DashboardFunctionName` |
 
-Nothing else is reachable until Step 4.2+ (queries + overview/setups/signals
-endpoints). In 4.1 **nothing in the stack touches Aurora** — the health route does
-not open a DB call, so browsing it never wakes the cluster. The Data API grant is
-in place for 4.2.
+Nothing else is reachable until **Step 4.4** adds the Cognito JWT authorizer and the
+`ANY /api/{proxy+}` route: Step 4.2's data routes (queries + overview / setups /
+signals) exist in the FastAPI app but are console-only until then (§8.6). The
+health route does not open a DB call, so browsing it never wakes the cluster; the
+Data API grant is what the 4.2 routes use.
 
 ### 8.2 Where the API URL is
 
@@ -535,9 +536,9 @@ ran from a different commit than expected (`APP_VERSION` is baked at synth time)
 The FastAPI app also defines `/api/openapi.json` and `/api/docs` (`openapi_url` /
 `docs_url` in `create_app()`), but in Step 4.1 the HTTP API routes **only**
 `GET /api/health` — any other path (including those two) returns API Gateway's
-`{"message":"Not Found"}`. They become reachable when a later step adds the routes
-behind the JWT authorizer (design §6: "OpenAPI served at `/api/docs` (behind the
-authorizer)").
+`{"message":"Not Found"}`. They become reachable in **Step 4.4**, which routes
+`ANY /api/{proxy+}` behind the JWT authorizer (design §6: "OpenAPI served at
+`/api/docs` (behind the authorizer)").
 
 A request also produces one line in `DashboardApiAccessLogs` — since Step 4.2 a
 JSON object per request (`routeKey`, `path`, `status`, … — fields in §8.6). Before
@@ -606,9 +607,12 @@ Gateway **v2** (HTTP API) payload — Mangum needs `version`, `rawPath`,
 }
 ```
 
-Change `rawPath` (and the two `routeKey` / `http.path` copies) for another route;
-query parameters go in `rawQueryString` (e.g. `"limit=5&symbol=BTCUSDT"` — Mangum
-reads that field, not `queryStringParameters`). The response is the Lambda proxy
+For another route change **all three** path copies together — `rawPath`,
+`routeKey` and `requestContext.http.path`. Mangum's HTTP-API handler routes on
+**`requestContext.http.path`**, not `rawPath` (the event above works because the
+three agree; edit only `rawPath` and the old route still answers). Query
+parameters go in `rawQueryString` (e.g. `"limit=5&symbol=BTCUSDT"` — Mangum reads
+that field, not `queryStringParameters`). The response is the Lambda proxy
 shape: `{"statusCode": 200, "headers": {...}, "body": "<JSON string>",
 "isBase64Encoded": false}`. Save the event — it survives in the console and is the
 smoke test for any console edit of a data route (§8.4).
@@ -620,7 +624,13 @@ smoke test for any console edit of a data route (§8.4).
 | 503 + `Retry-After: 10` | `{"reason":"db_resuming"}` | Aurora is waking from scale-to-zero (`DatabaseResumingException`). The dashboard store is built with `resume_attempts=1` — **no retry**, the first resume error propagates at once (the scan Lambda's default budget is 6 attempts / ~75 s) — because an HTTP request behind API Gateway's 30 s cap cannot wait out the resume. |
 | 502 | `{"reason":"db_error"}` | any other Data API `ClientError`; the AWS code + message are in the function log at WARNING, never in the body |
 | 404 | `{"reason":"not_found"}` | `/api/signals/{id}` or `/runs/{run_id}` addresses a row that does not exist |
-| 400 | `{"reason":"bad_cursor"}` | `cursor` is not one this deployment issued |
+| 400 | `{"reason":"bad_cursor"}` | `cursor` is not one this deployment issued (also any cursor longer than 512 characters) |
+| 422 | FastAPI validation body (`{"detail":[{"loc":…,"msg":…,"type":…}]}`) | request validation: `limit` outside 1..200 (rejected, not clamped), a non-UUID `{id}` / `{run_id}`, an unknown `kind` / `outcome` enum value, a malformed `since` / `until` |
+
+The dashboard store's boto3 client is itself bounded (`deps.py`: 3 s connect, 15 s
+read, one attempt) so the slowest Data API call fails inside the function's 25 s
+timeout and one of the bodies above is returned — API Gateway's own 504 (30 s)
+should never be what the UI sees.
 
 **Expect the first call after idle to return 503 `db_resuming`** (Aurora takes
 ~10–30 s to resume); re-run the Test after ~10 s and it answers 200. `/api/system/db`

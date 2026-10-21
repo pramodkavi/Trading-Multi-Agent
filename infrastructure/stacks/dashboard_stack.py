@@ -43,11 +43,15 @@ Why it is declared LAST and coupled only to DataStack (design §3.5 / anti-goal
 this stack imports nothing from Compute / Scheduling / Monitoring -- the tests
 pin that (``Fn::ImportValue`` names all start with ``Data:``).
 
-What the next steps add here: 4.2 the read-only query module + the first real
-routes; 4.3 the SPA (private S3 bucket + CloudFront, which also fronts ``/api/*``
-so SPA and API share one origin); 4.4 the Cognito user pool + JWT authorizer on
-every non-health route; 4.5 the SSM parameter publishing the base URL for the
-Telegram deep links (design §7).
+Step 4.2 shipped the read-only query module and the first data routes
+(``/api/overview``, ``/api/setups/open``, ``/api/signals...``) -- in the FastAPI
+app only, deliberately unrouted here (no auth yet); the one change 4.2 made to
+this stack is the JSON access-log format (``ACCESS_LOG_FORMAT``). What the next
+steps add here: 4.3 the SPA (private S3 bucket + CloudFront, which also fronts
+``/api/*`` so SPA and API share one origin); 4.4 the Cognito user pool + JWT
+authorizer and the ``ANY /api/{proxy+}`` route that makes the data routes
+reachable; 4.5 the SSM parameter publishing the base URL for the Telegram deep
+links (design §7).
 """
 
 from __future__ import annotations

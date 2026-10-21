@@ -124,8 +124,8 @@ pipeline-side changes the serverless dashboard needs before Step 4.1 builds the 
    shared `ProviderErrorAlarm` still counts the markers too, but its threshold of 3 is
    unreachable with 1–2 open setups (closes the "Forecaster failures are invisible" finding).
 5. **`DataApiSignalStore(..., resume_attempts=6)` / `from_arns(..., resume_attempts=)`** — the
-   Aurora resume-retry budget is a parameter (default unchanged; the dashboard API will pass
-   `1` because an HTTP request cannot wait ~75 s).
+   Aurora resume-retry budget is a parameter (default unchanged; the dashboard API passes `1`
+   in `src/dashboard/api/deps.py` because an HTTP request cannot wait ~75 s).
 6. **`MonitoringStack` cost guardrail** — `AWS::Budgets::Budget` $15/month, notifies the alarm
    SNS topic (→ Telegram) at ACTUAL ≥ 80 % and FORECASTED ≥ 100 %; topic resource policy for
    `budgets.amazonaws.com`; the Budget `DependsOn` that policy (Budgets validates topic access
@@ -228,8 +228,20 @@ merge is the `$default` stage's access-log format (JSON, below):
    `docs/operations.md §8.6` (also the 503/502/404/400 contract; the first call after idle is
    503 `db_resuming`, retry after ~10 s).
 
-Known cold-start cost (§5): importing `risk_gates` for the overview drags in the whole agent
-pipeline (~6 s) — being fixed with a lazy package `__init__`.
+6. **Final-review fix wave (2026-10-21, same branch)** — (a) `src/agents/orchestration/__init__`
+   is a **lazy package** (PEP 562): the dashboard's `import src.dashboard.api.app` dropped from
+   7.2 s to 1.2 s and no longer loads LangGraph / the Anthropic SDK (§5 gotcha, now past tense);
+   (b) the dashboard store's boto3 client has **bounded timeouts** (`deps.py`: 3 s connect / 15 s
+   read / one attempt) so a slow Data API call fails inside the 25 s Lambda timeout and becomes
+   503 / 502, never a gateway 504; `errors.py` shares the store's `RESUME_RETRY_CODES`;
+   (c) **journal rows are trimmed** (wire-contract change, see item 3; `SignalDetailOut` on the
+   lifecycle carries the full signal); (d) the overview's `last_scan` badge spans **yesterday**
+   (fetch since start-of-yesterday; `last_scan_outcome` takes the latest row regardless of day,
+   grouped with its own day's window) so it is not blind overnight; (e) hardening: `has_setup`
+   is an `EXISTS` probe (no `active_setups` join fan-out), cursors longer than 512 chars and
+   `RecursionError` map to 400 `bad_cursor`, a malformed setup row is skipped with a WARNING
+   instead of failing the page, the Skeptic's `NoMacroData` step is detected by its `provider`
+   key, and a Critic step trims to the `DecisionReview` fields.
 
 ---
 
@@ -251,7 +263,7 @@ pipeline (~6 s) — being fixed with a lazy package `__init__`.
 | **Dashboard stack** | `CryptoSignals-Dashboard` — **CREATE_COMPLETE 2026-10-20 10:21 UTC** (first `cdk deploy --all` after the 4.1 merge, PR #14). Runbook `docs/operations.md §8`. |
 | **Dashboard function name** | `CryptoSignals-Dashboard-DashboardApi9FF75625-sBxaO23I2ara` (512 MB / 25 s / python3.11; log groups `CryptoSignals-Dashboard-DashboardApiLogs1CB09409-mackPnzDjQWJ` and `…-DashboardApiAccessLogsC0B4C96E-mziSWrU7AjJI`) |
 | **Dashboard API URL** | `https://s2bc8yifa1.execute-api.ap-south-1.amazonaws.com` — smoke test `GET /api/health` → `{"status":"ok","version":"c3ecb80"}` **verified 2026-10-20 12:42 UTC** (`c3ecb80` = the PR #14 merge commit). Only `/api/health` is routed until Step 4.4 (`/api/docs` → 404 as documented; the Step 4.2 data routes exist in the app but are console-only — `docs/operations.md §8.6`); no auth until Step 4.4. |
-| **Console editing** | The scan + notifier functions — and, once deployed, the dashboard API function (`docs/operations.md §8.4`) — are zip-packaged: open **Code** in the Lambda console to read/edit `src/` and `scripts/`, Deploy, then Test (`docs/operations.md §4.1`). **Any `cdk deploy` overwrites console edits.** |
+| **Console editing** | The scan + notifier functions — and the dashboard API function, deployed 2026-10-20 (`docs/operations.md §8.4`) — are zip-packaged: open **Code** in the Lambda console to read/edit `src/` and `scripts/`, Deploy, then Test (`docs/operations.md §4.1`). **Any `cdk deploy` overwrites console edits.** |
 | **Schedule** | EventBridge Scheduler `cron(3 8 * * ? *)` Etc/UTC, **ENABLED** (London open). NY/overlap/wrap/Critic windows added in later steps. |
 | **App secrets** | **Step 2.12 (code; activates on next deploy):** moved to **SSM Parameter Store SecureString** — `/crypto-signals/anthropic-api-key` (plain key string) and `/crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). Created out-of-band via `aws ssm put-parameter --type SecureString` (CFN can't create SecureString) — see `docs/operations.md §1`. Pre-2.12 these were Secrets Manager secrets (no leading slash); the 2.12 deploy removes them. The Aurora DB credential stays in Secrets Manager. |
 | **Estimated cost** | ~$5–9/month (Aurora scales to zero when idle). |
@@ -279,7 +291,7 @@ python -m venv .venv
 
 # 3. Pre-commit + sanity
 .\.venv\Scripts\python.exe -m pre_commit install
-.\.venv\Scripts\python.exe -m pytest -q          # expect: 1201 passed, 23 deselected (as of Step 4.2)
+.\.venv\Scripts\python.exe -m pytest -q          # expect: 1217 passed, 23 deselected (as of Step 4.2's final fix wave)
 .\.venv\Scripts\python.exe -m mypy --strict src/ scripts/
 
 # 4. AWS creds (the NEW machine needs its own credentials for account 097853039368)
@@ -364,19 +376,25 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
   bundler variant must put its distinguishing input into a serialisable `BundlingOptions` field.
 - **Mangum resolves the asyncio event loop at import** (`handler = Mangum(...)` in
   `src/dashboard/api/app.py`). Correct on the Python 3.11 Lambda runtime; under pytest-asyncio
-  the tests in `tests/unit/test_dashboard_app.py` manage the loop with fixtures, and on Python
-  3.12+ `asyncio.get_event_loop()` would raise a DeprecationWarning under `filterwarnings=error`
+  the loop is managed by the shared fixtures in `tests/unit/conftest.py` (`lambda_event_loop`,
+  captured at conftest import and closed once at session end), and on Python 3.12+
+  `asyncio.get_event_loop()` would raise a DeprecationWarning under `filterwarnings=error`
   — revisit when the runtime moves off 3.11.
 - **A bare `python app.py` synth writes to `%TEMP%\cdk.outXXXX`**, not `infrastructure/cdk.out`
   — look there (or pass `--output`) when inspecting the synthesised templates.
-- **Dashboard cold start drags in the agent pipeline (Step 4.2, being fixed).** The overview
-  imports `src.agents.orchestration.risk_gates` for the risk budget, which runs the package
-  `src/agents/orchestration/__init__.py` — and that eagerly imports `graph.py` (LangGraph + the
-  Anthropic SDK + langchain-core). Measured 2026-10-21: `import src.dashboard.api.app` = 7.2 s
-  wall / 6.18 s cumulative (`-X importtime`), of which 5.39 s is `src.agents.orchestration`
-  (`anthropic` 2.9 s, `langgraph.graph` 1.2 s); `risk_gates` itself is 4 ms. Fix = a lazy package
-  `__init__` (PEP 562 `__getattr__`) so `risk_gates` no longer pulls `graph`; the number above is
-  the before-measurement.
+- **Dashboard cold start used to drag in the agent pipeline — fixed in 4.2's final wave.** The
+  overview imports `src.agents.orchestration.risk_gates` for the risk budget, which runs the
+  package `src/agents/orchestration/__init__.py` — and that *eagerly* imported `graph.py`
+  (LangGraph + the Anthropic SDK + langchain-core). Measured 2026-10-21 before the fix:
+  `import src.dashboard.api.app` = **7.2 s** wall (6.18 s cumulative under `-X importtime`, of
+  which 5.39 s was `src.agents.orchestration`: `anthropic` 2.9 s, `langgraph.graph` 1.2 s;
+  `risk_gates` itself is 4 ms). The package `__init__` is now lazy (PEP 562 `__getattr__` +
+  `__dir__`; `from src.agents.orchestration import X` still works for the scan pipeline), so
+  importing `risk_gates` no longer loads `graph` — **now 1.2 s** (three runs: 1.27 / 1.24 /
+  1.22 s), with `langgraph` / `anthropic` absent from `sys.modules`
+  (`tests/unit/test_orchestration_lazy_import.py` pins it in a subprocess). Rule: nothing under
+  `src/dashboard/` may import `src.agents.orchestration.graph` or any agent module that pulls
+  the Anthropic SDK.
 
 ---
 
@@ -404,7 +422,7 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | ✅ Done (Step 4.0) | ~~**Observability — Forecaster failures are invisible:** `Forecaster.run` swallowed per-setup exceptions, the Lambda returned `ok`, and no alarm fired.~~ **Fixed:** every per-setup exception now logs `PROVIDER_ERROR provider=forecaster setup=<id> error=<Type>: <msg>` — the dedicated `ForecasterErrorAlarm` (metric filter on both terms, threshold 1/h) fires on the first one; the shared `ProviderErrorAlarm` counts it too — and journals a `setup_evaluations` row with `status='ERROR'`; every successful evaluation journals its verdict row too. Also closes the Step 2.7 deferral "per-agent token/cost on `agent_runs`": skeptic/judge rows now carry `latency_ms` / `token_usage` / `cost_usd` (`LlmUsage`). |
 | 🟡 Verify after deploy (Step 4.0) — **partially verified 2026-10-20** | Schema is applied (`to_regclass('setup_evaluations')` is non-null). (b) ✅ the 08:05 sweep wrote a `setup_evaluations` row (an `ERROR` row — credits, see the 🔴 Ops item — which is exactly the journaling 4.0 added). (c) ✅ the 08:03 scan's four `scan_runs` rows carry `session='LONDON'`; all 16 rows from 10-19 are `AD_HOC` (pre-4.0 deploy). **Still open:** (a) skeptic/judge `cost_usd` / `latency_ms` — unobservable so far because every proposal since 10-19 was gate-rejected (`RULE_2_MIN_RR`, `RULE_3_PREMIUM_DISCOUNT`, `RULE_9_CORRELATED_EXPOSURE`), so no skeptic/judge rows exist post-4.0; needs credits + a gate-passing proposal. (d) rule 7 — the first post-4.0 Cooldown scan is 2026-10-20 22:03 UTC; check `scan_runs.session='COOLDOWN'` and any `RULE_7_SESSION_BLOCK` skip after it. |
 | ✅ Verified (Step 4.1, 2026-10-20) | `GET https://s2bc8yifa1.execute-api.ap-south-1.amazonaws.com/api/health` → **200** `{"status":"ok","version":"c3ecb80"}` = the PR #14 merge commit; `/api/docs` → 404 (not routed, as documented). The `DashboardApiAccessLogs` group received one CLF line per request with **the path field logged as `-`** (`"GET - HTTP/1.1" 200 35`) because CDK's default format uses REST-era `$context.resourcePath` → ✅ **fixed in Step 4.2: the stage now uses an HTTP-API JSON format** (`routeKey`, `path`, `status`, `integrationLatency`, `requestId`, …) — verify after the 4.2 deploy (row below). Deploy created the stack last with no pipeline-stack changes beyond the shared code asset. |
-| 🟡 Verify after deploy (Step 4.2) | (a) `GET /api/health` once, then read the newest `DashboardApiAccessLogs` event: a JSON object whose `routeKey` is `GET /api/health` and `path` is `/api/health` (no more `-`). (b) Lambda console → `DashboardApi…` → Test with the v2 event from `docs/operations.md §8.6` against `/api/system/db`: `statusCode` 200 and a body `{"db":"ok","latency_ms":…}` — the first try after idle may say `"resuming"`, re-run after ~10 s. (c) The same event with `rawPath` `/api/overview`: 200 with today's windows (one `WindowOutcome` per window that has run — `LONDON` / `NY` / `OVERLAP` / `DAILY_WRAP` labels, worst per-symbol `status`, the four symbols — grouped from the per-symbol `scan_runs` rows), the risk budget, and `alarms: null`; a 503 `db_resuming` on the first try is expected. (d) `/api/signals?limit=5` (in `rawQueryString`): 200, five rows with a `kind`, and a `next_cursor` that pages when fed back as `cursor=`. |
+| 🟡 Verify after deploy (Step 4.2) | (a) `GET /api/health` once, then read the newest `DashboardApiAccessLogs` event: a JSON object whose `routeKey` is `GET /api/health` and `path` is `/api/health` (no more `-`). (b) Lambda console → `DashboardApi…` → Test with the v2 event from `docs/operations.md §8.6` against `/api/system/db`: `statusCode` 200 and a body `{"db":"ok","latency_ms":…}` — the first try after idle may say `"resuming"`, re-run after ~10 s. (c) The same event with `requestContext.http.path` (plus `rawPath` / `routeKey` — Mangum routes on the `http.path` field) set to `/api/overview`: 200 with today's windows (one `WindowOutcome` per window that has run — `LONDON` / `NY` / `OVERLAP` / `DAILY_WRAP` labels, worst per-symbol `status`, the four symbols — grouped from the per-symbol `scan_runs` rows), the risk budget, and `alarms: null`; a 503 `db_resuming` on the first try is expected. (d) `/api/signals?limit=5` (in `rawQueryString`): 200, five rows with a `kind`, and a `next_cursor` that pages when fed back as `cursor=`. |
 | 🟡 Test debt (Step 4.0) | Run `.\.venv\Scripts\python.exe -m pytest -m integration tests/integration/test_repositories_integration.py` the next time a local Postgres (Docker, port 5433) is available — the asyncpg `setup_evaluations` record/list round-trip was written in Step 4.0 but has never executed (no Docker on the build machine). |
 | 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |
 | ✅ Done | ~~Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking.~~ **Shipped (`fix/aurora-resume-retry`):** `_execute` retries `DatabaseResumingException` up to 6× with linear backoff (5/10/15/20/25s, ≤75s, well under the 10-min Lambda timeout). This was the production failure — every scheduled scan was dying on its first DB call (`start_scan`) because Aurora had scaled to zero, so no Telegram ever fired. Verified in the live Lambda logs (`log-events-viewer-result.csv`). |
@@ -427,8 +445,8 @@ unlocks **unrealised R** on open setups (`unrealised_r: null` since 4.2). Same t
 `EXPLAIN` on the funnel query under 500 ms at 10 k signals (NFR-4.3). Preconditions: merge 4.2
 (this branch) and run its 🟡 verify row in §7 — the 4.2 routes stay console-only until **Step
 4.4** (Cognito + JWT authorizer + `ANY /api/{proxy+}`), which is also when `/api/docs` becomes
-reachable. The lazy `src/agents/orchestration/__init__` (§5 cold-start gotcha) lands with 4.2's
-final review wave. Operational blocker unchanged: **top up Anthropic credits** (🔴 Ops row);
+reachable. The lazy `src/agents/orchestration/__init__` (§5 cold-start gotcha) landed in 4.2's
+final review wave (7.2 s → 1.2 s). Operational blocker unchanged: **top up Anthropic credits** (🔴 Ops row);
 4.3 itself needs no LLM.
 
 ### 8.1 Slice 2 progress log (Weeks 4–7, per `SPEC.md §4`) — historical
