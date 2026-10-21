@@ -17,12 +17,20 @@ Three rules of the overview are decided here and nowhere else:
   aggregates the group (earliest start, worst status, sorted symbol union,
   first error) and :func:`bucket_windows` keys the groups by
   ``schedule.window_for``; an ``AD_HOC`` run belongs to no window.
-* **Forecaster staleness is relative to the last *completed* sweep.** The
-  Forecaster runs inside each scheduled scan, so a sweep is counted once the
-  fire time plus :data:`SWEEP_GRACE` has passed (:func:`last_sweep_at`); an OPEN
+* **Forecaster staleness is relative to the last *finished* sweep.** The
+  Forecaster is a **separate** invocation of the scan Lambda
+  (``{"mode": "forecaster"}``, ``SchedulingStack`` cron ``5 8,13,15,22``): it
+  starts :data:`SWEEP_OFFSET` (2 min) after each scan fire time and, under
+  NFR-4.2 (<= 30 s per setup, <= 3 open setups), finishes well inside
+  :data:`SWEEP_RUN_BUDGET` (3 min). :func:`last_sweep_at` therefore returns the
+  *start* of the most recent sweep whose budget has elapsed, looking across
+  yesterday's and today's windows so the 22:05 sweep stays the reference until
+  08:08 the next morning (no blind spot before the day's first window). An OPEN
   setup is stale when it was never evaluated or last evaluated before that
-  fire time (:func:`count_stale`). Before the first sweep of the day only the
-  never-evaluated setups count.
+  start (:func:`count_stale`); a setup the sweep itself evaluated has
+  ``last_evaluated_at >= sweep start`` and reads fresh, and while a sweep is
+  still inside its budget the previous one is the reference, so a sweep in
+  flight never produces false "stale" badges.
 """
 
 from __future__ import annotations
@@ -55,7 +63,8 @@ from src.persistence.models import StoredActiveSetup, StoredAgentRun, StoredScan
 
 __all__ = [
     "AD_HOC_GROUP_TOLERANCE",
-    "SWEEP_GRACE",
+    "SWEEP_OFFSET",
+    "SWEEP_RUN_BUDGET",
     "bucket_windows",
     "build_risk_budget",
     "count_stale",
@@ -70,9 +79,15 @@ __all__ = [
     "window_outcome",
 ]
 
-# A scheduled sweep is counted once its fire time plus this grace has passed: the
-# Forecaster evaluates inside the scan, which takes a minute or two end to end.
-SWEEP_GRACE = timedelta(minutes=2)
+# The Forecaster sweep is its own EventBridge schedule, `cron(5 8,13,15,22)` UTC in
+# `infrastructure/stacks/scheduling_stack.py` (`{"mode": "forecaster"}`): it starts
+# this long after each scan fire time (:03 -> :05). Mirrors that cron literal; the
+# unit test `test_sweep_offset_matches_scheduling_stack` pins the two equal.
+SWEEP_OFFSET = timedelta(minutes=2)
+
+# How long a sweep is allowed before it counts as finished: NFR-4.2 budgets <= 30 s
+# per setup with <= 3 open setups (rule 4), i.e. under ~2 min; 3 min is the margin.
+SWEEP_RUN_BUDGET = timedelta(minutes=3)
 
 # Per-symbol rows of one AD_HOC invocation start within seconds of each other; rows
 # further apart than this are separate invocations (e.g. two console tests).
@@ -245,22 +260,31 @@ def last_scan_outcome(scans: Sequence[StoredScanRun], *, day: date) -> WindowOut
 
 
 def last_sweep_at(now: datetime) -> datetime | None:
-    """Fire time of the latest scheduled scan today whose sweep had time to finish.
+    """Start time of the most recent Forecaster sweep that has had time to finish.
 
-    A window counts once ``fire + SWEEP_GRACE <= now``; returns ``None`` before the
-    first such window of the UTC day. Raises ``ValueError`` on a naive ``now``.
+    A sweep starts at ``fire + SWEEP_OFFSET`` for every scheduled window and
+    counts once ``start + SWEEP_RUN_BUDGET <= now``. Yesterday's windows are
+    considered too, so before today's first sweep (and overnight) the answer is
+    yesterday's 22:05, not ``None``; ``None`` is only possible in the degenerate
+    case of no finished sweep in the two-day span, which the four daily windows
+    make unreachable. Raises ``ValueError`` on a naive ``now``.
     """
     now_utc = _require_aware(now, "now")
-    completed = [fire for fire in windows_for_day(now_utc.date()) if fire + SWEEP_GRACE <= now_utc]
-    return completed[-1] if completed else None
+    today = now_utc.date()
+    fires = [*windows_for_day(today - timedelta(days=1)), *windows_for_day(today)]
+    finished = [
+        fire + SWEEP_OFFSET for fire in fires if fire + SWEEP_OFFSET + SWEEP_RUN_BUDGET <= now_utc
+    ]
+    return finished[-1] if finished else None
 
 
 def count_stale(cards: Sequence[SetupCard], *, sweep_at: datetime | None) -> int:
-    """OPEN setups the last completed sweep did not cover.
+    """OPEN setups the last finished sweep did not cover.
 
-    Never evaluated -> stale. Otherwise stale iff last evaluated before
-    ``sweep_at``; with no sweep yet today (``sweep_at is None``) an evaluated
-    setup cannot have missed one.
+    Never evaluated -> stale. Otherwise stale iff last evaluated before the
+    sweep's start (``sweep_at``): a setup that sweep evaluated has
+    ``last_evaluated_at >= sweep_at`` and reads fresh. With no reference sweep
+    (``sweep_at is None``, degenerate) an evaluated setup cannot have missed one.
     """
     return sum(
         1

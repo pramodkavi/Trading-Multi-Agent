@@ -31,7 +31,8 @@ from src.common.schedule import AD_HOC
 from src.dashboard.api.classify import DecisionKind
 from src.dashboard.api.overview import (
     AD_HOC_GROUP_TOLERANCE,
-    SWEEP_GRACE,
+    SWEEP_OFFSET,
+    SWEEP_RUN_BUDGET,
     bucket_windows,
     build_risk_budget,
     count_stale,
@@ -370,21 +371,31 @@ def test_last_scan_outcome_ignores_other_days() -> None:
 # ---------------------------------------------------------------------------
 
 
+YESTERDAY = DAY - timedelta(days=1)
+
+
+def test_sweep_offset_matches_scheduling_stack() -> None:
+    # SchedulingStack: scans at :03, the Forecaster sweep at :05 (`cron(5 8,13,15,22)`).
+    assert timedelta(minutes=2) == SWEEP_OFFSET
+    assert timedelta(minutes=3) == SWEEP_RUN_BUDGET
+
+
 @pytest.mark.parametrize(
     ("now", "expected"),
     [
-        (_at(7, 0), None),  # before the first window
-        (_at(8, 3), None),  # fired, but the sweep has not had its grace period yet
-        (_at(8, 4, 59), None),
-        (_at(8, 5), _at(8, 3)),  # fire + SWEEP_GRACE -> the sweep counts
-        (_at(12, 0), _at(8, 3)),
-        (_at(13, 10), _at(13, 3)),
-        (_at(15, 4), _at(13, 3)),
-        (_at(23, 59), _at(22, 3)),
+        (_at(0, 30), _at(22, 5, day=YESTERDAY)),  # overnight: yesterday's wrap sweep
+        (_at(7, 0), _at(22, 5, day=YESTERDAY)),  # before today's first window: not None
+        (_at(8, 5), _at(22, 5, day=YESTERDAY)),  # today's first sweep just started
+        (_at(8, 7, 59), _at(22, 5, day=YESTERDAY)),  # still inside its run budget
+        (_at(8, 8), _at(8, 5)),  # start + SWEEP_RUN_BUDGET -> finished
+        (_at(12, 0), _at(8, 5)),
+        (_at(13, 6), _at(8, 5)),  # the 13:05 sweep has not finished yet
+        (_at(13, 8), _at(13, 5)),
+        (_at(15, 7), _at(13, 5)),
+        (_at(23, 59), _at(22, 5)),
     ],
 )
-def test_last_sweep_at(now: datetime, expected: datetime | None) -> None:
-    assert timedelta(minutes=2) == SWEEP_GRACE  # the table above assumes this grace
+def test_last_sweep_at(now: datetime, expected: datetime) -> None:
     assert last_sweep_at(now) == expected
 
 
@@ -394,14 +405,28 @@ def test_last_sweep_at_rejects_naive() -> None:
 
 
 def test_count_stale() -> None:
-    fresh = _card(opened_at=_at(8, 4), last_evaluated_at=_at(13, 4))
-    old = _card(opened_at=_at(8, 4), last_evaluated_at=_at(8, 4))
+    sweep = _at(13, 5)
+    fresh = _card(opened_at=_at(8, 4), last_evaluated_at=_at(13, 5, 40))  # this sweep
+    old = _card(opened_at=_at(8, 4), last_evaluated_at=_at(8, 5, 30))  # previous sweep
     never = _card(opened_at=_at(8, 4), last_evaluated_at=None)
-    exactly = _card(opened_at=_at(8, 4), last_evaluated_at=_at(13, 3))  # at the sweep: fresh
+    exactly = _card(opened_at=_at(8, 4), last_evaluated_at=sweep)  # at the sweep start: fresh
     cards = [fresh, old, never, exactly]
-    assert count_stale(cards, sweep_at=_at(13, 3)) == 2
-    assert count_stale(cards, sweep_at=None) == 1  # no sweep yet today: only never-evaluated
-    assert count_stale([], sweep_at=_at(13, 3)) == 0
+    assert count_stale(cards, sweep_at=sweep) == 2
+    assert count_stale(cards, sweep_at=None) == 1  # degenerate: only never-evaluated
+    assert count_stale([], sweep_at=sweep) == 0
+
+
+def test_count_stale_across_midnight() -> None:
+    # 07:00: the reference is yesterday's 22:05 sweep; a 15:05-yesterday evaluation missed it.
+    sweep = last_sweep_at(_at(7, 0))
+    assert sweep == _at(22, 5, day=YESTERDAY)
+    missed = _card(
+        opened_at=_at(8, 4, day=YESTERDAY), last_evaluated_at=_at(15, 5, 20, day=YESTERDAY)
+    )
+    covered = _card(
+        opened_at=_at(8, 4, day=YESTERDAY), last_evaluated_at=_at(22, 5, 20, day=YESTERDAY)
+    )
+    assert count_stale([missed, covered], sweep_at=sweep) == 1
 
 
 # ---------------------------------------------------------------------------

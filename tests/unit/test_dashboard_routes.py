@@ -45,7 +45,8 @@ from src.persistence.store import DataApiSignalStore
 from tests.unit.test_dashboard_app import _Ctx, _v2_event
 
 DAY = date(2026, 10, 20)
-NOW = datetime(2026, 10, 20, 13, 10, 0, tzinfo=UTC)  # NY session; the 13:03 sweep is done
+NOW = datetime(2026, 10, 20, 13, 10, 0, tzinfo=UTC)  # NY session; the 13:05 sweep finished 13:08
+EVALUATED_AT = datetime(2026, 10, 20, 13, 5, 30, tzinfo=UTC)  # inside the 13:05 sweep
 NARRATIVE = "Synthetic fixture narrative for the dashboard route tests, long enough."
 
 
@@ -361,7 +362,7 @@ def _scenario() -> Scenario:
         signal_id=published.id,
         opened_at=_at(8, 4),
         status=ActiveSetupStatus.OPEN,
-        last_evaluated_at=_at(13, 4),
+        last_evaluated_at=EVALUATED_AT,
         latest_evaluation={
             "status": "AT_RISK",
             "reasoning": "price near the stop",
@@ -417,7 +418,7 @@ def _scenario() -> Scenario:
             id=uuid4(),
             setup_id=setup.id,
             signal_id=published.id,
-            evaluated_at=_at(13, 4),
+            evaluated_at=EVALUATED_AT,
             status=SetupEvaluationStatus.AT_RISK,
             reasoning="price near the stop",
             latency_ms=900,
@@ -515,7 +516,7 @@ def _scenario() -> Scenario:
             "take_profit_1": 106.0,
             "take_profit_2": 110.0,
             "opened_at": setup.opened_at.isoformat(),
-            "last_evaluated_at": _at(13, 4).isoformat(),
+            "last_evaluated_at": EVALUATED_AT.isoformat(),
             "latest_evaluation": json.dumps(setup.latest_evaluation),
         }
     ]
@@ -524,7 +525,7 @@ def _scenario() -> Scenario:
         "signal_id": str(published.id),
         "opened_at": setup.opened_at.isoformat(),
         "status": "OPEN",
-        "last_evaluated_at": _at(13, 4).isoformat(),
+        "last_evaluated_at": EVALUATED_AT.isoformat(),
         "latest_evaluation": json.dumps(setup.latest_evaluation),
     }
     store.scan_rows = [
@@ -657,15 +658,16 @@ def test_overview_health_strip(client: TestClient, scenario: Scenario) -> None:
     forecaster = health["forecaster"]
     assert forecaster == {
         "open_setups": 1,
-        "stale": 0,  # evaluated 13:04, after the 13:03 sweep
+        "stale": 0,  # evaluated 13:05:30, by the 13:05 sweep itself
         "evaluations_last_window": 1,
         "errors_last_window": 0,
     }
-    # Scans are bounded to the current UTC day; evaluations are counted since the sweep.
+    # Scans are bounded to the current UTC day; evaluations are counted since the
+    # start of the last finished sweep (13:05 + 3 min budget <= 13:10).
     (scan_call,) = scenario.store.calls_matching("FROM scan_runs")
     assert datetime.fromisoformat(scan_call["since"]) == _at(0, 0)
     (count_call,) = scenario.store.calls_matching("FROM setup_evaluations")
-    assert datetime.fromisoformat(count_call["since"]) == _at(13, 3)
+    assert datetime.fromisoformat(count_call["since"]) == _at(13, 5)
 
 
 def test_overview_windows_today(client: TestClient, scenario: Scenario) -> None:
@@ -699,44 +701,70 @@ def test_overview_windows_today(client: TestClient, scenario: Scenario) -> None:
     assert str(scenario.vetoed.scan_id) not in chips_call["ids"]
 
 
-def test_overview_stale_setup_and_no_sweep_yet(
+def test_overview_stale_across_midnight(
     scenario: Scenario, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 08:04 UTC: the LONDON sweep fired a minute ago, so no sweep counts yet today; a
-    # never-evaluated setup is stale, one evaluated yesterday is not (no sweep to miss).
-    early = _at(8, 4)
+    # 07:00 UTC, before today's first window: the reference sweep is YESTERDAY's 22:05
+    # (a separate :05 invocation), not "no sweep yet". A setup last evaluated at 15:05
+    # yesterday missed it (stale); one evaluated at 22:05:40 yesterday did not; a
+    # never-evaluated one is stale. Evaluations are counted since yesterday 22:05.
+    early = _at(7, 0)
+    yesterday = DAY - timedelta(days=1)
     monkeypatch.setattr(assembly, "utcnow", lambda: early)
+    missed = StoredActiveSetup(
+        id=uuid4(),
+        signal_id=scenario.published.id,
+        opened_at=_at(8, 4, day=yesterday),
+        status=ActiveSetupStatus.OPEN,
+        last_evaluated_at=_at(15, 5, 20, day=yesterday),
+    )
     never = StoredActiveSetup(
         id=uuid4(),
         signal_id=scenario.published.id,
-        opened_at=_at(7, 0),
+        opened_at=_at(6, 0),
         status=ActiveSetupStatus.OPEN,
     )
-    scenario.store.open_setups = [scenario.setup, never]
-    # The fixture's scan rows are static; drop the ones that have not "happened" at 08:04.
+    covered = scenario.setup.model_copy(update={"last_evaluated_at": _at(22, 5, 40, day=yesterday)})
+    scenario.store.open_setups = [covered, missed, never]
+    # Nothing has run today yet: no scan rows on this UTC day.
     scenario.store.scan_rows = [
         r for r in scenario.store.scan_rows if datetime.fromisoformat(r["started_at"]) <= early
     ]
+    base = scenario.store.setup_card_rows[0]
     scenario.store.setup_card_rows = [
+        dict(base, last_evaluated_at=_at(22, 5, 40, day=yesterday).isoformat()),
         dict(
-            scenario.store.setup_card_rows[0],
-            last_evaluated_at=_at(22, 5, day=DAY - timedelta(days=1)).isoformat(),
+            base,
+            setup_id=str(missed.id),
+            last_evaluated_at=_at(15, 5, 20, day=yesterday).isoformat(),
         ),
-        dict(
-            scenario.store.setup_card_rows[0],
-            setup_id=str(never.id),
-            last_evaluated_at=None,
-            latest_evaluation=None,
-        ),
+        dict(base, setup_id=str(never.id), last_evaluated_at=None, latest_evaluation=None),
     ]
     _, client = _client_for(scenario.store)
     body = client.get("/api/overview").json()
-    assert body["health"]["forecaster"]["open_setups"] == 2
-    assert body["health"]["forecaster"]["stale"] == 1
+    assert body["health"]["forecaster"]["open_setups"] == 3
+    assert body["health"]["forecaster"]["stale"] == 2
     (count_call,) = scenario.store.calls_matching("FROM setup_evaluations")
-    assert datetime.fromisoformat(count_call["since"]) == _at(0, 0)  # start of day fallback
-    assert body["health"]["last_scan"]["label"] == "LONDON"  # 08:03:52 is the only scan so far
-    assert body["risk"]["session"] == "LONDON"
+    assert datetime.fromisoformat(count_call["since"]) == _at(22, 5, day=yesterday)
+    assert body["health"]["last_scan"] is None  # no scan yet today
+    assert body["risk"]["session"] == "ASIAN" and body["risk"]["session_blocked"] is True
+    assert datetime.fromisoformat(body["risk"]["next_scan_at"]) == _at(8, 3)
+
+
+def test_overview_sweep_in_flight_uses_previous_sweep(
+    scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 13:06: the 13:05 sweep is still inside its 3-minute budget, so the 08:05 sweep is
+    # the reference and a setup it evaluated (08:05:30) is NOT flagged stale.
+    in_flight = _at(13, 6)
+    monkeypatch.setattr(assembly, "utcnow", lambda: in_flight)
+    base = scenario.store.setup_card_rows[0]
+    scenario.store.setup_card_rows = [dict(base, last_evaluated_at=_at(8, 5, 30).isoformat())]
+    _, client = _client_for(scenario.store)
+    body = client.get("/api/overview").json()
+    assert body["health"]["forecaster"]["stale"] == 0
+    (count_call,) = scenario.store.calls_matching("FROM setup_evaluations")
+    assert datetime.fromisoformat(count_call["since"]) == _at(8, 5)
 
 
 def test_overview_with_nothing_today(frozen_clock: datetime) -> None:
@@ -777,8 +805,8 @@ def test_setups_open_cards(client: TestClient, scenario: Scenario) -> None:
         "take_profit_2": 110.0,
         "opened_at": "2026-10-20T08:04:00Z",
         "age_seconds": 5 * 3600 + 6 * 60,  # 08:04 -> 13:10
-        "last_evaluated_at": "2026-10-20T13:04:00Z",
-        "evaluation_age_seconds": 6 * 60,
+        "last_evaluated_at": "2026-10-20T13:05:30Z",
+        "evaluation_age_seconds": 4 * 60 + 30,
         "latest_status": "AT_RISK",
         "latest_reasoning": "price near the stop",
         "unrealised_r": None,
@@ -976,7 +1004,7 @@ def test_lifecycle_published_signal(client: TestClient, scenario: Scenario) -> N
     setup = body["setup"]
     assert setup["setup_id"] == str(scenario.setup.id)
     assert setup["age_seconds"] == 5 * 3600 + 6 * 60
-    assert setup["evaluation_age_seconds"] == 6 * 60
+    assert setup["evaluation_age_seconds"] == 4 * 60 + 30
     assert setup["latest_status"] == "AT_RISK" and setup["entry_price"] == 100.0
 
 

@@ -43,6 +43,8 @@ async def overview(store: StoreDep) -> OverviewResponse:
     cards = await list_open_setup_cards(store)
     scans = await list_scan_runs_since(store, since=start_of_day)  # bounded to the UTC day
     rows = await list_signals_for_scans(store, scan_ids=[scan.id for scan in scans])
+    # The last finished Forecaster sweep (a separate :05 invocation; spans yesterday's
+    # windows, so it is set in practice -- the start-of-day fallback is degenerate-only).
     sweep_at = assembly.last_sweep_at(now)
     evaluations, errors = await count_evaluations_since(store, since=sweep_at or start_of_day)
 
