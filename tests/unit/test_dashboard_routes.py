@@ -346,11 +346,13 @@ class Scenario:
     vetoed_runs: list[StoredAgentRun]
     ny_published: StoredSignal
     gate_rejected: StoredSignal
+    yesterday_wrap_scan: UUID
 
 
 def _scenario() -> Scenario:
     store = FakeStore()
     two_days_ago = DAY - timedelta(days=2)
+    yesterday = DAY - timedelta(days=1)
 
     # LONDON window, BTCUSDT: published with caveat, OPEN setup, two evaluations.
     s1 = uuid4()
@@ -528,8 +530,14 @@ def _scenario() -> Scenario:
         "last_evaluated_at": EVALUATED_AT.isoformat(),
         "latest_evaluation": json.dumps(setup.latest_evaluation),
     }
+    # Yesterday's DAILY_WRAP ran (review-only: no journal row); it is the last-scan
+    # badge overnight and must never show up in today's windows / chips.
+    s5 = uuid4()
     store.scan_rows = [
         _scan_row(s3, started_at=_at(13, 3, 40, day=two_days_ago), symbol="SOLUSDT", session="NY"),
+        _scan_row(
+            s5, started_at=_at(22, 3, 5, day=yesterday), symbol="BTCUSDT", session="COOLDOWN"
+        ),
         _scan_row(s1, started_at=_at(8, 3, 52), symbol="BTCUSDT", session="LONDON"),
         _scan_row(s2, started_at=_at(13, 3, 40), symbol="ETHUSDT", session="NY"),
         _scan_row(s4, started_at=_at(13, 3, 41), symbol="SOLUSDT", session="NY"),
@@ -575,6 +583,7 @@ def _scenario() -> Scenario:
         vetoed_runs=vetoed_runs,
         ny_published=ny_published,
         gate_rejected=gate_rejected,
+        yesterday_wrap_scan=s5,
     )
 
 
@@ -662,10 +671,11 @@ def test_overview_health_strip(client: TestClient, scenario: Scenario) -> None:
         "evaluations_last_window": 1,
         "errors_last_window": 0,
     }
-    # Scans are bounded to the current UTC day; evaluations are counted since the
-    # start of the last finished sweep (13:05 + 3 min budget <= 13:10).
+    # Scans are fetched from the start of YESTERDAY (so the last-scan badge is never
+    # blind overnight); evaluations are counted since the start of the last finished
+    # sweep (13:05 + 3 min budget <= 13:10).
     (scan_call,) = scenario.store.calls_matching("FROM scan_runs")
-    assert datetime.fromisoformat(scan_call["since"]) == _at(0, 0)
+    assert datetime.fromisoformat(scan_call["since"]) == _at(0, 0, day=DAY - timedelta(days=1))
     (count_call,) = scenario.store.calls_matching("FROM setup_evaluations")
     assert datetime.fromisoformat(count_call["since"]) == _at(13, 5)
 
@@ -696,9 +706,11 @@ def test_overview_windows_today(client: TestClient, scenario: Scenario) -> None:
     ]
     assert overlap["scan"] is None and overlap["symbols"] == []
     assert wrap["scan"] is None and wrap["symbols"] == []
-    # Only today's scans were asked for; the two-day-old scan never reached the chips query.
+    # Only today's scans reach the chips query: neither the two-day-old scan (outside
+    # the fetch window) nor yesterday's wrap (fetched for the last-scan badge only).
     (chips_call,) = scenario.store.calls_matching("string_to_array(:ids")
     assert str(scenario.vetoed.scan_id) not in chips_call["ids"]
+    assert str(scenario.yesterday_wrap_scan) not in chips_call["ids"]
 
 
 def test_overview_stale_across_midnight(
@@ -746,7 +758,14 @@ def test_overview_stale_across_midnight(
     assert body["health"]["forecaster"]["stale"] == 2
     (count_call,) = scenario.store.calls_matching("FROM setup_evaluations")
     assert datetime.fromisoformat(count_call["since"]) == _at(22, 5, day=yesterday)
-    assert body["health"]["last_scan"] is None  # no scan yet today
+    # No scan yet today: the badge shows YESTERDAY's wrap, not "none" (overnight blind spot).
+    last = body["health"]["last_scan"]
+    assert last["label"] == "DAILY_WRAP" and last["symbols"] == ["BTCUSDT"]
+    assert datetime.fromisoformat(last["started_at"]) == _at(22, 3, 5, day=yesterday)
+    (scan_call,) = scenario.store.calls_matching("FROM scan_runs")
+    assert datetime.fromisoformat(scan_call["since"]) == _at(0, 0, day=yesterday)
+    # Yesterday's wrap is fetched for the badge only: today's windows stay empty.
+    assert all(w["scan"] is None and w["symbols"] == [] for w in body["windows_today"])
     assert body["risk"]["session"] == "ASIAN" and body["risk"]["session_blocked"] is True
     assert datetime.fromisoformat(body["risk"]["next_scan_at"]) == _at(8, 3)
 

@@ -71,6 +71,7 @@ __all__ = [
     "last_scan_outcome",
     "last_sweep_at",
     "lifecycle_step",
+    "scans_on",
     "setup_card_for_signal",
     "setup_card_out",
     "signal_row_out",
@@ -183,7 +184,8 @@ def window_outcome(label: str, scans: Sequence[StoredScanRun]) -> WindowOutcome:
     )
 
 
-def _scans_on(scans: Sequence[StoredScanRun], day: date) -> list[StoredScanRun]:
+def scans_on(scans: Sequence[StoredScanRun], day: date) -> list[StoredScanRun]:
+    """The scan rows that started on the UTC date ``day`` (order preserved)."""
     return [s for s in scans if s.started_at.astimezone(UTC).date() == day]
 
 
@@ -211,7 +213,7 @@ def bucket_windows(
     later -- and rows from other UTC dates appear in no window. Chips are the
     journal rows of the window's scans, sorted by symbol.
     """
-    todays = _scans_on(scans, day)
+    todays = scans_on(scans, day)
     by_label: dict[str, list[StoredScanRun]] = {}
     for scan in todays:
         by_label.setdefault(window_for(scan.started_at), []).append(scan)
@@ -230,27 +232,33 @@ def bucket_windows(
     return summaries
 
 
-def last_scan_outcome(scans: Sequence[StoredScanRun], *, day: date) -> WindowOutcome | None:
-    """The most recent scan on ``day`` as a window outcome, or ``None`` if none ran yet.
+def last_scan_outcome(scans: Sequence[StoredScanRun]) -> WindowOutcome | None:
+    """The most recent scan in ``scans`` as a window outcome, or ``None`` if there is none.
 
-    The latest row names the group: every row of the same scheduled window, or
-    -- for an ``AD_HOC`` row -- the ``AD_HOC`` rows that started within
+    Deliberately not bounded to a UTC day: the router fetches from the start of
+    *yesterday*, so overnight (00:00-08:03) the badge shows yesterday's
+    ``DAILY_WRAP`` rather than "no scan" -- the window list, not this badge, is
+    what is scoped to today (:func:`bucket_windows`).
+
+    The latest row names the group: every row of the same scheduled window **on
+    the same UTC date** (yesterday's LONDON rows never join today's), or -- for
+    an ``AD_HOC`` row -- the ``AD_HOC`` rows that started within
     :data:`AD_HOC_GROUP_TOLERANCE` before it (one invocation's per-symbol rows).
     """
-    todays = _scans_on(scans, day)
-    if not todays:
+    if not scans:
         return None
-    latest = max(todays, key=lambda s: (s.started_at, str(s.id)))
+    latest = max(scans, key=lambda s: (s.started_at, str(s.id)))
+    same_day = scans_on(scans, latest.started_at.astimezone(UTC).date())
     label = window_for(latest.started_at)
     if label == AD_HOC:
         group = [
             s
-            for s in todays
+            for s in same_day
             if window_for(s.started_at) == AD_HOC
             and timedelta(0) <= latest.started_at - s.started_at <= AD_HOC_GROUP_TOLERANCE
         ]
     else:
-        group = [s for s in todays if window_for(s.started_at) == label]
+        group = [s for s in same_day if window_for(s.started_at) == label]
     return window_outcome(label, group)
 
 

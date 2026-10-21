@@ -108,7 +108,10 @@ class HealthStrip(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    last_scan: WindowOutcome | None = Field(description="Most recent scan today; null if none.")
+    last_scan: WindowOutcome | None = Field(
+        description="Most recent scan since the start of yesterday UTC (overnight this is "
+        "yesterday's DAILY_WRAP); null only if nothing ran in that span."
+    )
     forecaster: ForecasterCoverage
     alarms: None = Field(default=None, description="CloudWatch alarm states; " + PENDING_4_3)
     alarms_note: str = PENDING_4_3

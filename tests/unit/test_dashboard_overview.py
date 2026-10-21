@@ -341,8 +341,8 @@ def test_bucket_windows_empty_day() -> None:
 def test_last_scan_outcome_groups_the_latest_window() -> None:
     btc = _scan(_at(8, 3, 52), symbol="BTCUSDT")
     eth = _scan(_at(8, 3, 53), symbol="ETHUSDT", status=ScanStatus.FAILED, error="boom")
-    assert last_scan_outcome([], day=DAY) is None
-    outcome = last_scan_outcome([eth, btc], day=DAY)
+    assert last_scan_outcome([]) is None
+    outcome = last_scan_outcome([eth, btc])
     assert outcome is not None
     assert outcome.label == "LONDON" and outcome.symbols == ["BTCUSDT", "ETHUSDT"]
     assert outcome.status is ScanStatus.FAILED and outcome.started_at == _at(8, 3, 52)
@@ -353,7 +353,7 @@ def test_last_scan_outcome_ad_hoc_groups_only_co_started_rows() -> None:
     early_manual = _scan(_at(9, 0), symbol="BTCUSDT", session="AD_HOC")
     manual_btc = _scan(_at(10, 0, 0), symbol="BTCUSDT", session="AD_HOC")
     manual_eth = _scan(_at(10, 0, 3), symbol="ETHUSDT", session="AD_HOC", status=ScanStatus.RUNNING)
-    outcome = last_scan_outcome([london, early_manual, manual_btc, manual_eth], day=DAY)
+    outcome = last_scan_outcome([london, early_manual, manual_btc, manual_eth])
     assert outcome is not None
     assert outcome.label == AD_HOC
     assert outcome.symbols == ["BTCUSDT", "ETHUSDT"]  # the 09:00 run is a separate invocation
@@ -361,9 +361,27 @@ def test_last_scan_outcome_ad_hoc_groups_only_co_started_rows() -> None:
     assert timedelta(seconds=3) <= AD_HOC_GROUP_TOLERANCE < timedelta(hours=1)
 
 
-def test_last_scan_outcome_ignores_other_days() -> None:
-    yesterday = _scan(_at(22, 3, 5, day=DAY - timedelta(days=1)))
-    assert last_scan_outcome([yesterday], day=DAY) is None
+def test_last_scan_outcome_spans_days() -> None:
+    # Overnight (before today's first window) the badge must show YESTERDAY's wrap,
+    # not "no scan": the latest row wins regardless of its UTC date.
+    yesterday = DAY - timedelta(days=1)
+    wrap_btc = _scan(_at(22, 3, 5, day=yesterday), symbol="BTCUSDT", session="COOLDOWN")
+    wrap_eth = _scan(_at(22, 3, 6, day=yesterday), symbol="ETHUSDT", session="COOLDOWN")
+    outcome = last_scan_outcome([wrap_eth, wrap_btc])
+    assert outcome is not None
+    assert outcome.label == "DAILY_WRAP" and outcome.started_at == _at(22, 3, 5, day=yesterday)
+    assert outcome.symbols == ["BTCUSDT", "ETHUSDT"]
+    # Once today's first window has run, it is the latest -- yesterday's rows do not
+    # leak into its group.
+    london = _scan(_at(8, 3, 52), symbol="SOLUSDT")
+    today = last_scan_outcome([wrap_eth, wrap_btc, london])
+    assert today is not None
+    assert today.label == "LONDON" and today.symbols == ["SOLUSDT"]
+    # A window label groups by the window *and* its day: yesterday's LONDON rows
+    # are not part of today's LONDON outcome.
+    old_london = _scan(_at(8, 3, 50, day=yesterday), symbol="BNBUSDT")
+    again = last_scan_outcome([old_london, london])
+    assert again is not None and again.symbols == ["SOLUSDT"]
 
 
 # ---------------------------------------------------------------------------
