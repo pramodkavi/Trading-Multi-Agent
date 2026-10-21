@@ -31,7 +31,9 @@ Why ``GET /api/health`` is open and DB-free (design §6.1): it is the deploy
 smoke test and returns only ``{"status": "ok", "version": <APP_VERSION>}``. It
 must never touch the database or any AWS API -- an unauthenticated probe that
 woke Aurora would let any scanner keep it awake (~$25/month). It is the ONLY
-unauthenticated route; every other route lands behind the authorizer.
+unauthenticated route; since Step 4.4 every other ``/api/*`` path is served by
+``ANY /api/{proxy+}`` behind the Cognito JWT authorizer (API Gateway prefers
+the more specific health route).
 
 Why the role is so small (design §8): ``grant_data_api_access`` on the one
 cluster + its credential secret, CloudWatch Logs write and -- since Step 4.3 --
@@ -58,6 +60,14 @@ the next steps add here: 4.4 the Cognito user pool + JWT authorizer and the
 (private S3 bucket + CloudFront, which also fronts ``/api/*`` so SPA and API
 share one origin); 4.7 the SSM parameter publishing the base URL for the
 Telegram deep links (design §7).
+
+Step 4.4 (done) added the one-user Cognito pool (admin-created only, LITE plan,
+optional TOTP, RETAINED with deletion protection), its classic Hosted UI
+domain, the public PKCE app client (callback = the local token helper
+``scripts/dashboard_token.py``; 4.5 adds the CloudFront URLs), the
+``HttpUserPoolAuthorizer`` and the ``ANY /api/{proxy+}`` route that uses it.
+The app adds a second layer (``src/dashboard/api/auth.py``): under Lambda, a
+non-health request without JWT claims is a 401. Runbook: docs/operations.md §8.7.
 """
 
 from __future__ import annotations
@@ -288,7 +298,8 @@ class DashboardStack(Stack):
             ),
         )
         # One integration object shared by both routes: CDK binds it once per API,
-        # so there is one AWS::ApiGatewayV2::Integration + one Lambda permission.
+        # so there is one AWS::ApiGatewayV2::Integration -- but it adds one Lambda
+        # permission per route (2 here: health + proxy, each scoped to its route).
         self.integration = integrations.HttpLambdaIntegration("HealthIntegration", self.function)
         health_routes = self.http_api.add_routes(
             path=HEALTH_PATH,

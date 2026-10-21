@@ -499,17 +499,26 @@ cluster ARN + DB secret ARN imports):
 |---|---|
 | Lambda `DashboardApi` | python3.11, 512 MB, 25 s timeout, **outside the VPC**; handler `src.dashboard.api.app.handler` (FastAPI wrapped by Mangum); env `PERSISTENCE_BACKEND=dataapi`, `DB_CLUSTER_ARN`, `DB_SECRET_ARN`, `DB_NAME`, `APP_VERSION`, `LOG_LEVEL` |
 | Its own `DepsLayer` | built by `lambda_assets.deps_layer(..., extras=("dashboard",))` — base deps + `fastapi` + `mangum` (~136 MB); the scan Lambda's layer is unchanged |
-| HTTP API `crypto-signals-dashboard` | one route `GET /api/health` (no authorizer yet — Step 4.4 adds the Cognito JWT authorizer); `$default` stage, auto-deploy, throttle 10 rps / burst 20 |
+| HTTP API `crypto-signals-dashboard` | two routes, one shared Lambda integration: `GET /api/health` (**open**, no authorizer) and, since Step 4.4, `ANY /api/{proxy+}` behind the Cognito JWT authorizer `DashboardJwtAuthorizer` (validates issuer, client id and expiry); `$default` stage, auto-deploy, throttle 10 rps / burst 20, no CORS |
+| Cognito (Step 4.4) | user pool `crypto-signals-dashboard`: one admin-created user (no self-signup), email sign-in (case-insensitive), password ≥ 12 with lower + upper + digit + symbol, temp password valid 3 days, optional TOTP MFA (no SMS), email-only recovery, LITE plan; **retained** on stack delete + deletion protection. Hosted UI prefix domain `crypto-signals-dash-<account-id>` (classic Hosted UI). Public app client `DashboardSpaClient`: authorization code + PKCE only, SRP, scopes `openid email profile`, callback `http://localhost:8765/callback` (the token helper; Step 4.5 adds CloudFront), access / ID tokens 1 h, refresh 30 d, token revocation on |
 | Log groups | `DashboardApiLogs` (function) + `DashboardApiAccessLogs` (API access log), 14-day retention |
 | IAM role | RDS Data API on the one cluster + read of its secret, CloudWatch Logs write; since Step 4.3 CloudWatch read (`DescribeAlarms` on `CryptoSignals-Monitoring-*`, `ListMetrics` + `GetMetricData` on `*`) — **no SSM, no S3, no Lambda** |
-| Outputs | `DashboardApiUrl`, `DashboardFunctionName` |
+| Outputs | `DashboardApiUrl`, `DashboardFunctionName`; since Step 4.4 `DashboardUserPoolId`, `DashboardUserPoolClientId`, `DashboardCognitoDomain` (Hosted UI base URL `https://<prefix>.auth.<region>.amazoncognito.com`), `DashboardJwtIssuer` |
 
-Nothing else is reachable until **Step 4.4** adds the Cognito JWT authorizer and the
-`ANY /api/{proxy+}` route: the Step 4.2 and 4.3 data routes (overview / setups /
-signals, market, funnel, analytics, Critic, system health) exist in the FastAPI app
-but are console-only until then (§8.6). The
-health route does not open a DB call, so browsing it never wakes the cluster; the
-Data API grant is what the 4.2 routes use.
+Since **Step 4.4** every `/api/*` route except `GET /api/health` — the Step 4.2 and
+4.3 data routes (overview / setups / signals, market, funnel, analytics, Critic,
+system health) and `/api/docs` / `/api/openapi.json` — is reachable through the API
+URL **with** `Authorization: Bearer <access token>` (§8.6, login in §8.7). Without
+a valid token API Gateway answers **401** before the Lambda runs (nothing is
+invoked, the cluster is not woken). The health route does not open a DB call, so
+browsing it never wakes the cluster; the Data API grant is what the data routes use.
+
+The user pool is **retained**: deleting the stack (§8.5) leaves the pool (and its
+user) in place, and a recreated stack creates a **new, empty** pool — re-create the
+user there (§8.7) and delete the orphan by hand once deletion protection is turned
+off, if wanted (it costs nothing). cdk-nag `AwsSolutions-COG2` (MFA not required),
+`-COG3` (advanced security) and `-COG8` (Plus plan) are suppressed on the pool only,
+with reasons in `dashboard_stack.py` (single operator; paid tiers).
 
 ### 8.2 Where the API URL is
 
@@ -535,11 +544,12 @@ should match the merge commit that triggered the deploy — if it does not, the 
 ran from a different commit than expected (`APP_VERSION` is baked at synth time).
 
 The FastAPI app also defines `/api/openapi.json` and `/api/docs` (`openapi_url` /
-`docs_url` in `create_app()`), but in Step 4.1 the HTTP API routes **only**
-`GET /api/health` — any other path (including those two) returns API Gateway's
-`{"message":"Not Found"}`. They become reachable in **Step 4.4**, which routes
-`ANY /api/{proxy+}` behind the JWT authorizer (design §6: "OpenAPI served at
-`/api/docs` (behind the authorizer)").
+`docs_url` in `create_app()`). Since **Step 4.4** they sit behind the JWT authorizer
+like every other non-health route (design §6: "OpenAPI served at `/api/docs`
+(behind the authorizer)"): `curl` with a token works, but a browser cannot send the
+`Authorization` header, so `/api/docs` is **not browsable directly** until the SPA
+(Step 4.5) — a plain browser visit gets API Gateway's 401 `{"message":"Unauthorized"}`.
+Paths outside `/api/` still return API Gateway's `{"message":"Not Found"}`.
 
 A request also produces one line in `DashboardApiAccessLogs` — since Step 4.2 a
 JSON object per request (`routeKey`, `path`, `status`, … — fields in §8.6). Before
@@ -551,19 +561,21 @@ JSON object per request (`routeKey`, `path`, `status`, … — fields in §8.6).
 The function is zip-packaged like the scan Lambda (§4.1): **Code** tab shows
 `src/dashboard/api/…`, Deploy, then call the URL. The same caveat applies — any
 `cdk deploy` replaces console edits with the git contents. For `/api/health` use
-the URL; for the data routes, which are not routed until Step 4.4, use the
-console **Test** event in §8.6.
+the URL; for the data routes use the URL with a token (§8.7) or the console
+**Test** event in §8.6 (which must carry authorizer claims since Step 4.4).
 
 ### 8.5 Removal
 
 The stack is independent: deleting `CryptoSignals-Dashboard` in the CloudFormation
 console removes the API, function, layer and log groups without touching the
-pipeline stacks. No workflow exposes `cdk destroy` for it (the deploy workflow's
+pipeline stacks. The Cognito user pool is **retained** (RETAIN + deletion
+protection, Step 4.4): it survives the delete, and the recreated stack makes a new
+empty pool (§8.1). No workflow exposes `cdk destroy` for it (the deploy workflow's
 `recreate_stateless_stacks` covers Monitoring / Scheduling / Compute only), and the
 hard rule rules out a local CLI — the console delete is the path. Note that the next
 `cdk deploy --all` recreates it.
 
-### 8.6 Data routes before Step 4.4 (console-only)
+### 8.6 Data routes (behind the JWT authorizer since Step 4.4)
 
 Step 4.2 added the first data routes to the FastAPI app (`src/dashboard/api/routers/`):
 
@@ -577,7 +589,7 @@ Step 4.2 added the first data routes to the FastAPI app (`src/dashboard/api/rout
 | `GET /api/signals/{id}/runs/{run_id}` | one agent run's full output |
 
 Step 4.3 added the market, funnel, analytics, Critic and system-health routes
-(same app, same console-only status):
+(same app, same authorizer):
 
 | Route | Returns |
 |---|---|
@@ -651,18 +663,26 @@ dashboard role grants below. IAM (Step 4.3): `cloudwatch:DescribeAlarms` on
 resource-level permissions — the `AwsSolutions-IAM5` suppression is justified in
 `dashboard_stack.py`). Still no `ssm:`, `s3:` or `lambda:`.
 
-**None of these is routed through the HTTP API yet.** The API still has the single
-route `GET /api/health`; every other path returns API Gateway's
-`{"message":"Not Found"}`. The data routes read Aurora, and there is no
-authentication until Step 4.4 adds the Cognito JWT authorizer — routing them earlier
-would let any scanner read the journal and keep the cluster awake. Step 4.4 adds
-`ANY /api/{proxy+}` behind the authorizer; until then the only way to exercise a
-data route is the Lambda console.
+**Routing and auth (Step 4.4).** All of these are served by `ANY /api/{proxy+}`
+behind the Cognito JWT authorizer: call them through the API URL with
+`Authorization: Bearer <access token>` (get one with the helper, §8.7). Without a
+valid token API Gateway answers **401** `{"message":"Unauthorized"}` before the
+Lambda runs — the data routes read Aurora, so an unauthenticated scanner can neither
+read the journal nor keep the cluster awake. **Second layer:** under Lambda the app
+itself (`src/dashboard/api/auth.py`, `AuthorizerClaimsMiddleware`) rejects every
+request except `/api/health` whose event lacks `requestContext.authorizer.jwt.claims`
+with a non-empty `sub` — **401** `{"reason":"unauthorized"}`, no route / DB / AWS
+call. So a console Test event must carry claims (below), and an unknown or mistyped
+path without claims answers 401, not 404. Outside Lambda (TestClient, local uvicorn)
+the middleware is a no-op.
 
 **Exercising one from the Lambda console.** Lambda → `DashboardApi…` function →
 **Test** → create a new event (name it e.g. `api-overview`) with a minimal API
 Gateway **v2** (HTTP API) payload — Mangum needs `version`, `rawPath`,
-`rawQueryString`, `headers` and `requestContext.http`; the rest is filler:
+`rawQueryString`, `headers` and `requestContext.http`; the app's second layer needs
+`requestContext.authorizer.jwt.claims` with a `sub` (any non-empty string — the
+console bypasses API Gateway, so nothing validates it; the claims are what the
+authorizer would have passed); the rest is filler:
 
 ```json
 {
@@ -674,6 +694,7 @@ Gateway **v2** (HTTP API) payload — Mangum needs `version`, `rawPath`,
   "requestContext": {
     "http": {"method": "GET", "path": "/api/overview", "protocol": "HTTP/1.1",
              "sourceIp": "127.0.0.1", "userAgent": "console"},
+    "authorizer": {"jwt": {"claims": {"sub": "console-test"}, "scopes": null}},
     "requestId": "console", "stage": "$default", "routeKey": "GET /api/overview",
     "accountId": "097853039368", "apiId": "s2bc8yifa1",
     "domainName": "s2bc8yifa1.execute-api.ap-south-1.amazonaws.com",
@@ -713,6 +734,7 @@ Two Step 4.3 examples, as edits of the event above (everything else unchanged):
 
 | Status | Body | When |
 |---|---|---|
+| 401 | `{"reason":"unauthorized"}` | under Lambda, a request other than `/api/health` whose event has no JWT authorizer claims with a `sub` (console Test event without `authorizer`, a route wired without the authorizer, an unknown path); the route never runs. API Gateway's own rejection of a missing / invalid / expired token is a different body, `{"message":"Unauthorized"}`, and never reaches the Lambda |
 | 503 + `Retry-After: 10` | `{"reason":"db_resuming"}` | Aurora is waking from scale-to-zero (`DatabaseResumingException`). The dashboard store is built with `resume_attempts=1` — **no retry**, the first resume error propagates at once (the scan Lambda's default budget is 6 attempts / ~75 s) — because an HTTP request behind API Gateway's 30 s cap cannot wait out the resume. |
 | 502 | `{"reason":"db_error"}` | any other Data API `ClientError`; the AWS code + message are in the function log at WARNING, never in the body |
 | 404 | `{"reason":"not_found"}` | `/api/signals/{id}` or `/runs/{run_id}` addresses a row that does not exist |
@@ -741,5 +763,58 @@ per request to `DashboardApiAccessLogs` (`ACCESS_LOG_FORMAT` in
 the raw request path (populated even when no route matched); `integrationError`
 is non-empty only when API Gateway, not the app, produced the 5xx. From Step 4.4 these
 lines are also the only record of requests the JWT authorizer rejects before the
-Lambda runs. Console Test invocations bypass the API and therefore write no access-log
+Lambda runs: such a line has `"routeKey":"ANY /api/{proxy+}"`, `"status":"401"` and
+**no** `integrationLatency` (`"-"`), and the function log has nothing for it. Console Test invocations bypass the API and therefore write no access-log
 line — only the function log.
+
+### 8.7 Login and tokens (Step 4.4)
+
+One operator, one Cognito user, no SPA yet (Step 4.5): tokens come from the local
+PKCE helper `scripts/dashboard_token.py` (stdlib only; authorization code + PKCE
+S256 through the classic Hosted UI; nothing is written to disk).
+
+1. **Read the outputs.** After the Step 4.4 deploy: CloudFormation console →
+   `CryptoSignals-Dashboard` → **Outputs** → `DashboardUserPoolId`,
+   `DashboardUserPoolClientId`, `DashboardCognitoDomain` (plus `DashboardApiUrl`).
+   Record them in `docs/PROJECT_STATE.md §3`.
+2. **Create the user (once).** Cognito console → user pool `crypto-signals-dashboard`
+   (the `DashboardUserPoolId`) → **Users** → **Create user**: email address as the
+   username, **Send an email invitation**, set (or generate) a **temporary
+   password** (≥ 12 chars, lower + upper + digit + symbol; valid 3 days). There is
+   no self-signup — this is the only way in.
+3. **Get a token** (from the repo root, port **8765** must be free — the app client's
+   only registered callback is `http://localhost:8765/callback`, so do not change
+   `--port` unless that URL is changed too):
+
+   ```powershell
+   .\.venv\Scripts\python.exe -m scripts.dashboard_token `
+     --domain <DashboardCognitoDomain> --client-id <DashboardUserPoolClientId> `
+     --call <DashboardApiUrl>/api/system/db
+   ```
+
+   It binds `127.0.0.1:8765`, opens the browser at the Hosted UI (the URL is also
+   printed on stderr), and waits up to 120 s for the callback. The **first sign-in
+   forces the password change** from the temporary password. **stdout is the access
+   token only** (so `$token = .\.venv\Scripts\python.exe -m scripts.dashboard_token ...`
+   works); with `--call` (must be `https://`) the HTTP status and the first 500
+   characters of the body go to **stderr**. Errors are one `error:` line, exit
+   non-zero, the token redacted.
+4. **Optional TOTP MFA.** MFA is optional (TOTP only, never SMS). Enrol an
+   authenticator app at the Hosted UI prompt or from the Cognito console (user →
+   MFA); later sign-ins then ask for the code.
+5. **Call the API** (`<api>` = `DashboardApiUrl`):
+
+   ```bash
+   curl -s -i <api>/api/overview                                   # 401 {"message":"Unauthorized"} (no token; Lambda not invoked)
+   curl -s -i -H "Authorization: Bearer $TOKEN" <api>/api/overview # 200 (first call after idle may be 503 db_resuming)
+   curl -s <api>/api/health                                        # 200 without a token
+   ```
+
+**Token validity.** Access and ID tokens last **1 h**, refresh tokens 30 d (the
+helper uses only the access token; re-run it after an hour). The authorizer checks
+the issuer (`DashboardJwtIssuer`), the client id and expiry; an expired token is a
+401 from API Gateway. **Where 401s show up:** API Gateway's rejections only in
+`DashboardApiAccessLogs` (`status` 401, no `integrationLatency`, §8.6); the app's
+own `{"reason":"unauthorized"}` (missing claims) is a normal invocation in the
+function log. `/api/docs` needs a token, so it is not browsable directly until the
+SPA (Step 4.5).

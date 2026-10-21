@@ -277,6 +277,9 @@ OpenAPI served at `/api/docs` (behind the authorizer). Pagination is `?limit=&cu
 
 ### 6.1 Endpoints
 
+*Status (Step 4.4, 2026-10-21): done — every route below sits behind the Cognito JWT authorizer
+(`ANY /api/{proxy+}`) except `GET /api/health`, which stays open; runbook `docs/operations.md §8.7`.*
+
 | Route | Page | Returns |
 |---|---|---|
 | `GET /api/health` (no auth) | deploy smoke test only | `{status:"ok", version}` — **must not touch the database or any AWS API**; an unauthenticated probe that woke Aurora would let any scanner keep it awake (~$25/month). No external uptime monitor consumes it. |
