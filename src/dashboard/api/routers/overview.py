@@ -16,11 +16,15 @@ Only today's rows feed the window list and the per-symbol chips.
 Step 4.3: the OPEN setup cards carry a best-effort unrealised R -- one
 `market.latest_prices` call (one provider, one fetch per distinct symbol,
 5 s overall budget). Binance down or slow leaves `unrealised_r` null with
-"price unavailable"; the landing page is still 200.
+"price unavailable"; the landing page is still 200. The alarm strip is one
+CloudWatch `DescribeAlarms` (`cloudwatch.read_alarms`), run concurrently with
+the price fetch; a CloudWatch error leaves `alarms` null with
+`alarms_note = "cloudwatch unavailable"` -- still 200.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter
@@ -28,6 +32,7 @@ from fastapi import APIRouter
 from src.agents.orchestration.risk_gates import gather_risk_context
 from src.dashboard.api import market
 from src.dashboard.api import overview as assembly
+from src.dashboard.api.cloudwatch import CloudWatchDep, read_alarms
 from src.dashboard.api.deps import StoreDep
 from src.dashboard.api.errors import DATA_ROUTE_RESPONSES
 from src.dashboard.api.market import ProviderFactoryDep
@@ -43,7 +48,9 @@ router = APIRouter(tags=["overview"], responses=DATA_ROUTE_RESPONSES)
 
 
 @router.get("/api/overview", response_model=OverviewResponse)
-async def overview(store: StoreDep, factory: ProviderFactoryDep) -> OverviewResponse:
+async def overview(
+    store: StoreDep, factory: ProviderFactoryDep, cw: CloudWatchDep
+) -> OverviewResponse:
     """Health strip, risk budget, OPEN setups and today's scan windows."""
     now = assembly.utcnow()
     day = now.astimezone(UTC).date()
@@ -62,9 +69,16 @@ async def overview(store: StoreDep, factory: ProviderFactoryDep) -> OverviewResp
     sweep_at = assembly.last_sweep_at(now)
     evaluations, errors = await count_evaluations_since(store, since=sweep_at or start_of_day)
     # Best-effort unrealised R (Step 4.3): bounded by the 5 s budget, never raises on a
-    # provider failure -- the cards then read "price unavailable".
-    prices = await market.latest_prices(
-        factory, sorted({card.symbol for card in cards}), now=now, budget_s=market.PRICE_BUDGET_S
+    # provider failure -- the cards then read "price unavailable". The alarm strip is
+    # fetched concurrently; a CloudWatch error leaves it null with a note, never a 5xx.
+    prices, (alarms, alarms_note) = await asyncio.gather(
+        market.latest_prices(
+            factory,
+            sorted({card.symbol for card in cards}),
+            now=now,
+            budget_s=market.PRICE_BUDGET_S,
+        ),
+        read_alarms(cw),
     )
 
     health = HealthStrip(
@@ -75,6 +89,8 @@ async def overview(store: StoreDep, factory: ProviderFactoryDep) -> OverviewResp
             evaluations_last_window=evaluations,
             errors_last_window=errors,
         ),
+        alarms=alarms,
+        alarms_note=alarms_note,
         db="ok",
     )
     return OverviewResponse(

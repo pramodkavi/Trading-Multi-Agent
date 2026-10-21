@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from datetime import date as date_type
 from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
@@ -52,22 +53,29 @@ __all__ = [
     "ASC_KEYSET_ORDER",
     "ASC_KEYSET_PREDICATE",
     "PAGE_LIMIT_SQL",
+    "ConfigFacts",
     "CriticReportSummary",
     "DashboardReader",
     "DecisionRow",
+    "EvaluationStamp",
     "JournalRow",
     "OutcomeRow",
     "ReviewSummary",
     "SetupCard",
     "SignalFilters",
+    "UsageDay",
+    "agent_usage_by_day",
+    "config_inference",
     "count_evaluations_since",
     "get_critic_report",
     "get_review",
     "get_setup_for_signal",
     "list_critic_reports",
     "list_decisions_between",
+    "list_evaluation_stamps",
     "list_open_setup_cards",
     "list_outcome_rows",
+    "list_recent_scan_runs",
     "list_reviews_page",
     "list_scan_runs_since",
     "list_signals_for_scans",
@@ -692,6 +700,169 @@ WHERE signal_id = :signal_id::uuid"""
     data["review"] = _parse_jsonb_field(data["review"])
     data["token_usage"] = _parse_jsonb_field(data["token_usage"])
     return StoredReview.model_validate(data)
+
+
+# ---------------------------------------------------------------------------
+# System health (P7, Step 4.3)
+# ---------------------------------------------------------------------------
+
+
+class UsageDay(BaseModel):
+    """Runs, failures and LLM spend of one agent role on one UTC day.
+
+    Three sources (design §4.2 P7): ``agent_runs`` (the scan pipeline -- a row is
+    only written on success, so ``errors`` is 0), ``setup_evaluations`` (role
+    ``forecaster``; ``ERROR`` rows are failures) and ``decision_reviews`` (role
+    ``critic``; a set ``error`` is a failure). Unpriced calls (NULL cost) add 0.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    date: date_type
+    role: str
+    runs: int = Field(ge=0)
+    errors: int = Field(ge=0)
+    cost_usd: float = Field(ge=0, description="Sum of cost_usd; NULL (unpriced) counts as 0.")
+
+
+class EvaluationStamp(BaseModel):
+    """One Forecaster evaluation reduced to what sweep bucketing needs."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    evaluated_at: datetime
+    is_error: bool
+
+
+class ConfigFacts(BaseModel):
+    """What the database says about the deployed configuration (design §8: inferred)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    watchlist: list[str] = Field(description="Union of scan_runs.symbols in the window.")
+    model: str | None = Field(description="Latest agent_runs.token_usage->>'model'.")
+    skeptic_outputs: int = Field(ge=0, description="How many recent Skeptic outputs were read.")
+    real_objections: int = Field(ge=0, description="... of which were not NoMacroData.")
+
+
+async def list_recent_scan_runs(reader: DashboardReader, *, limit: int = 50) -> list[StoredScanRun]:
+    """The latest ``limit`` scan runs, newest first (P7 scan history)."""
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    sql = f"""SELECT id::text AS id,
+       {_utc_iso("started_at", alias="started_at")},
+       {_utc_iso("completed_at", alias="completed_at")},
+       status, error_message, session, strategy, symbols
+FROM scan_runs
+ORDER BY started_at DESC, id DESC
+LIMIT :limit"""
+    rows = await reader.read_rows(sql, [_long_param("limit", limit)])
+    return [StoredScanRun.model_validate(row) for row in rows]
+
+
+def _utc_day(column: str) -> str:
+    return f"to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD')"
+
+
+# One statement, three sources, aggregated per (UTC day, role). A bounded result:
+# at most 30 days x 6 roles rows.
+_USAGE_BY_DAY_SQL = f"""SELECT day, role,
+       sum(runs)::bigint AS runs,
+       sum(errors)::bigint AS errors,
+       COALESCE(sum(cost_usd), 0)::double precision AS cost_usd
+FROM (
+    SELECT {_utc_day("created_at")} AS day, agent_role AS role,
+           count(*) AS runs, 0::bigint AS errors,
+           sum(cost_usd)::double precision AS cost_usd
+    FROM agent_runs
+    WHERE created_at >= :since::timestamptz
+    GROUP BY 1, 2
+    UNION ALL
+    SELECT {_utc_day("evaluated_at")} AS day, 'forecaster' AS role,
+           count(*) AS runs, count(*) FILTER (WHERE status = 'ERROR') AS errors,
+           sum(cost_usd)::double precision AS cost_usd
+    FROM setup_evaluations
+    WHERE evaluated_at >= :since::timestamptz
+    GROUP BY 1
+    UNION ALL
+    SELECT {_utc_day("created_at")} AS day, 'critic' AS role,
+           count(*) AS runs, count(*) FILTER (WHERE error IS NOT NULL) AS errors,
+           sum(cost_usd)::double precision AS cost_usd
+    FROM decision_reviews
+    WHERE created_at >= :since::timestamptz
+    GROUP BY 1
+) u
+GROUP BY day, role
+ORDER BY day ASC, role ASC"""
+
+
+async def agent_usage_by_day(reader: DashboardReader, *, since: datetime) -> list[UsageDay]:
+    """Per-day, per-role runs / failures / cost since ``since`` (P7 agents + LLM cost)."""
+    rows = await reader.read_rows(_USAGE_BY_DAY_SQL, [_str_param("since", since.isoformat())])
+    return [
+        UsageDay(
+            date=date_type.fromisoformat(str(row["day"])),
+            role=str(row["role"]),
+            runs=int(row.get("runs") or 0),
+            errors=int(row.get("errors") or 0),
+            cost_usd=float(row.get("cost_usd") or 0.0),
+        )
+        for row in rows
+    ]
+
+
+async def list_evaluation_stamps(
+    reader: DashboardReader, *, since: datetime
+) -> list[EvaluationStamp]:
+    """Every Forecaster evaluation since ``since`` as ``(evaluated_at, is_error)``, oldest first.
+
+    Two short columns per row: <= 3 open setups x 4 sweeps a day x 30 days.
+    """
+    sql = f"""SELECT {_utc_iso("evaluated_at", alias="evaluated_at")},
+       (status = 'ERROR') AS is_error
+FROM setup_evaluations
+WHERE evaluated_at >= :since::timestamptz
+ORDER BY evaluated_at ASC"""
+    rows = await reader.read_rows(sql, [_str_param("since", since.isoformat())])
+    return [EvaluationStamp.model_validate(row) for row in rows]
+
+
+# The last N Skeptic outputs decide "macro providers configured" (design §8).
+_SKEPTIC_SAMPLE = 10
+
+
+async def config_inference(reader: DashboardReader, *, since: datetime) -> ConfigFacts:
+    """The config panel's database facts (design §8 -- every value is inferred).
+
+    Watchlist = union of ``scan_runs.symbols`` since ``since``; model = the latest
+    ``token_usage->>'model'``; and how many of the last 10 Skeptic outputs are a
+    real objection rather than the NoMacroData sentinel (``{provider, reason}``).
+    """
+    watch_sql = """SELECT DISTINCT unnest(symbols) AS symbol
+FROM scan_runs
+WHERE started_at >= :since::timestamptz
+ORDER BY 1"""
+    watch = await reader.read_rows(watch_sql, [_str_param("since", since.isoformat())])
+    model_sql = """SELECT token_usage->>'model' AS model
+FROM agent_runs
+WHERE token_usage->>'model' IS NOT NULL
+ORDER BY created_at DESC
+LIMIT 1"""
+    model_rows = await reader.read_rows(model_sql, [])
+    # `output->'provider' IS NULL` = the key is absent (no `?` operator: the Data
+    # API parses SQL JDBC-style, see _OUTCOME_ROWS_SQL).
+    skeptic_sql = f"""SELECT (output->'provider') IS NULL AS real_objection
+FROM agent_runs
+WHERE agent_role = 'skeptic'
+ORDER BY created_at DESC
+LIMIT {_SKEPTIC_SAMPLE}"""
+    skeptic = await reader.read_rows(skeptic_sql, [])
+    return ConfigFacts(
+        watchlist=[str(row["symbol"]) for row in watch if row.get("symbol")],
+        model=str(model_rows[0]["model"]) if model_rows and model_rows[0].get("model") else None,
+        skeptic_outputs=len(skeptic),
+        real_objections=sum(1 for row in skeptic if row.get("real_objection")),
+    )
 
 
 async def count_evaluations_since(reader: DashboardReader, *, since: datetime) -> tuple[int, int]:

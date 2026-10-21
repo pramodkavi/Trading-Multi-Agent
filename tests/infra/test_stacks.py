@@ -435,19 +435,85 @@ def test_dashboard_log_groups_two_week_retention(templates: dict[str, Any]) -> N
         assert props["Properties"]["RetentionInDays"] == 14
 
 
-def test_dashboard_role_has_data_api_but_no_ssm(templates: dict[str, Any]) -> None:
+def _dashboard_statements(templates: dict[str, Any]) -> list[dict[str, Any]]:
     policies = templates["dashboard"].find_resources("AWS::IAM::Policy")
-    statements = [
-        s for p in policies.values() for s in p["Properties"]["PolicyDocument"]["Statement"]
-    ]
-    actions = {
-        a
-        for s in statements
-        for a in ([s["Action"]] if isinstance(s["Action"], str) else s["Action"])
-    }
+    return [s for p in policies.values() for s in p["Properties"]["PolicyDocument"]["Statement"]]
+
+
+def _actions(statement: dict[str, Any]) -> list[str]:
+    action = statement["Action"]
+    return [action] if isinstance(action, str) else list(action)
+
+
+def test_dashboard_role_has_data_api_but_no_ssm(templates: dict[str, Any]) -> None:
+    actions = {a for s in _dashboard_statements(templates) for a in _actions(s)}
     assert "rds-data:ExecuteStatement" in actions
     assert "secretsmanager:GetSecretValue" in actions
     assert not any(a.startswith(("ssm:", "s3:", "lambda:")) for a in actions)
+
+
+def test_dashboard_role_cloudwatch_read_only(templates: dict[str, Any]) -> None:
+    # Step 4.3 (design §8): the alarm strip + Lambda metrics, read-only.
+    statements = _dashboard_statements(templates)
+    cw = [s for s in statements if any(a.startswith("cloudwatch:") for a in _actions(s))]
+    actions = {a for s in cw for a in _actions(s)}
+    assert actions == {
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:ListMetrics",
+        "cloudwatch:GetMetricData",
+    }
+    assert all(s["Effect"] == "Allow" for s in cw)
+
+    (alarms,) = [s for s in cw if "cloudwatch:DescribeAlarms" in _actions(s)]
+    assert _actions(alarms) == ["cloudwatch:DescribeAlarms"]
+    rendered = json.dumps(alarms["Resource"])
+    assert ":cloudwatch:" in rendered
+    assert ":alarm:CryptoSignals-Monitoring-*" in rendered
+    assert alarms["Resource"] != "*"
+
+    (metrics,) = [s for s in cw if "cloudwatch:ListMetrics" in _actions(s)]
+    assert sorted(_actions(metrics)) == ["cloudwatch:GetMetricData", "cloudwatch:ListMetrics"]
+    assert metrics["Resource"] == "*"  # these two have no resource-level permissions
+
+    every = {a for s in statements for a in _actions(s)}
+    assert not any(a.startswith(("ssm:", "s3:", "lambda:")) for a in every)
+    assert not any(a.startswith("cloudwatch:") and a not in actions for a in every)
+
+
+def test_dashboard_cloudwatch_iam5_suppression_present(templates: dict[str, Any]) -> None:
+    # The `*` / alarm-prefix wildcards are justified in code (AwsSolutions-IAM5).
+    policies = templates["dashboard"].find_resources("AWS::IAM::Policy")
+    rules = [
+        rule
+        for p in policies.values()
+        for rule in p.get("Metadata", {}).get("cdk_nag", {}).get("rules_to_suppress", [])
+        if rule["id"] == "AwsSolutions-IAM5"
+    ]
+    assert rules, "expected a justified AwsSolutions-IAM5 suppression on the dashboard policy"
+    assert all("resource-level" in rule["reason"] for rule in rules)
+    applies = json.dumps([rule.get("applies_to") for rule in rules])
+    assert "Resource::*" in applies and "CryptoSignals-Monitoring-" in applies
+
+
+def test_dashboard_cloudwatch_grants_pass_cdk_nag() -> None:
+    # The fixture does not apply the nag aspect; run it on a fresh app so a malformed
+    # `appliesTo` (an unsuppressed IAM5 finding) fails here, not only in the full synth.
+    import aws_cdk as core
+    from aws_cdk import assertions as cdk_assertions
+    from cdk_nag import AwsSolutionsChecks
+    from stacks.dashboard_stack import DashboardStack
+    from stacks.data_stack import DataStack
+    from stacks.network_stack import NetworkStack
+
+    app = core.App(context={"aws:cdk:bundling-stacks": []})
+    network = NetworkStack(app, "Network")
+    data = DataStack(app, "Data", vpc=network.vpc, db_security_group=network.db_security_group)
+    dashboard = DashboardStack(app, "Dashboard", cluster=data.cluster, app_version="t")
+    core.Aspects.of(dashboard).add(AwsSolutionsChecks())
+    errors = cdk_assertions.Annotations.from_stack(dashboard).find_error(
+        "*", cdk_assertions.Match.string_like_regexp("AwsSolutions-IAM5")
+    )
+    assert errors == []
 
 
 def test_dashboard_imports_only_from_data_stack(templates: dict[str, Any]) -> None:

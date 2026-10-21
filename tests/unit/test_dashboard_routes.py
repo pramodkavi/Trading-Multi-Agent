@@ -30,9 +30,10 @@ from src.common.models import (
     SignalDirection,
     SignalStatus,
 )
-from src.dashboard.api import deps, market
+from src.dashboard.api import cloudwatch, deps, market
 from src.dashboard.api import overview as assembly
 from src.dashboard.api.app import create_app, handler
+from src.dashboard.api.cloudwatch import AlarmState, MetricDay, get_cloudwatch_reader
 from src.dashboard.api.cursor import decode_cursor, encode_cursor
 from src.dashboard.api.deps import get_store
 from src.dashboard.api.market import get_provider_factory
@@ -712,6 +713,21 @@ def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
     return NOW
 
 
+class _NoAlarmsReader:
+    """`CloudWatchReader` stand-in for the overview tests: no alarms, no boto3."""
+
+    async def describe_alarms(self, prefix: str) -> list[AlarmState]:
+        return []
+
+    async def scan_function_name(self) -> str | None:
+        return None
+
+    async def lambda_daily_metrics(
+        self, function_name: str, *, days: int = 7, now: datetime
+    ) -> list[MetricDay]:
+        return []
+
+
 def _client_for(
     store: FakeStore, factory: FakeProviderFactory | None = None
 ) -> tuple[FastAPI, TestClient]:
@@ -720,6 +736,8 @@ def _client_for(
     provider_factory = factory if factory is not None else default_factory()
     app.dependency_overrides[get_provider_factory] = lambda: provider_factory
     app.dependency_overrides[get_dashboard_settings] = make_settings
+    # The overview's alarm strip: never a real boto3 client in tests.
+    app.dependency_overrides[get_cloudwatch_reader] = _NoAlarmsReader
     return app, TestClient(app)
 
 
@@ -751,8 +769,9 @@ def test_overview_shape_and_risk_numbers(client: TestClient, scenario: Scenario)
     assert risk["seconds_to_next_scan"] == 6780  # 13:10 -> 15:03
     assert risk["seconds_to_next_scan"] > 0
 
-    assert body["health"]["alarms"] is None
-    assert body["health"]["alarms_note"] == "pending Step 4.3"
+    # Step 4.3: the alarm strip is CloudWatch's answer (the fake reader has none).
+    assert body["health"]["alarms"] == []
+    assert body["health"]["alarms_note"] is None
     assert body["health"]["db"] == "ok"
 
     assert len(body["open_setups"]) == 1
@@ -1374,6 +1393,13 @@ def test_openapi_lists_new_routes() -> None:
     }
 
 
+class _NoAlarmsCwClient:
+    """boto3 `cloudwatch` client stand-in for the import-time handler: one empty page."""
+
+    def describe_alarms(self, **_kwargs: Any) -> dict[str, Any]:
+        return {"MetricAlarms": [], "CompositeAlarms": []}
+
+
 @pytest.fixture
 def container_store(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeStore]:
     """Route the import-time `handler` app's `get_store()` at the fake (no override hook)."""
@@ -1385,6 +1411,8 @@ def container_store(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.setattr(DataApiSignalStore, "from_arns", lambda **_kwargs: scenario.store)
     # The import-time app has no override hook: swap the default factory itself.
     monkeypatch.setattr(market, "default_provider_factory", default_factory())
+    # ... and its CloudWatch client (the per-container cache) at a no-alarms fake.
+    monkeypatch.setattr(cloudwatch, "_CLIENT", _NoAlarmsCwClient())
     yield scenario.store
     deps.reset_store()
     get_dashboard_settings.cache_clear()
@@ -1398,6 +1426,7 @@ def test_mangum_serves_overview_event(container_store: FakeStore) -> None:
     assert body["risk"]["open_setups"] == 1 and body["risk"]["published_24h"] == 2
     assert body["health"]["last_scan"]["label"] == "NY"
     assert body["open_setups"][0]["unrealised_r"] == 0.5
+    assert body["health"]["alarms"] == [] and body["health"]["alarms_note"] is None
     assert datetime.fromisoformat(body["generated_at"]) == NOW
     assert container_store.calls_matching("FROM scan_runs")
 

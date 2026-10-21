@@ -29,15 +29,16 @@ its `ChartOverlay`), the decision funnel (`FunnelResponse`, reusing the pure
 live price. P6 adds the analytics bodies (`WinRateResponse`,
 `SkepticValueResponse`, `EquityCurveResponse`, reusing the pure `analytics.py`
 models) and the Critic's reports / reviews (list lines without markdown or
-whole JSONB; the report detail carries both). Fields still marked
-"pending Step 4.3" (CloudWatch alarm states) are placeholders the UI can
-already bind to until the system endpoints land.
+whole JSONB; the report detail carries both). P7 adds the system-health
+bodies (scan history, per-role usage + LLM cost per day, Forecaster sweeps,
+CloudWatch alarms + Lambda metrics, the inferred config panel) and fills the
+overview's alarm strip (`HealthStrip.alarms`, null + note on a CloudWatch error).
 """
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Literal
+from datetime import date, datetime
+from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -53,8 +54,9 @@ from src.dashboard.api.analytics import (
     WinRateBy,
 )
 from src.dashboard.api.classify import DecisionKind
+from src.dashboard.api.cloudwatch import AlarmState, MetricDay
 from src.dashboard.api.funnel import FunnelGroup
-from src.dashboard.api.queries import CriticReportSummary, ReviewSummary
+from src.dashboard.api.queries import CriticReportSummary, ReviewSummary, UsageDay
 from src.persistence.models import (
     StoredAgentRun,
     StoredCriticReport,
@@ -62,8 +64,6 @@ from src.persistence.models import (
     StoredSetupEvaluation,
 )
 from src.providers.base import Timeframe
-
-PENDING_4_3 = "pending Step 4.3"
 
 
 class HealthResponse(BaseModel):
@@ -140,8 +140,13 @@ class HealthStrip(BaseModel):
         "yesterday's DAILY_WRAP); null only if nothing ran in that span."
     )
     forecaster: ForecasterCoverage
-    alarms: None = Field(default=None, description="CloudWatch alarm states; " + PENDING_4_3)
-    alarms_note: str = PENDING_4_3
+    alarms: list[AlarmState] | None = Field(
+        default=None,
+        description="The CryptoSignals-Monitoring-* alarm states; null when CloudWatch failed.",
+    )
+    alarms_note: str | None = Field(
+        default=None, description='Null on success; "cloudwatch unavailable" when `alarms` is.'
+    )
     db: Literal["ok"] = Field(description="Reaching this response proves the reads succeeded.")
 
 
@@ -487,3 +492,148 @@ class ReviewsPage(BaseModel):
 
     items: list[ReviewSummaryOut]
     next_cursor: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# System health (P7, Step 4.3)
+# ---------------------------------------------------------------------------
+
+
+class ScanRowOut(BaseModel):
+    """One `scan_runs` row of the scan history table (one row per symbol per invocation)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    window: str = Field(description="schedule.window_for(started_at): a window label or AD_HOC.")
+    started_at: datetime
+    completed_at: datetime | None
+    duration_s: float | None = Field(
+        ge=0, description="completed_at - started_at (never negative); null while RUNNING."
+    )
+    status: ScanStatus
+    symbols: list[str]
+    error_message: str | None
+
+
+class ScansResponse(BaseModel):
+    """`GET /api/system/scans` body: the latest 50 scan runs, newest first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ScanRowOut]
+
+
+class UsageDayOut(UsageDay):
+    """One (UTC day, role) line: runs, failures and LLM cost (`queries.UsageDay`)."""
+
+
+class CostDay(BaseModel):
+    """LLM spend of one UTC day, total and per role."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    date: date
+    total_usd: float = Field(ge=0)
+    by_role: dict[str, float]
+
+
+class AgentsResponse(BaseModel):
+    """`GET /api/system/agents` body: per-role usage and LLM cost per day since `since`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: datetime = Field(description="Midnight UTC `days` days ago.")
+    until: datetime
+    usage: list[UsageDayOut]
+    cost_per_day: list[CostDay]
+
+
+class SweepRow(BaseModel):
+    """One Forecaster sweep: evaluations bucketed to the latest sweep start <= them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sweep_start: datetime = Field(description="Scheduled fire time + SWEEP_OFFSET (:05).")
+    evaluations: int = Field(ge=0)
+    errors: int = Field(ge=0)
+
+
+class SweepsResponse(BaseModel):
+    """`GET /api/system/sweeps` body: every sweep started in [since, until], oldest first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: datetime
+    until: datetime
+    sweeps: list[SweepRow]
+
+
+class AlarmsResponse(BaseModel):
+    """`GET /api/system/alarms` body: null `alarms` + note when CloudWatch failed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    alarms: list[AlarmState] | None
+    note: str | None = None
+
+
+class MetricsResponse(BaseModel):
+    """`GET /api/system/metrics` body: the scan Lambda's daily metrics.
+
+    `days` is null with a note when CloudWatch failed ("cloudwatch unavailable")
+    or no `CryptoSignals-Compute-ScanLambda*` metric exists ("scan function not found").
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    function_name: str | None
+    days: list[MetricDay] | None
+    note: str | None = None
+
+
+_T = TypeVar("_T")
+
+
+class Inferred(BaseModel, Generic[_T]):
+    """A config value the dashboard *infers* (design §8): it cannot read the scan config."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    value: _T
+    inferred: Literal[True] = True
+    source: str = Field(description="Where the value was inferred from.")
+
+
+class ScheduleWindowOut(BaseModel):
+    """One scheduled scan window (UTC wall clock)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    time_utc: str = Field(description='"HH:MM" UTC.')
+
+
+class ScheduleOut(BaseModel):
+    """The scan schedule -- a SPEC constant (`schedule.SCAN_WINDOWS`), not inferred."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    windows: list[ScheduleWindowOut]
+    inferred: Literal[False] = False
+    source: str
+
+
+class ConfigResponse(BaseModel):
+    """`GET /api/system/config` body: the inferred config panel (design §4.2 P7, §8)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    watchlist: Inferred[list[str]]
+    model: Inferred[str | None]
+    macro_providers_configured: Inferred[bool | None] = Field(
+        description="True when any of the last 10 Skeptic outputs is a real objection; "
+        "null when there is no Skeptic output to judge by."
+    )
+    langfuse_configured: Inferred[bool]
+    schedule: ScheduleOut
