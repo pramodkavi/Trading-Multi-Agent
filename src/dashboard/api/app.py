@@ -31,6 +31,8 @@ from mangum import Mangum
 
 from src.dashboard.api.errors import register_error_handlers
 from src.dashboard.api.routers import (
+    analytics,
+    critic,
     funnel,
     health,
     market,
@@ -67,6 +69,8 @@ def create_app(*, version: str | None = None) -> FastAPI:
     app.include_router(market.router)
     # Step 4.3 aggregates.
     app.include_router(funnel.router)
+    app.include_router(analytics.router)
+    app.include_router(critic.router)
     return app
 
 

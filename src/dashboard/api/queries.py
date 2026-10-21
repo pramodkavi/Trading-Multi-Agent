@@ -39,7 +39,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from src.common.models import ActiveSetupStatus, SignalDirection, SignalOutcome, SignalStatus
 from src.dashboard.api.classify import DECISION_KIND_SQL, DecisionKind
-from src.persistence.models import StoredActiveSetup, StoredReview, StoredScanRun
+from src.persistence.models import (
+    StoredActiveSetup,
+    StoredCriticReport,
+    StoredReview,
+    StoredScanRun,
+)
 from src.persistence.repositories import _parse_jsonb_field
 from src.persistence.store import _cursor_params, _long_param, _str_param, _utc_iso
 
@@ -47,16 +52,23 @@ __all__ = [
     "ASC_KEYSET_ORDER",
     "ASC_KEYSET_PREDICATE",
     "PAGE_LIMIT_SQL",
+    "CriticReportSummary",
     "DashboardReader",
     "DecisionRow",
     "JournalRow",
+    "OutcomeRow",
+    "ReviewSummary",
     "SetupCard",
     "SignalFilters",
     "count_evaluations_since",
+    "get_critic_report",
     "get_review",
     "get_setup_for_signal",
+    "list_critic_reports",
     "list_decisions_between",
     "list_open_setup_cards",
+    "list_outcome_rows",
+    "list_reviews_page",
     "list_scan_runs_since",
     "list_signals_for_scans",
     "list_signals_page",
@@ -402,6 +414,192 @@ async def list_decisions_between(
         [_str_param("since", since.isoformat()), _str_param("until", until.isoformat())],
     )
     return [DecisionRow.model_validate(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Analytics (P6)
+# ---------------------------------------------------------------------------
+
+
+class OutcomeRow(BaseModel):
+    """One proposal / gate rejection reduced to what P6 aggregates (design §5.2a).
+
+    Minimal (Data API 1 MB cap): the one ``risk_reward_ratio`` extract from the
+    payload, the two outcome sources and three named extracts of the scan's
+    Skeptic run -- never a whole JSONB document.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    created_at: datetime
+    symbol: str
+    strategy: str
+    session: str | None = Field(description="scan_runs.session.")
+    tags: list[str]
+    decision_kind: DecisionKind
+    judge_ruling: str | None
+    risk_reward_ratio: float | None
+    signal_outcome: str | None = Field(description="signals.outcome (the Forecaster's verdict).")
+    resolution_outcome: str | None = Field(description="decision_resolutions.outcome.")
+    realized_r: float | None = Field(description="decision_resolutions.realized_r.")
+    skeptic_severity: str | None = Field(description="Latest Skeptic run's output->>'severity'.")
+    skeptic_recommends_against: bool | None
+    skeptic_is_no_macro: bool = Field(
+        description="The Skeptic output is the NoMacroData sentinel ({provider, reason})."
+    )
+
+
+# ``k`` is the latest Skeptic run sharing the signal's scan (as ``j`` is the Judge's).
+# NoMacroData serialises as ``{provider, reason}``: ``output->'provider' IS NOT NULL``
+# is the key-exists test. The ``?`` operator is avoided on purpose -- the Data API
+# parses SQL JDBC-style and ``?`` there is a positional-placeholder hazard.
+# NO_SETUP rows (no proposal, no gate rule) feed no P6 chart: filtered server-side.
+_OUTCOME_ROWS_SQL = f"""SELECT s.id::text AS id,
+       {_utc_iso("s.created_at", alias="created_at")},
+       s.symbol, s.strategy, r.session AS session, s.tags,
+       ({DECISION_KIND_SQL}) AS decision_kind,
+       j.ruling AS judge_ruling,
+       (s.payload->>'risk_reward_ratio')::double precision AS risk_reward_ratio,
+       s.outcome AS signal_outcome,
+       d.outcome AS resolution_outcome,
+       d.realized_r::double precision AS realized_r,
+       k.severity AS skeptic_severity,
+       k.recommends_against AS skeptic_recommends_against,
+       COALESCE(k.is_no_macro, FALSE) AS skeptic_is_no_macro
+{_SIGNAL_SCAN_JUDGE_FROM}
+LEFT JOIN LATERAL (
+    SELECT a.output->>'severity' AS severity,
+           (a.output->>'recommends_against')::boolean AS recommends_against,
+           (a.output->'provider') IS NOT NULL AS is_no_macro
+    FROM agent_runs a
+    WHERE a.scan_id = s.scan_id AND a.agent_role = 'skeptic'
+    ORDER BY a.created_at DESC
+    LIMIT 1
+) k ON TRUE
+LEFT JOIN decision_resolutions d ON d.signal_id = s.id
+WHERE s.created_at >= :since::timestamptz AND s.created_at < :until::timestamptz
+  AND (s.direction IS NOT NULL OR COALESCE(s.payload->>'violated_rule', '') <> '')
+  AND {ASC_KEYSET_PREDICATE}
+{ASC_KEYSET_ORDER}
+{PAGE_LIMIT_SQL}"""
+
+
+async def list_outcome_rows(
+    reader: DashboardReader, *, since: datetime, until: datetime
+) -> list[OutcomeRow]:
+    """Every proposal / gate rejection with ``since <= created_at < until``, oldest first.
+
+    Read in 1 000-row keyset pages (:func:`read_all_pages`), like the funnel.
+    """
+    rows = await read_all_pages(
+        reader,
+        _OUTCOME_ROWS_SQL,
+        [_str_param("since", since.isoformat()), _str_param("until", until.isoformat())],
+    )
+    return [OutcomeRow.model_validate(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Critic reports / reviews (P6)
+# ---------------------------------------------------------------------------
+
+
+class CriticReportSummary(BaseModel):
+    """A ``critic_reports`` list line: no ``markdown``, no JSONB beyond the summary."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    id: UUID
+    period_start: datetime
+    period_end: datetime
+    created_at: datetime
+    pr_url: str | None
+    summary: str | None = Field(description="report->>'summary'.")
+
+
+class ReviewSummary(BaseModel):
+    """A ``decision_reviews`` list line: named extracts of the ``review`` JSONB.
+
+    The review fields are null when the review call errored (``review`` is ``{}``
+    and ``error`` is set).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    signal_id: UUID
+    decision_kind: str
+    failure_category: str | None
+    lesson: str | None
+    judge_correct: bool | None
+    gate_correct: bool | None
+    skeptic_vindicated: str | None
+    confidence: str | None
+    error: str | None = Field(description="First 500 chars of the failure text.")
+    created_at: datetime
+
+
+async def list_critic_reports(reader: DashboardReader, *, limit: int) -> list[CriticReportSummary]:
+    """The latest ``limit`` Critic reports, newest first, without their markdown."""
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    sql = f"""SELECT id::text AS id,
+       {_utc_iso("period_start", alias="period_start")},
+       {_utc_iso("period_end", alias="period_end")},
+       {_utc_iso("created_at", alias="created_at")},
+       pr_url,
+       report->>'summary' AS summary
+FROM critic_reports
+ORDER BY created_at DESC, id DESC
+LIMIT :limit"""
+    rows = await reader.read_rows(sql, [_long_param("limit", limit)])
+    return [CriticReportSummary.model_validate(row) for row in rows]
+
+
+async def get_critic_report(reader: DashboardReader, report_id: UUID) -> StoredCriticReport | None:
+    """One Critic report with its full JSONB and markdown, or ``None``."""
+    sql = f"""SELECT id::text AS id,
+       {_utc_iso("period_start", alias="period_start")},
+       {_utc_iso("period_end", alias="period_end")},
+       report::text AS report, markdown, pr_url,
+       {_utc_iso("created_at", alias="created_at")}
+FROM critic_reports
+WHERE id = :id::uuid"""
+    rows = await reader.read_rows(sql, [_str_param("id", str(report_id))])
+    if not rows:
+        return None
+    data = dict(rows[0])
+    data["report"] = _parse_jsonb_field(data["report"])
+    return StoredCriticReport.model_validate(data)
+
+
+_REVIEW_KEYSET_PREDICATE = (
+    "(:after_ts::timestamptz IS NULL OR "
+    "(created_at, signal_id) < (:after_ts::timestamptz, :after_id::uuid))"
+)
+
+
+async def list_reviews_page(
+    reader: DashboardReader, *, limit: int, after: tuple[datetime, UUID] | None
+) -> list[ReviewSummary]:
+    """One page of Critic reviews, newest first; up to ``limit + 1`` rows (see the journal)."""
+    if limit < 1:
+        raise ValueError(f"limit must be >= 1, got {limit}")
+    sql = f"""SELECT signal_id::text AS signal_id, decision_kind,
+       review->>'failure_category' AS failure_category,
+       review->>'lesson' AS lesson,
+       (review->>'judge_correct')::boolean AS judge_correct,
+       (review->>'gate_correct')::boolean AS gate_correct,
+       review->>'skeptic_vindicated' AS skeptic_vindicated,
+       review->>'confidence' AS confidence,
+       left(error, 500) AS error,
+       {_utc_iso("created_at", alias="created_at")}
+FROM decision_reviews
+WHERE {_REVIEW_KEYSET_PREDICATE}
+ORDER BY created_at DESC, signal_id DESC
+LIMIT :limit"""
+    rows = await reader.read_rows(sql, [*_cursor_params(after), _long_param("limit", limit + 1)])
+    return [ReviewSummary.model_validate(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------

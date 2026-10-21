@@ -26,8 +26,12 @@ Step 4.2 adds the read-only data payloads (design §4.2 P1 / P2 / P3, §3.4):
 Step 4.3 adds the market payloads (`KlinesResponse`, `SignalChartResponse` with
 its `ChartOverlay`), the decision funnel (`FunnelResponse`, reusing the pure
 `funnel.FunnelGroup`) and fills `SetupCardOut.unrealised_r` best-effort from a
-live price. Fields still marked "pending Step 4.3" (CloudWatch alarm states)
-are placeholders the UI can already bind to until the system endpoints land.
+live price. P6 adds the analytics bodies (`WinRateResponse`,
+`SkepticValueResponse`, `EquityCurveResponse`, reusing the pure `analytics.py`
+models) and the Critic's reports / reviews (list lines without markdown or
+whole JSONB; the report detail carries both). Fields still marked
+"pending Step 4.3" (CloudWatch alarm states) are placeholders the UI can
+already bind to until the system endpoints land.
 """
 
 from __future__ import annotations
@@ -41,9 +45,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from src.agents.critic.models import Resolution
 from src.agents.orchestration.risk_gates import MAX_CONCURRENT_SETUPS, MAX_SIGNALS_PER_24H
 from src.common.models import ScanStatus, SignalDirection, SignalOutcome, SignalStatus
+from src.dashboard.api.analytics import (
+    EquityCurves,
+    SkepticValue,
+    SourceCounts,
+    WinRateBucket,
+    WinRateBy,
+)
 from src.dashboard.api.classify import DecisionKind
 from src.dashboard.api.funnel import FunnelGroup
-from src.persistence.models import StoredAgentRun, StoredReview, StoredSetupEvaluation
+from src.dashboard.api.queries import CriticReportSummary, ReviewSummary
+from src.persistence.models import (
+    StoredAgentRun,
+    StoredCriticReport,
+    StoredReview,
+    StoredSetupEvaluation,
+)
 from src.providers.base import Timeframe
 
 PENDING_4_3 = "pending Step 4.3"
@@ -410,3 +427,63 @@ class FunnelResponse(BaseModel):
     totals: FunnelGroup = Field(description='The same counts over every row (key "total").')
     top_rejections_7d: list[RejectionCount]
     top_rejections_30d: list[RejectionCount]
+
+
+# ---------------------------------------------------------------------------
+# Performance analytics + Critic (P6, Step 4.3)
+# ---------------------------------------------------------------------------
+
+
+class WinRateResponse(BaseModel):
+    """`GET /api/analytics/win-rate` body: published win rate per bucket (`analytics.py`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    since: datetime
+    until: datetime
+    by: WinRateBy
+    buckets: list[WinRateBucket]
+    source_counts: SourceCounts
+
+
+class SkepticValueResponse(SkepticValue):
+    """`GET /api/analytics/skeptic-value` body: the three bars plus the period."""
+
+    since: datetime
+    until: datetime
+
+
+class EquityCurveResponse(EquityCurves):
+    """`GET /api/analytics/equity-curve` body: the three R curves plus the period."""
+
+    since: datetime
+    until: datetime
+
+
+class CriticReportSummaryOut(CriticReportSummary):
+    """One `critic_reports` list line (no markdown; `summary` = `report->>'summary'`)."""
+
+
+class CriticReportsPage(BaseModel):
+    """`GET /api/critic/reports` body: the latest reports, newest first."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[CriticReportSummaryOut]
+
+
+class CriticReportOut(StoredCriticReport):
+    """`GET /api/critic/reports/{id}` body: the full report JSONB and markdown."""
+
+
+class ReviewSummaryOut(ReviewSummary):
+    """One `decision_reviews` list line (named `review` extracts; null when it errored)."""
+
+
+class ReviewsPage(BaseModel):
+    """`GET /api/critic/reviews` body; `next_cursor` is null on the last page."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ReviewSummaryOut]
+    next_cursor: str | None = None
