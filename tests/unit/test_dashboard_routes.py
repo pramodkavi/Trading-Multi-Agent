@@ -49,7 +49,6 @@ from src.providers.base import (
     DataProvider,
     Kline,
     MarketSnapshot,
-    ProviderError,
     ProviderUnavailableError,
     Timeframe,
 )
@@ -195,7 +194,7 @@ class FakeProvider(DataProvider):
     """`DataProvider` double: serves canned candles, records calls, tracks `aclose`."""
 
     klines: dict[tuple[str, Timeframe], list[Kline]] = field(default_factory=dict)
-    errors: dict[str, ProviderError] = field(default_factory=dict)
+    errors: dict[str, Exception] = field(default_factory=dict)
     delay_s: float = 0.0
     calls: list[tuple[str, Timeframe, datetime, datetime]] = field(default_factory=list)
     closed: bool = False
@@ -230,7 +229,7 @@ class FakeProviderFactory:
     """`ProviderFactory` double: builds a fresh `FakeProvider` per call and keeps them all."""
 
     klines: dict[tuple[str, Timeframe], list[Kline]] = field(default_factory=dict)
-    errors: dict[str, ProviderError] = field(default_factory=dict)
+    errors: dict[str, Exception] = field(default_factory=dict)
     delay_s: float = 0.0
     built: list[FakeProvider] = field(default_factory=list)
 

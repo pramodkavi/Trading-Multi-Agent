@@ -11,18 +11,24 @@ Every agent reads market data through the uniform `DataProvider` interface
   :data:`ProviderFactory` (FastAPI dependency :func:`get_provider_factory`), never
   on a provider, so a request rejected before any market call (unknown symbol,
   404 signal) constructs nothing. Tests override the dependency.
-* **Klines are a proxy, errors are mapped app-wide.** :func:`fetch_recent_klines`
-  lets `ProviderError` propagate; `errors.py` turns it into **502**
-  ``{"reason": "market_unavailable"}`` (message logged, never echoed).
+* **Klines are a proxy, bounded, errors are mapped app-wide.**
+  :func:`fetch_klines_window` (klines route + signal chart) runs under
+  :data:`MARKET_BUDGET_S` (12 s) and turns a blown budget into
+  `ProviderTimeoutError`; `ProviderError` propagates and `errors.py` turns it
+  into **502** ``{"reason": "market_unavailable"}`` (message logged, never
+  echoed) -- well inside the 25 s Lambda cap, so never a gateway 5xx.
 * **Unrealised R is best-effort.** :func:`latest_prices` runs one fetch per
   symbol concurrently under an overall budget (:data:`PRICE_BUDGET_S`, 5 s, via
-  ``asyncio.wait_for``); a per-symbol `ProviderError` or an empty window omits
-  that symbol and a blown budget returns ``{}``. It never raises a provider
-  error or a timeout, so a slow or down Binance cannot fail the landing page --
-  the cards just show ``unrealised_r: null`` with ``"price unavailable"``.
+  ``asyncio.wait_for``); a per-symbol failure of any kind or an empty window
+  omits that symbol, and a blown budget or a factory failure returns ``{}``. It
+  never raises, so a slow or down Binance cannot fail the landing page -- the
+  cards just show ``unrealised_r: null`` with ``"price unavailable"``.
 
-The default factory imports `BinanceProvider` lazily: ccxt is a heavy import and
-the unauthenticated `/api/health` cold start should not pay for it.
+The default factory imports `BinanceProvider` lazily (ccxt is a heavy import and
+the unauthenticated `/api/health` cold start should not pay for it), restricts
+ccxt to linear (USDT-M) markets, and hands it the markets captured from the
+first successful fetch in this container (:data:`_MARKETS`), so only a cold
+container pays the exchangeInfo download.
 """
 
 from __future__ import annotations
@@ -31,15 +37,22 @@ import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta
-from typing import Annotated, Final
+from typing import Annotated, Any, Final
 
 from fastapi import Depends
 
 from src.common.models import SignalDirection
-from src.providers.base import DataProvider, Kline, ProviderError, Timeframe
+from src.providers.base import (
+    DataProvider,
+    Kline,
+    ProviderError,
+    ProviderTimeoutError,
+    Timeframe,
+)
 
 __all__ = [
     "LATEST_PRICE_LOOKBACK",
+    "MARKET_BUDGET_S",
     "PRICE_BUDGET_S",
     "TIMEFRAME_DURATION",
     "ProviderFactory",
@@ -49,6 +62,7 @@ __all__ = [
     "fetch_recent_klines",
     "get_provider_factory",
     "latest_prices",
+    "reset_markets_cache",
     "unrealised_r",
 ]
 
@@ -72,10 +86,45 @@ PRICE_BUDGET_S: float = 5.0
 LATEST_PRICE_LOOKBACK: Final[timedelta] = timedelta(minutes=30)
 
 
+# Overall bound on one market route's provider work (klines proxy, signal chart):
+# ccxt's own 10 s per-request timeout x (market load + pages) could otherwise exceed
+# the 25 s Lambda cap and surface as a gateway 5xx instead of our 502. Looked up at
+# call time so tests can shrink it.
+MARKET_BUDGET_S: float = 12.0
+
+# Binance markets cached per container (Mangum keeps the module alive between
+# invocations). Without it every request's fresh ccxt client would download the
+# full exchangeInfo (several MB) before its first candle. The dashboard reads only
+# USDT-M perpetuals, so the production provider loads linear markets only.
+_MARKETS: dict[str, Any] | None = None
+
+
+def reset_markets_cache() -> None:
+    """Forget the cached Binance markets (tests; a fresh container starts empty)."""
+    global _MARKETS
+    _MARKETS = None
+
+
+def _remember_markets(provider: DataProvider) -> None:
+    """After a successful fetch, keep the provider's loaded markets for the next request.
+
+    Duck-typed (`loaded_markets`) so fakes and non-Binance providers are ignored and
+    this module never imports ccxt eagerly.
+    """
+    global _MARKETS
+    if _MARKETS is not None:
+        return
+    getter = getattr(provider, "loaded_markets", None)
+    if callable(getter):
+        markets = getter()
+        if isinstance(markets, dict) and markets:
+            _MARKETS = markets
+
+
 def _binance_provider() -> DataProvider:
     from src.providers.binance import BinanceProvider  # lazy: ccxt is a heavy import
 
-    return BinanceProvider()
+    return BinanceProvider(market_types=["linear"], markets=_MARKETS)
 
 
 # The production factory. A module attribute (looked up per call by
@@ -104,13 +153,26 @@ async def fetch_klines_window(
     """Candles with ``start <= open_time < end``, ascending, from a fresh provider.
 
     An empty window (``end <= start``) returns ``[]`` without building a provider.
-    `ProviderError` propagates (502 via `errors.py`); the provider is closed either way.
+    The fetch is bounded by :data:`MARKET_BUDGET_S`; a blown budget raises
+    `ProviderTimeoutError`. `ProviderError` propagates (502 via `errors.py`); the
+    provider is closed either way.
     """
     if end <= start:
         return []
+    budget_s = MARKET_BUDGET_S
     provider = factory()
     try:
-        return await provider.fetch_klines(symbol, tf, start=start, end=end)
+        try:
+            klines = await asyncio.wait_for(
+                provider.fetch_klines(symbol, tf, start=start, end=end), timeout=budget_s
+            )
+        except TimeoutError as exc:
+            raise ProviderTimeoutError(
+                f"{symbol} {tf.value} candles exceeded the {budget_s:.1f} s market budget",
+                provider=provider.name,
+            ) from exc
+        _remember_markets(provider)
+        return klines
     finally:
         await provider.aclose()
 
@@ -147,18 +209,24 @@ async def latest_prices(
     now: datetime,
     budget_s: float = PRICE_BUDGET_S,
 ) -> dict[str, float]:
-    """Last 5m close per symbol over the past 30 min -- best-effort, never raises on market errors.
+    """Last 5m close per symbol over the past 30 min -- best-effort, never raises.
 
     One provider for the whole call; one fetch per distinct symbol, concurrent,
     under an overall ``budget_s`` (``asyncio.wait_for``). A symbol whose fetch
-    raises `ProviderError` or returns no candles is omitted; a blown budget
-    returns ``{}``. No symbols -> ``{}`` without building a provider. Anything
-    that is not a provider error (a bug) propagates.
+    raises (a `ProviderError` or anything else) or returns no candles is omitted;
+    a blown budget or a provider that cannot even be built returns ``{}``. No
+    symbols -> ``{}`` without building a provider. Unexpected exceptions are
+    logged with their traceback (a bug must stay visible) but never fail the
+    landing page.
     """
     unique = list(dict.fromkeys(symbols))
     if not unique:
         return {}
-    provider = factory()
+    try:
+        provider = factory()
+    except Exception:
+        logger.error("building the market provider failed; unrealised R unavailable", exc_info=True)
+        return {}
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
@@ -186,10 +254,14 @@ async def latest_prices(
             logger.warning(
                 "latest price for %s unavailable (%s): %s", symbol, result.provider, result
             )
+        elif isinstance(result, Exception):
+            logger.error("latest price for %s failed unexpectedly", symbol, exc_info=result)
         elif isinstance(result, BaseException):
-            raise result
+            raise result  # cancellation / interpreter exit: never swallowed
         elif result is not None:
             prices[symbol] = result
+    if any(not isinstance(result, BaseException) for result in results):
+        _remember_markets(provider)  # at least one fetch succeeded: markets are loaded
     return prices
 
 

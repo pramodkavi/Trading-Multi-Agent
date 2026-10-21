@@ -9,7 +9,9 @@ was constructed" is asserted as `factory.built == []`.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from datetime import datetime, timedelta
+from typing import Any, ClassVar
 from uuid import uuid4
 
 import pytest
@@ -17,9 +19,16 @@ import pytest
 from src.common.models import AgentRole, SignalDirection
 from src.dashboard.api import market
 from src.dashboard.api import overview as assembly
-from src.providers.base import ProviderError, ProviderUnavailableError, Timeframe
+from src.providers.base import (
+    Kline,
+    ProviderError,
+    ProviderTimeoutError,
+    ProviderUnavailableError,
+    Timeframe,
+)
 from tests.unit.test_dashboard_routes import (
     NOW,
+    FakeProvider,
     FakeProviderFactory,
     Scenario,
     _client_for,
@@ -116,6 +125,133 @@ async def test_latest_prices_budget_returns_partial_or_empty() -> None:
     idle = FakeProviderFactory()
     assert await market.latest_prices(idle, [], now=NOW) == {}
     assert idle.built == []
+
+
+async def test_latest_prices_factory_failure_degrades_to_empty(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Best-effort path: even building the provider failing must not fail the page.
+    def broken_factory() -> FakeProvider:
+        raise RuntimeError("ccxt import exploded")
+
+    with caplog.at_level(logging.WARNING, logger="src.dashboard.api.market"):
+        assert await market.latest_prices(broken_factory, ["BTCUSDT"], now=NOW) == {}
+    assert "ccxt import exploded" in caplog.text  # logged with exc_info
+
+
+async def test_latest_prices_omits_symbol_on_non_provider_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    m5 = Timeframe.M5
+    factory = FakeProviderFactory(
+        klines={("BTCUSDT", m5): _series(m5, end=NOW, count=6, first_close=96.0)},
+        errors={"ETHUSDT": KeyError("unexpected ccxt shape")},
+    )
+    with caplog.at_level(logging.WARNING, logger="src.dashboard.api.market"):
+        prices = await market.latest_prices(factory, ["BTCUSDT", "ETHUSDT"], now=NOW)
+    assert prices == {"BTCUSDT": 101.0}
+    assert "unexpected ccxt shape" in caplog.text
+    (provider,) = factory.built
+    assert provider.closed
+
+
+# ---------------------------------------------------------------------------
+# Production factory: Binance markets cached per container (linear only)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingBinance:
+    """Stands in for `BinanceProvider` inside `market._binance_provider` (no ccxt client)."""
+
+    built: ClassVar[list[dict[str, Any]]] = []
+    fail: ClassVar[bool] = False
+    table: ClassVar[dict[str, Any]] = {"BTC/USDT:USDT": {"id": "BTCUSDT"}}
+
+    def __init__(self, **kwargs: Any) -> None:
+        type(self).built.append(kwargs)
+        self._markets: dict[str, Any] | None = kwargs.get("markets")
+
+    async def fetch_klines(
+        self, symbol: str, timeframe: Timeframe, *, start: datetime, end: datetime
+    ) -> list[Kline]:
+        if type(self).fail:
+            raise ProviderUnavailableError("down", provider="binance")
+        self._markets = self._markets or type(self).table  # a real client loads on first use
+        return []
+
+    def loaded_markets(self) -> dict[str, Any] | None:
+        return self._markets
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.fixture
+def recording_binance(monkeypatch: pytest.MonkeyPatch) -> Iterator[type[_RecordingBinance]]:
+    from src.providers import binance as binance_module
+
+    monkeypatch.setattr(_RecordingBinance, "built", [])
+    monkeypatch.setattr(_RecordingBinance, "fail", False)
+    monkeypatch.setattr(binance_module, "BinanceProvider", _RecordingBinance)
+    market.reset_markets_cache()
+    yield _RecordingBinance
+    market.reset_markets_cache()
+
+
+async def test_default_factory_caches_markets_after_first_request(
+    recording_binance: type[_RecordingBinance],
+) -> None:
+    factory = market._binance_provider
+    start = NOW - timedelta(hours=1)
+    # A failed request caches nothing.
+    recording_binance.fail = True
+    with pytest.raises(ProviderError):
+        await market.fetch_klines_window(factory, "BTCUSDT", Timeframe.H1, start=start, end=NOW)
+    recording_binance.fail = False
+    # First successful request: linear-only, no markets yet -> the client loads them.
+    await market.fetch_klines_window(factory, "BTCUSDT", Timeframe.H1, start=start, end=NOW)
+    # Second request (and the price path) reuse the captured table: no market load.
+    await market.fetch_klines_window(factory, "BTCUSDT", Timeframe.H1, start=start, end=NOW)
+    await market.latest_prices(factory, ["BTCUSDT"], now=NOW)
+    assert recording_binance.built == [
+        {"market_types": ["linear"], "markets": None},
+        {"market_types": ["linear"], "markets": None},
+        {"market_types": ["linear"], "markets": recording_binance.table},
+        {"market_types": ["linear"], "markets": recording_binance.table},
+    ]
+    market.reset_markets_cache()
+    market._binance_provider()
+    assert recording_binance.built[-1]["markets"] is None
+
+
+async def test_fetch_klines_window_bounded_by_market_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(market, "MARKET_BUDGET_S", 0.05)
+    slow = FakeProviderFactory(delay_s=10.0)
+    with pytest.raises(ProviderTimeoutError):
+        await market.fetch_recent_klines(slow, "BTCUSDT", Timeframe.H4, limit=10, end=NOW)
+    (provider,) = slow.built
+    assert provider.closed
+
+
+@pytest.mark.usefixtures("frozen_clock")
+def test_market_routes_slow_provider_is_502(
+    scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Bounded below the 25 s Lambda / 30 s gateway caps: a slow Binance is a clean 502.
+    monkeypatch.setattr(market, "MARKET_BUDGET_S", 0.05)
+    slow = FakeProviderFactory(delay_s=10.0)
+    _, client = _client_for(scenario.store, slow)
+    resp = client.get("/api/market/klines", params={"symbol": "BTCUSDT"})
+    assert resp.status_code == 502 and resp.json() == {"reason": "market_unavailable"}
+    resp = client.get(f"/api/signals/{scenario.published.id}/chart")
+    assert resp.status_code == 502 and resp.json() == {"reason": "market_unavailable"}
+    assert len(slow.built) == 2 and all(p.closed for p in slow.built)
+
+
+def test_market_budget_is_twelve_seconds() -> None:
+    assert market.MARKET_BUDGET_S == 12.0
 
 
 # ---------------------------------------------------------------------------

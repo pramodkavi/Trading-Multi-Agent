@@ -6,7 +6,8 @@
 - `tf` is a `Timeframe` value (`1d`, `4h`, `1h`, `15m`, `5m`; default `4h`);
   `limit` is 1..500 (default 200) and out-of-range values are rejected with 422.
 - The window ends at the request clock (`overview.utcnow()`), so the last candle
-  may still be forming. A `ProviderError` becomes 502 `market_unavailable`
+  may still be forming. The provider work is bounded by `market.MARKET_BUDGET_S`
+  (12 s); a blown budget or any `ProviderError` becomes 502 `market_unavailable`
   (`errors.py`). No database access.
 """
 
