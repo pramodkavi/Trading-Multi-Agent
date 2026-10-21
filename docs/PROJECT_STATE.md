@@ -254,8 +254,14 @@ suppression). Route table, error bodies and console examples: `docs/operations.m
    (watchlist symbols only → 400 `unknown_symbol`; `limit` 1..500; any `ProviderError` → 502
    `market_unavailable`; `BinanceProvider` per request, imported lazily) and
    `GET /api/signals/{id}/chart?before=60&after=30` (candles + entry/stop/TP/POI overlay).
+   Both are bounded by **`MARKET_BUDGET_S` = 12 s** (blown → `ProviderTimeoutError` → 502, never a
+   gateway 5xx), and the dashboard's provider loads **linear markets only, cached per container**
+   (`market._MARKETS`, captured after the first successful fetch) so only a cold container pays
+   Binance's multi-MB `exchangeInfo`. The scan pipeline's `BinanceProvider()` is byte-identical
+   (the two new constructor arguments default to None; pinned in `test_binance_provider.py`).
    **Unrealised R** on overview + `/api/setups/open` is best-effort: one concurrent latest-price
-   fetch per OPEN-setup symbol under a 5 s budget; failure → `null` + `"price unavailable"`.
+   fetch per OPEN-setup symbol under a 5 s budget; any failure → `null` + `"price unavailable"`
+   (never raises); the lifecycle card says `"not fetched on this view"`.
 2. **Funnel** — `GET /api/funnel?since&until&group_by=day|window|symbol` (default 30 d, ≤ 365 d;
    `AD_HOC` its own window group; `judge_*` incl. `judge_none` sum to `gate_passed`; top
    rejections 7 / 30 d anchored to now).
@@ -264,11 +270,17 @@ suppression). Route table, error bodies and console examples: `docs/operations.m
    replay when present else the Forecaster's `signals.outcome`; `source_counts`; counterfactuals
    from replays only; `win_rate: null` with 0 decisive); `/api/critic/reports`,
    `/api/critic/reports/{id}`, `/api/critic/reviews`.
-4. **System health (P7)** — `/api/system/scans`, `/agents?days=7` (≤ 30), `/sweeps`, `/alarms`,
-   `/metrics`, `/config` (inferred values flagged `"inferred": true`). **LLM cost source rule:**
-   `agent_runs` = runs + cost for every role (Critic successes included); `decision_reviews` adds
-   only failed reviews (zero cost); `setup_evaluations` = the Forecaster. CloudWatch sections (and
-   the overview alarm strip, 5 s budget) degrade to `null` + `"cloudwatch unavailable"`, HTTP 200.
+4. **System health (P7)** — `/api/system/scans`, `/agents?days=7`, `/sweeps?days=7`, `/alarms`,
+   `/metrics?days=7` (`days` ≤ 30 on all three), `/config` (inferred values flagged
+   `"inferred": true`). **Cost / failure source rule:** `agent_runs` = runs + cost for every role
+   (Critic successes included) but **no failure source** (rows exist only on success) → those
+   roles report **`errors: null`** ("unknown", not 0); `decision_reviews` adds only failed reviews
+   (zero cost) — **critic failures = signals whose latest review attempt failed (upsert)**;
+   `setup_evaluations` = the Forecaster; `scan_runs` = the cost-free **`scan` pseudo-role** (runs,
+   `FAILED` rows as errors) where pipeline failures show. CloudWatch sections (and the overview
+   alarm strip, 5 s budget) degrade to `null` + `"cloudwatch unavailable"`, HTTP 200; an
+   `AccessDenied*` code gets `"cloudwatch access denied"` + an ERROR log (an IAM gap, not a
+   hiccup). The overview starts the alarm and price fetches as tasks overlapping its DB reads.
 5. **Data API 1 MB cap** — the funnel and outcome-row fetches read long ranges in 1,000-row
    ascending keyset pages (`queries.read_all_pages`, 20-page guard). `/api/markets` (P5 tiles) is
    deferred to its page step. **`src/providers/__init__` is now a lazy package** (PEP 562, same
@@ -279,6 +291,12 @@ suppression). Route table, error bodies and console examples: `docs/operations.m
    at 4.3 vs ≈2.0 s at the 4.2 base (`f813a63`). The 4.2 "1.2 s" was measured on a quieter run;
    fastapi alone is ≈1.4 s today. The remaining ≈0.2 s is mostly `cloudwatch.py`'s botocore
    `Config`. `/api/health` stays DB- and AWS-free.
+6. **Final-review fix wave (2026-10-21, same branch)** — market cache + 12 s bound + additive
+   provider seam (item 1); `errors: null` + `scan` pseudo-role (item 4); overview side fetches
+   concurrent with its DB reads (a failed DB read cancels them); lifecycle card note
+   `"not fetched on this view"`; Skeptic value gains `unruled` (counted objection, no Judge
+   ruling); `"cloudwatch access denied"` note; the two lazy-import tests also forbid `httpx` /
+   `boto3` and run their subprocess from the repo root.
 
 ---
 
@@ -427,11 +445,18 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
   which 5.39 s was `src.agents.orchestration`: `anthropic` 2.9 s, `langgraph.graph` 1.2 s;
   `risk_gates` itself is 4 ms). The package `__init__` is now lazy (PEP 562 `__getattr__` +
   `__dir__`; `from src.agents.orchestration import X` still works for the scan pipeline), so
-  importing `risk_gates` no longer loads `graph` — **now 1.2 s** (three runs: 1.27 / 1.24 /
-  1.22 s), with `langgraph` / `anthropic` absent from `sys.modules`
-  (`tests/unit/test_orchestration_lazy_import.py` pins it in a subprocess). Rule: nothing under
-  `src/dashboard/` may import `src.agents.orchestration.graph` or any agent module that pulls
-  the Anthropic SDK.
+  importing `risk_gates` no longer loads `graph` — **1.2 s measured 2026-10-21 at the 4.2 fix
+  wave** (three runs: 1.27 / 1.24 / 1.22 s, a quiet run), with `langgraph` / `anthropic` absent
+  from `sys.modules` (`tests/unit/test_orchestration_lazy_import.py` pins it in a subprocess).
+  **Current figure (Step 4.3 final wave, same machine, back-to-back runs): ≈2.0–2.2 s** —
+  fastapi alone is ≈1.4 s on this machine today; treat that, not 1.2 s, as the baseline to
+  compare against. Rule: nothing under `src/dashboard/` may import `src.providers.binance` /
+  `src.providers.macro` (ccxt + aiohttp / httpx) or `src.agents.orchestration.graph` (or any
+  agent module that pulls the Anthropic SDK) at module level, and neither
+  `src/providers/__init__` nor `src/agents/orchestration/__init__` may become eager again —
+  pinned by `tests/unit/test_providers_lazy_import.py` (no ccxt / aiohttp / httpx / boto3 after
+  `import src.dashboard.api.app`) and `tests/unit/test_orchestration_lazy_import.py`. The market
+  factory imports `BinanceProvider` inside the function for exactly this reason.
 
 ---
 
@@ -460,7 +485,7 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | 🟡 Verify after deploy (Step 4.0) — **partially verified 2026-10-20** | Schema is applied (`to_regclass('setup_evaluations')` is non-null). (b) ✅ the 08:05 sweep wrote a `setup_evaluations` row (an `ERROR` row — credits, see the 🔴 Ops item — which is exactly the journaling 4.0 added). (c) ✅ the 08:03 scan's four `scan_runs` rows carry `session='LONDON'`; all 16 rows from 10-19 are `AD_HOC` (pre-4.0 deploy). **Still open:** (a) skeptic/judge `cost_usd` / `latency_ms` — unobservable so far because every proposal since 10-19 was gate-rejected (`RULE_2_MIN_RR`, `RULE_3_PREMIUM_DISCOUNT`, `RULE_9_CORRELATED_EXPOSURE`), so no skeptic/judge rows exist post-4.0; needs credits + a gate-passing proposal. (d) rule 7 — the first post-4.0 Cooldown scan is 2026-10-20 22:03 UTC; check `scan_runs.session='COOLDOWN'` and any `RULE_7_SESSION_BLOCK` skip after it. |
 | ✅ Verified (Step 4.1, 2026-10-20) | `GET https://s2bc8yifa1.execute-api.ap-south-1.amazonaws.com/api/health` → **200** `{"status":"ok","version":"c3ecb80"}` = the PR #14 merge commit; `/api/docs` → 404 (not routed, as documented). The `DashboardApiAccessLogs` group received one CLF line per request with **the path field logged as `-`** (`"GET - HTTP/1.1" 200 35`) because CDK's default format uses REST-era `$context.resourcePath` → ✅ **fixed in Step 4.2: the stage now uses an HTTP-API JSON format** (`routeKey`, `path`, `status`, `integrationLatency`, `requestId`, …) — verify after the 4.2 deploy (row below). Deploy created the stack last with no pipeline-stack changes beyond the shared code asset. |
 | 🟡 Verify after deploy (Step 4.2) | (a) `GET /api/health` once, then read the newest `DashboardApiAccessLogs` event: a JSON object whose `routeKey` is `GET /api/health` and `path` is `/api/health` (no more `-`). (b) Lambda console → `DashboardApi…` → Test with the v2 event from `docs/operations.md §8.6` against `/api/system/db`: `statusCode` 200 and a body `{"db":"ok","latency_ms":…}` — the first try after idle may say `"resuming"`, re-run after ~10 s. (c) The same event with `requestContext.http.path` (plus `rawPath` / `routeKey` — Mangum routes on the `http.path` field) set to `/api/overview`: 200 with today's windows (one `WindowOutcome` per window that has run — `LONDON` / `NY` / `OVERLAP` / `DAILY_WRAP` labels, worst per-symbol `status`, the four symbols — grouped from the per-symbol `scan_runs` rows), the risk budget, and `alarms: null` (once 4.3 is deployed: the alarm list, see the 4.3 row); a 503 `db_resuming` on the first try is expected. (d) `/api/signals?limit=5` (in `rawQueryString`): 200, five rows with a `kind`, and a `next_cursor` that pages when fed back as `cursor=`. |
-| 🟡 Verify after deploy (Step 4.3) | Lambda console Test events per `docs/operations.md §8.6`: (a) `/api/system/alarms` returns the **five** `CryptoSignals-Monitoring-*` alarms — not `"alarms": null` + `"cloudwatch unavailable"` (the AccessDenied degradation), which confirms the `DescribeAlarms` resource scoping; (b) `/api/market/klines` with `rawQueryString` `symbol=BTCUSDT` returns candles from ap-south-1 (Binance reachable from the dashboard Lambda); (c) `/api/funnel` for one day (`since` / `until` one UTC day apart) matches a manual count of that day's `signals` / `scan_runs` rows; (d) **NFR-4.3**: re-run `EXPLAIN (ANALYZE, BUFFERS)` of the funnel (`_DECISIONS_BETWEEN_SQL`) and outcome-rows (`_OUTCOME_ROWS_SQL`) queries over 365 days through the aws-mcp Data API path and record planning + execution time (< 500 ms budget) — **not run on 2026-10-21 because the MCP token had expired** (re-auth with `/mcp`, then run). |
+| 🟡 Verify after deploy (Step 4.3) | Lambda console Test events per `docs/operations.md §8.6`: (a) `/api/system/alarms` returns the **five** `CryptoSignals-Monitoring-*` alarms — not `"alarms": null` + `"cloudwatch unavailable"` (the AccessDenied degradation), which confirms the `DescribeAlarms` resource scoping; (b) `/api/market/klines` with `rawQueryString` `symbol=BTCUSDT` returns candles from ap-south-1 (Binance reachable from the dashboard Lambda); (c) `/api/funnel` for one day (`since` / `until` one UTC day apart) matches a manual count of that day's `signals` / `scan_runs` rows; (d) **NFR-4.3**: re-run `EXPLAIN (ANALYZE, BUFFERS)` of the funnel (`_DECISIONS_BETWEEN_SQL`) and outcome-rows (`_OUTCOME_ROWS_SQL`) queries over 365 days through the aws-mcp Data API path and record planning + execution time (< 500 ms budget) — **not run on 2026-10-21 because the MCP token had expired** (re-auth with `/mcp`, then run); (e) `/api/overview` while a setup is OPEN returns a **non-null `unrealised_r`** on its card (Binance reachable + the linear-only market load works); (f) record **cold and warm latency** of `/api/overview` and `/api/market/klines` (first Test after a deploy / idle = cold — expect the market load on the cold klines call only; a second Test = warm, cached markets); (g) `/api/system/metrics` reports the **current** `CryptoSignals-Compute-ScanLambda…` function name (discovered via `ListMetrics`; not a stale pre-redeploy name). |
 | 🟡 Test debt (Step 4.0) | Run `.\.venv\Scripts\python.exe -m pytest -m integration tests/integration/test_repositories_integration.py` the next time a local Postgres (Docker, port 5433) is available — the asyncpg `setup_evaluations` record/list round-trip was written in Step 4.0 but has never executed (no Docker on the build machine). |
 | 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |
 | ✅ Done | ~~Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking.~~ **Shipped (`fix/aurora-resume-retry`):** `_execute` retries `DatabaseResumingException` up to 6× with linear backoff (5/10/15/20/25s, ≤75s, well under the 10-min Lambda timeout). This was the production failure — every scheduled scan was dying on its first DB call (`start_scan`) because Aurora had scaled to zero, so no Telegram ever fired. Verified in the live Lambda logs (`log-events-viewer-result.csv`). |

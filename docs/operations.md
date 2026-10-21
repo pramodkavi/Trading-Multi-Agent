@@ -570,10 +570,10 @@ Step 4.2 added the first data routes to the FastAPI app (`src/dashboard/api/rout
 | Route | Returns |
 |---|---|
 | `GET /api/system/db` | `{"db": "ok" \| "resuming" \| "error", "latency_ms": …}` — the DB probe; **always 200** (it catches the Data API error itself because it *is* the probe) |
-| `GET /api/overview` | health strip, risk budget (the §1.6 gates via `risk_gates`), open setups, today's scan windows (`src/common/schedule.py`), Forecaster coverage (`last_sweep_at`). Since Step 4.3 the strip carries the CloudWatch alarm states (`alarms`, 5 s budget; on failure `alarms: null` + `alarms_note: "cloudwatch unavailable"`) and each setup card a best-effort `unrealised_r` (below) |
+| `GET /api/overview` | health strip, risk budget (the §1.6 gates via `risk_gates`), open setups, today's scan windows (`src/common/schedule.py`), Forecaster coverage (`last_sweep_at`). Since Step 4.3 the strip carries the CloudWatch alarm states (`alarms`, 5 s budget; on failure `alarms: null` + `alarms_note: "cloudwatch unavailable"` or `"cloudwatch access denied"`) and each setup card a best-effort `unrealised_r` (below); the alarm and price fetches run concurrently with the DB reads |
 | `GET /api/setups/open` | OPEN setups with signal summary + latest evaluation + best-effort `unrealised_r` (since Step 4.3) |
 | `GET /api/signals?since&until&symbol&kind&outcome&tag&session&violated_rule&limit&cursor` | journal page with the derived decision kind (`classify.py`); `limit` 1..200 (default 50); `cursor` is the opaque keyset cursor from the previous page. **Rows are trimmed** (design §3.4, Data API 1 MB response cap): the `signals` columns *without* `payload` / `features` / `outcome_metadata`, plus the analyzer summary lifted out of the payload in SQL — `entry_price`, `stop_loss`, `take_profit_1`, `take_profit_2`, `risk_reward_ratio` (proposals) and `skip_reason`, `skip_details` (first 200 chars; skips) — and the derived `decision_kind`, `judge_ruling`, `session`, `has_setup`, `violated_rule`, `resolution_outcome`, `realized_r` |
-| `GET /api/signals/{id}` | lifecycle: the **full** signal (`SignalDetailOut` = the journal row plus `payload` / `features` / `outcome_metadata` — the only place the payload travels), agent runs in order (trimmed per-step summaries), Forecaster evaluations, the Critic's resolution + review, setup card |
+| `GET /api/signals/{id}` | lifecycle: the **full** signal (`SignalDetailOut` = the journal row plus `payload` / `features` / `outcome_metadata` — the only place the payload travels), agent runs in order (trimmed per-step summaries), Forecaster evaluations, the Critic's resolution + review, setup card (no live price: `unrealised_r: null`, `unrealised_r_note: "not fetched on this view"`) |
 | `GET /api/signals/{id}/runs/{run_id}` | one agent run's full output |
 
 Step 4.3 added the market, funnel, analytics, Critic and system-health routes
@@ -581,20 +581,20 @@ Step 4.3 added the market, funnel, analytics, Critic and system-health routes
 
 | Route | Returns |
 |---|---|
-| `GET /api/market/klines?symbol&tf=4h&limit=200` | Binance candles (`BinanceProvider` built **per request**, closed in `finally`). `symbol` must be in the dashboard's watchlist (`DashboardSettings.scan_symbols`) else 400 `unknown_symbol` before any provider is built; `tf` ∈ `Timeframe`; `limit` 1..500 |
+| `GET /api/market/klines?symbol&tf=4h&limit=200` | Binance candles (`BinanceProvider` built **per request**, closed in `finally`; markets cached per container, 12 s bound — below). `symbol` must be in the dashboard's watchlist (`DashboardSettings.scan_symbols`) else 400 `unknown_symbol` before any provider is built; `tf` ∈ `Timeframe`; `limit` 1..500 |
 | `GET /api/signals/{id}/chart?before=60&after=30` | H4 candles around the signal (`before` 1..500, `after` 0..500, window capped at now) + the chart overlay (entry/stop/TPs/POI for PUBLISHED/VETOED from the payload, GATE_REJECTED from the Analyzer run, `null` for NO_SETUP); 404 before any provider call |
 | `GET /api/funnel?since&until&group_by=day\|window\|symbol` | decision funnel (scans → proposals → gate-passed → Judge rulings → published, rejections by rule) per group + `totals`; default 30 d, ≤ 365 d. `judge_*` incl. `judge_none` sum to `gate_passed`. `AD_HOC` console scans are their own group under `group_by=window`. `top_rejections_7d` / `_30d` are anchored to **now**, not `until` |
 | `GET /api/analytics/win-rate?by=tag\|session\|strategy\|time&since&until` | published win rate per bucket; `win_rate: null` when 0 decisive (WIN/LOSS) |
-| `GET /api/analytics/skeptic-value?since&until` | counted objections (`recommends_against` or `severity == "HIGH"`) by Judge ruling: `respected` / `overruled_with_caveat` / `overruled`; NoMacroData runs excluded (`no_macro_data_excluded`) |
+| `GET /api/analytics/skeptic-value?since&until` | counted objections (`recommends_against` or `severity == "HIGH"`) by Judge ruling: `respected` / `overruled_with_caveat` / `overruled`; NoMacroData runs excluded (`no_macro_data_excluded`); a counted objection with no Judge ruling recorded is counted in `unruled` (no outcome) |
 | `GET /api/analytics/equity-curve?since&until` | cumulative R for published, plus vetoed / gate-rejected counterfactuals **from replays only** |
 | `GET /api/critic/reports?limit=10` | latest Critic reports (no markdown); `limit` 1..50 |
 | `GET /api/critic/reports/{id}` | one report: full JSONB + markdown; 404 `not_found` |
 | `GET /api/critic/reviews?limit=50&cursor` | Critic reviews newest first (keyset cursor, `error` trimmed to 500 chars); `limit` 1..200; 400 `bad_cursor` |
 | `GET /api/system/scans` | the latest 50 scan runs with `window` and `duration_s` |
-| `GET /api/system/agents?days=7` | per (UTC day, role) runs / errors / LLM cost + cost per day; `days` 1..30 |
+| `GET /api/system/agents?days=7` | per (UTC day, role) runs / errors / LLM cost + cost per day, plus the cost-free `scan` pseudo-role; `errors: null` = no failure source (below); `days` 1..30 |
 | `GET /api/system/sweeps?days=7` | Forecaster evaluations / errors per scheduled sweep (empty sweeps listed as 0/0); `days` 1..30 |
 | `GET /api/system/alarms` | the `CryptoSignals-Monitoring-*` alarm states; **always 200** (CloudWatch failure → `alarms: null` + note) |
-| `GET /api/system/metrics?days=7` | the scan Lambda's daily invocations / errors / p95 duration (function discovered via `ListMetrics`); **always 200** (`note: "scan function not found"` or `"cloudwatch unavailable"`) |
+| `GET /api/system/metrics?days=7` | the scan Lambda's daily invocations / errors / p95 duration (function discovered via `ListMetrics`); **always 200** (`note: "scan function not found"`, `"cloudwatch unavailable"` or `"cloudwatch access denied"`); `days` 1..30. **Fetch on page load / every 5–15 min, not on the 60 s poll** — `GetMetricData` is billed per metric (≈ $1.3/month at a 60 s cadence) |
 | `GET /api/system/config` | config panel **inferred** from the DB (watchlist = symbols scanned in 7 d, model = latest `agent_runs` model, macro providers = any real objection in the last 10 Skeptic outputs, Langfuse = the dashboard's own `LANGFUSE_BASE_URL`); every value carries `"inferred": true` except the schedule (`SCAN_WINDOWS`) |
 
 Analytics semantics (design §5.2a): default 90 d, ≤ 365 d (longer → 422, no SQL);
@@ -602,28 +602,50 @@ the effective outcome is the `decision_resolutions` replay when a row exists, el
 the Forecaster's `signals.outcome`; every response carries
 `source_counts: {"replayed": n, "forecaster": m}`.
 
-**LLM cost source rule** (`/api/system/agents`, `queries._USAGE_BY_DAY_SQL`):
-`agent_runs` is the source of runs and cost for **every** role, the Critic's
-successful reviews included; `decision_reviews` adds only **failed** reviews
-(`error IS NOT NULL`, zero cost — they are never in `agent_runs`);
-`setup_evaluations` is the Forecaster's source (`ERROR` rows count as errors).
+**Cost / failure source rule** (`/api/system/agents`, `queries._USAGE_BY_DAY_SQL`,
+`queries.UsageDay`):
+
+- `agent_runs` is the source of runs and cost for **every** role, the Critic's
+  successful reviews included. A row is written only on success, so it is **no
+  failure source**: a (day, role) fed by `agent_runs` alone (analyzer, historian,
+  skeptic, judge) reports **`errors: null`** — "unknown", never a claimed 0.
+- `decision_reviews` adds only **failed** reviews (`error IS NOT NULL`, zero cost —
+  never in `agent_runs`) as `critic` runs + errors. Reviews are upserted per
+  signal, so **critic failures = signals whose latest review attempt failed**.
+- `setup_evaluations` is the Forecaster's source (`ERROR` rows count as errors).
+- `scan_runs` is the **`scan` pseudo-role**: runs = rows (one per symbol per
+  invocation), errors = `FAILED` rows, cost 0 — this is where pipeline failures
+  show. It is left out of `cost_per_day.by_role` (a scan-only day lists at $0).
 
 **Long ranges are paged.** The funnel and outcome-row fetches read 365 days in
 1,000-row ascending keyset pages (`queries.read_all_pages`, 20-page guard) so no
 single Data API response approaches the 1 MB cap.
 
 **Unrealised R** (overview + `/api/setups/open`): one latest-price fetch per
-distinct OPEN-setup symbol, concurrent, 5 s overall budget. On timeout or a
-provider error the card answers 200 with `unrealised_r: null` and
-`unrealised_r_note: "price unavailable"` — Binance being slow never fails the page.
+distinct OPEN-setup symbol, concurrent, 5 s overall budget. On timeout, a
+provider error or any unexpected failure (logged with its traceback) the card
+answers 200 with `unrealised_r: null` and `unrealised_r_note: "price unavailable"`
+— Binance being slow never fails the page. The lifecycle page does not fetch a
+price; its card says `"not fetched on this view"`.
+
+**Market data cost + bound.** A fresh ccxt client would download Binance's full
+`exchangeInfo` (spot + linear + inverse, several MB) before its first candle. The
+dashboard's provider loads **linear (USDT-M) markets only** and keeps the loaded
+table in a module global for the container's life (`market._MARKETS`, captured
+after the first successful fetch), so only a cold container pays the market load.
+The klines and chart routes are bounded by `market.MARKET_BUDGET_S` = **12 s**
+(`asyncio.wait_for`); a blown budget is a `ProviderTimeoutError` → 502
+`market_unavailable`, well inside the 25 s function timeout (never a gateway 5xx).
+The scan pipeline's `BinanceProvider()` (no arguments) is unchanged.
 
 **CloudWatch degradation.** `/api/system/alarms`, `/api/system/metrics` and the
 overview alarm strip read CloudWatch with a bounded client (3 s connect, 10 s read,
-one attempt). Any `ClientError` / `BotoCoreError` (AccessDenied, throttling, no
-endpoint) — or the overview's 5 s budget expiring — yields a `null` section with
-`"cloudwatch unavailable"` and HTTP **200**. An AccessDenied shows up only as that
-note plus a WARNING in the function log, so check the log if alarms read
-unavailable for long. IAM (Step 4.3): `cloudwatch:DescribeAlarms` on
+one attempt). Any `ClientError` / `BotoCoreError` (throttling, no endpoint) — or
+the overview's 5 s budget expiring — yields a `null` section with
+`"cloudwatch unavailable"` (WARNING in the log) and HTTP **200**. An error code
+starting `AccessDenied` is an IAM gap, not a hiccup: the section note is
+**`"cloudwatch access denied"`** and the function log has it at **ERROR** — fix the
+dashboard role grants below. IAM (Step 4.3): `cloudwatch:DescribeAlarms` on
 `arn:aws:cloudwatch:<region>:<account>:alarm:CryptoSignals-Monitoring-*`;
 `cloudwatch:ListMetrics` + `cloudwatch:GetMetricData` on `*` (these two have no
 resource-level permissions — the `AwsSolutions-IAM5` suppression is justified in
@@ -682,8 +704,9 @@ Two Step 4.3 examples, as edits of the event above (everything else unchanged):
   `"/api/system/alarms"`, both `routeKey`s `"GET /api/system/alarms"`,
   `"rawQueryString": ""`. Expect 200 with the five `CryptoSignals-Monitoring-*`
   alarms (display names without the prefix / CDK hash); `"alarms": null` with
-  `"note": "cloudwatch unavailable"` means the CloudWatch call failed — the function
-  log has the AWS error code (AccessDenied → the `DescribeAlarms` resource scoping).
+  `"note": "cloudwatch unavailable"` means the CloudWatch call failed (the function
+  log has the AWS error code); `"cloudwatch access denied"` means the role lacks the
+  grant (check the `DescribeAlarms` resource scoping; ERROR in the log).
   This route does not touch Aurora, so it does not wake the cluster.
 
 **Error bodies** (`src/dashboard/api/errors.py`, app-wide; uniform `{"reason": …}`):
@@ -695,8 +718,8 @@ Two Step 4.3 examples, as edits of the event above (everything else unchanged):
 | 404 | `{"reason":"not_found"}` | `/api/signals/{id}` or `/runs/{run_id}` addresses a row that does not exist |
 | 400 | `{"reason":"bad_cursor"}` | `cursor` is not one this deployment issued (also any cursor longer than 512 characters) |
 | 400 | `{"reason":"unknown_symbol"}` | `/api/market/klines` for a symbol outside the dashboard watchlist (exact match — `btcusdt` is rejected); no provider is built |
-| 502 | `{"reason":"market_unavailable"}` | `/api/market/klines` or `/api/signals/{id}/chart` when Binance fails (any `ProviderError`: down, rate-limited, timed out, malformed); the provider message is logged at WARNING, never echoed. The setup cards' unrealised R never raises this — it degrades to `null` instead |
-| 422 | FastAPI validation body (`{"detail":[{"loc":…,"msg":…,"type":…}]}`) | request validation: `limit` outside its range (rejected, not clamped), a non-UUID `{id}` / `{run_id}`, an unknown `kind` / `outcome` / `group_by` / `by` / `tf` value, a malformed `since` / `until`, `days` outside 1..30 |
+| 502 | `{"reason":"market_unavailable"}` | `/api/market/klines` or `/api/signals/{id}/chart` when Binance fails (any `ProviderError`: down, rate-limited, timed out, malformed) or the 12 s market budget expires; the provider message is logged at WARNING, never echoed. The setup cards' unrealised R never raises this — it degrades to `null` instead |
+| 422 | FastAPI validation body (`{"detail":[{"loc":…,"msg":…,"type":…}]}`) | request validation: `limit` outside its range (rejected, not clamped), a non-UUID `{id}` / `{run_id}`, an unknown `kind` / `outcome` / `group_by` / `by` / `tf` value, a malformed `since` / `until`, `days` outside 1..30 (`/api/system/agents`, `/sweeps`, `/metrics`) |
 | 422 | `{"detail":"since must be before until"}` / `{"detail":"period exceeds 365 days"}` | funnel / analytics period checks (`period.py`) — a plain-string `detail`, not the validation list above; raised before any SQL |
 
 The dashboard store's boto3 client is itself bounded (`deps.py`: 3 s connect, 15 s
