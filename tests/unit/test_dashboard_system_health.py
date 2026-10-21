@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -28,15 +28,18 @@ from src.dashboard.api.cloudwatch import (
     get_cloudwatch_reader,
 )
 from src.dashboard.api.deps import get_store
+from src.dashboard.api.market import get_provider_factory
 from src.dashboard.api.queries import ConfigFacts, EvaluationStamp, UsageDay
 from src.dashboard.api.settings import DashboardSettings, get_dashboard_settings
 from src.persistence.models import StoredScanRun
 from tests.unit.test_dashboard_cloudwatch import ALARM, FakeReader, _client_error
 from tests.unit.test_dashboard_routes import (
+    FakeStore,
     Scenario,
     _client_for,
     _param_values,
     _scenario,
+    default_factory,
 )
 
 DAY = date(2026, 10, 21)
@@ -499,6 +502,104 @@ def test_overview_alarm_strip_degrades_on_timeout(
     health = resp.json()["health"]
     assert health["alarms"] is None and health["alarms_note"] == CLOUDWATCH_UNAVAILABLE
     assert reader.calls == [("describe_alarms", "CryptoSignals-Monitoring-")]
+
+
+@dataclass
+class _TimedStore(FakeStore):
+    """`FakeStore` whose every SQL read takes ``delay_s`` and is logged to ``events``."""
+
+    delay_s: float = 0.0
+    events: list[str] = field(default_factory=list)
+
+    async def read_rows(self, sql: str, parameters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.events.append("db")
+        await asyncio.sleep(self.delay_s)
+        return await super().read_rows(sql, parameters)
+
+
+class _LoggedSlowReader(FakeReader):
+    def __init__(self, events: list[str], delay_s: float) -> None:
+        super().__init__(alarms=[ALARM])
+        self.events = events
+        self.delay_s = delay_s
+
+    async def describe_alarms(self, prefix: str) -> list[AlarmState]:
+        self.events.append("alarms")
+        await asyncio.sleep(self.delay_s)
+        return await super().describe_alarms(prefix)
+
+
+def test_overview_fetches_alarms_and_prices_concurrently_with_db(
+    overview_scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    budget = 0.6
+    monkeypatch.setattr(cloudwatch, "ALARM_BUDGET_S", budget)
+    events: list[str] = []
+    store = _TimedStore(
+        **{f.name: getattr(overview_scenario.store, f.name) for f in fields(FakeStore)}
+    )
+    store.delay_s, store.events = 0.15, events
+    factory = default_factory()
+    real_call = factory.__call__
+
+    def logged_factory() -> Any:
+        events.append("prices")
+        return real_call()
+
+    app, client = _client_for(store, factory)
+    app.dependency_overrides[get_provider_factory] = lambda: logged_factory
+    reader = _LoggedSlowReader(events, delay_s=10.0)  # never answers: the budget decides
+    app.dependency_overrides[get_cloudwatch_reader] = lambda: reader
+
+    started = time.perf_counter()
+    resp = client.get("/api/overview")
+    elapsed = time.perf_counter() - started
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["health"]["alarms"] is None  # the budget expired, still 200
+    assert body["open_setups"][0]["unrealised_r"] == 0.5  # prices still arrived
+    last_db = len(events) - 1 - events[::-1].index("db")
+    # Both side fetches start before the store's last read -- not after all of them.
+    # (A task starts at the handler's first real suspension, i.e. inside the first read.)
+    assert events.index("alarms") <= 1
+    assert events.index("alarms") < last_db
+    assert events.index("prices") < last_db
+    db_total = events.count("db") * store.delay_s
+    assert events.count("db") >= 4
+    # Concurrent: about max(db, budget), well under the serial db + budget.
+    assert elapsed < db_total + budget - 0.2, (elapsed, db_total)
+
+
+@dataclass
+class _FailingScanStore(_TimedStore):
+    """The scan-runs read fails with a non-resume Data API error (-> 502 db_error)."""
+
+    async def read_rows(self, sql: str, parameters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if "FROM scan_runs" in sql:
+            raise _client_error("BadRequestException")
+        return await super().read_rows(sql, parameters)
+
+
+def test_overview_db_failure_cancels_side_fetches(
+    overview_scenario: Scenario, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A DB error mid-handler must not leave the alarm / price tasks running (they
+    # would outlive the request; under filterwarnings=error a destroyed pending task
+    # fails the run). The 10 s reader is cancelled, so the 502 comes back at once.
+    monkeypatch.setattr(cloudwatch, "ALARM_BUDGET_S", 30.0)
+    events: list[str] = []
+    store = _FailingScanStore(
+        **{f.name: getattr(overview_scenario.store, f.name) for f in fields(FakeStore)}
+    )
+    store.events = events
+    app, client = _client_for(store)
+    app.dependency_overrides[get_cloudwatch_reader] = lambda: _LoggedSlowReader(events, 10.0)
+    started = time.perf_counter()
+    resp = client.get("/api/overview")
+    assert time.perf_counter() - started < 5
+    assert resp.status_code == 502 and resp.json() == {"reason": "db_error"}
+    assert "alarms" in events  # it had started, and was cancelled
 
 
 def test_alarm_budget_default_is_5s() -> None:

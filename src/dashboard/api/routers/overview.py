@@ -17,10 +17,12 @@ Step 4.3: the OPEN setup cards carry a best-effort unrealised R -- one
 `market.latest_prices` call (one provider, one fetch per distinct symbol,
 5 s overall budget). Binance down or slow leaves `unrealised_r` null with
 "price unavailable"; the landing page is still 200. The alarm strip is one
-CloudWatch `DescribeAlarms` (`cloudwatch.read_alarms`), run concurrently with
-the price fetch under its own 5 s budget (`cloudwatch.ALARM_BUDGET_S`); a
-CloudWatch error or a blown budget leaves `alarms` null with
-`alarms_note = "cloudwatch unavailable"` -- still 200.
+CloudWatch `DescribeAlarms` (`cloudwatch.read_alarms`) under its own 5 s budget
+(`cloudwatch.ALARM_BUDGET_S`); a CloudWatch error or a blown budget leaves
+`alarms` null with a note -- still 200. Both side fetches run as tasks that
+overlap the DB reads (alarms from the start, prices once the cards are known),
+so the latency is about max(DB, budgets) rather than their sum; a failed DB
+read cancels them.
 """
 
 from __future__ import annotations
@@ -57,30 +59,43 @@ async def overview(
     day = now.astimezone(UTC).date()
     start_of_day = datetime(day.year, day.month, day.day, tzinfo=UTC)
 
-    # Design §5.3: the caps are computed by the gate's own context builder (no
-    # market snapshot on the dashboard -> funding is simply unknown).
-    ctx = await gather_risk_context(store=store, snapshot=None, now=now)
-    cards = await list_open_setup_cards(store)
-    # Yesterday's rows serve the last-scan badge only (no overnight blind spot).
-    scans = await list_scan_runs_since(store, since=start_of_day - timedelta(days=1))
-    todays = assembly.scans_on(scans, day)
-    rows = await list_signals_for_scans(store, scan_ids=[scan.id for scan in todays])
-    # The last finished Forecaster sweep (a separate :05 invocation; spans yesterday's
-    # windows, so it is set in practice -- the start-of-day fallback is degenerate-only).
-    sweep_at = assembly.last_sweep_at(now)
-    evaluations, errors = await count_evaluations_since(store, since=sweep_at or start_of_day)
-    # Best-effort unrealised R (Step 4.3): bounded by the 5 s budget, never raises on a
-    # provider failure -- the cards then read "price unavailable". The alarm strip is
-    # fetched concurrently; a CloudWatch error leaves it null with a note, never a 5xx.
-    prices, (alarms, alarms_note) = await asyncio.gather(
-        market.latest_prices(
-            factory,
-            sorted({card.symbol for card in cards}),
-            now=now,
-            budget_s=market.PRICE_BUDGET_S,
-        ),
-        read_alarms(cw, budget_s=cloudwatch.ALARM_BUDGET_S),
-    )
+    # The side fetches overlap the serial DB reads instead of following them: the
+    # alarm strip starts now, the prices as soon as the cards name the symbols. Both
+    # are bounded (5 s each) and never raise; a CloudWatch error leaves the strip
+    # null with a note, a provider failure leaves the cards "price unavailable".
+    alarms_task = asyncio.create_task(read_alarms(cw, budget_s=cloudwatch.ALARM_BUDGET_S))
+    prices_task: asyncio.Task[dict[str, float]] | None = None
+    try:
+        # Design §5.3: the caps are computed by the gate's own context builder (no
+        # market snapshot on the dashboard -> funding is simply unknown).
+        ctx = await gather_risk_context(store=store, snapshot=None, now=now)
+        cards = await list_open_setup_cards(store)
+        prices_task = asyncio.create_task(
+            market.latest_prices(
+                factory,
+                sorted({card.symbol for card in cards}),
+                now=now,
+                budget_s=market.PRICE_BUDGET_S,
+            )
+        )
+        # Yesterday's rows serve the last-scan badge only (no overnight blind spot).
+        scans = await list_scan_runs_since(store, since=start_of_day - timedelta(days=1))
+        todays = assembly.scans_on(scans, day)
+        rows = await list_signals_for_scans(store, scan_ids=[scan.id for scan in todays])
+        # The last finished Forecaster sweep (a separate :05 invocation; spans
+        # yesterday's windows, so it is set in practice -- the start-of-day fallback
+        # is degenerate-only).
+        sweep_at = assembly.last_sweep_at(now)
+        evaluations, errors = await count_evaluations_since(store, since=sweep_at or start_of_day)
+        prices = await prices_task
+        alarms, alarms_note = await alarms_task
+    finally:
+        # A failed DB read (503 / 502 via errors.py) must not leave a side fetch running.
+        pending = [t for t in (alarms_task, prices_task) if t is not None and not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     health = HealthStrip(
         last_scan=assembly.last_scan_outcome(scans),
