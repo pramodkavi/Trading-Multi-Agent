@@ -21,7 +21,14 @@ from src.dashboard.api.app import create_app
 from src.dashboard.api.classify import DecisionKind
 from src.dashboard.api.deps import get_store
 from src.dashboard.api.funnel import FunnelGroup, build_funnel, top_rejections
-from src.dashboard.api.queries import DecisionRow, list_decisions_between
+from src.dashboard.api.queries import (
+    ASC_KEYSET_PREDICATE,
+    PAGE_LIMIT_SQL,
+    DecisionRow,
+    list_decisions_between,
+    read_all_pages,
+)
+from src.persistence.store import _str_param
 
 NOW = datetime(2026, 10, 21, 12, 0, 0, tzinfo=UTC)
 
@@ -227,32 +234,133 @@ def _wire(row: DecisionRow) -> dict[str, Any]:
     }
 
 
+def _params(parameters: list[dict[str, Any]]) -> dict[str, Any]:
+    """Data API parameter list -> {name: python value}."""
+    out: dict[str, Any] = {}
+    for p in parameters:
+        value = p["value"]
+        if value.get("isNull"):
+            out[p["name"]] = None
+        elif "stringValue" in value:
+            out[p["name"]] = value["stringValue"]
+        else:
+            out[p["name"]] = value["longValue"]
+    return out
+
+
 @dataclass
 class FunnelReader:
-    """Serves the funnel statement only, honouring the bound `since` / `until`."""
+    """Serves the funnel statement only: `since` / `until`, ascending keyset, page limit."""
 
     rows: list[DecisionRow] = field(default_factory=list)
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
 
     async def read_rows(self, sql: str, parameters: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        params = {p["name"]: p["value"]["stringValue"] for p in parameters}
+        params = _params(parameters)
         self.calls.append((sql, params))
         if "AS scan_started_at" not in sql:
             raise AssertionError(f"unexpected SQL: {sql}")
         since = datetime.fromisoformat(params["since"])
         until = datetime.fromisoformat(params["until"])
-        return [_wire(r) for r in self.rows if since <= r.created_at < until]
+        selected = sorted(
+            (r for r in self.rows if since <= r.created_at < until),
+            key=lambda r: (r.created_at, str(r.id)),
+        )
+        if params["after_ts"] is not None:
+            after = (datetime.fromisoformat(params["after_ts"]), params["after_id"])
+            selected = [r for r in selected if (r.created_at, str(r.id)) > after]
+        return [_wire(r) for r in selected[: params["page_limit"]]]
+
+
+@dataclass
+class PagedReader:
+    """Returns canned pages in order; records each call's parameters."""
+
+    pages: list[list[dict[str, Any]]]
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    async def read_rows(self, sql: str, parameters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        self.calls.append(_params(parameters))
+        return self.pages[len(self.calls) - 1]
+
+
+_PAGED_SQL = f"SELECT 1 FROM signals s WHERE {ASC_KEYSET_PREDICATE} {PAGE_LIMIT_SQL}"
+
+
+def _page(n: int, *, start: datetime) -> list[dict[str, Any]]:
+    return [
+        {"id": str(uuid4()), "created_at": (start + timedelta(seconds=i)).isoformat()}
+        for i in range(n)
+    ]
+
+
+def test_read_all_pages_advances_keyset_and_stops() -> None:
+    first = _page(1000, start=_ts(1, 0))
+    second = _page(1000, start=_ts(2, 0))
+    third = _page(3, start=_ts(3, 0))
+    reader = PagedReader(pages=[first, second, third])
+    since = _str_param("since", "x")
+    rows = asyncio.run(read_all_pages(reader, _PAGED_SQL, [since]))
+    assert len(rows) == 2003
+    assert rows == [*first, *second, *third]
+    assert len(reader.calls) == 3
+    assert all(c["page_limit"] == 1000 and c["since"] == "x" for c in reader.calls)
+    assert reader.calls[0]["after_ts"] is None
+    assert reader.calls[0]["after_id"] is None
+    for call, previous in zip(reader.calls[1:], (first, second), strict=True):
+        assert datetime.fromisoformat(call["after_ts"]) == datetime.fromisoformat(
+            previous[-1]["created_at"]
+        )
+        assert call["after_id"] == previous[-1]["id"]
+
+
+def test_read_all_pages_single_short_page() -> None:
+    reader = PagedReader(pages=[_page(3, start=_ts(1, 0))])
+    rows = asyncio.run(read_all_pages(reader, _PAGED_SQL, []))
+    assert len(rows) == 3
+    assert len(reader.calls) == 1
+    # An exactly-empty first page is a single call too.
+    empty = PagedReader(pages=[[]])
+    assert asyncio.run(read_all_pages(empty, _PAGED_SQL, [])) == []
+    assert len(empty.calls) == 1
+
+
+def test_read_all_pages_guard_raises() -> None:
+    reader = PagedReader(pages=[_page(2, start=_ts(d, 0)) for d in range(1, 5)])
+    with pytest.raises(RuntimeError, match="result too large: more than 6 rows"):
+        asyncio.run(read_all_pages(reader, _PAGED_SQL, [], page_size=2, max_pages=3))
+    assert len(reader.calls) == 3
+    # A statement without the keyset / page limit is refused before any call.
+    with pytest.raises(ValueError, match="keyset"):
+        asyncio.run(read_all_pages(reader, "SELECT 1", []))
+    assert len(reader.calls) == 3
+
+
+def test_decisions_between_pages_through_fake_reader() -> None:
+    # 2 500 rows over three pages come back whole and in order.
+    rows = [_no_setup(_ts(1, 0) + timedelta(seconds=i)) for i in range(2500)]
+    reader = FunnelReader(rows=rows)
+    got = asyncio.run(list_decisions_between(reader, since=_ts(1, 0), until=_ts(30, 0)))
+    assert [r.id for r in got] == [r.id for r in rows]
+    assert len(reader.calls) == 3
 
 
 def test_decisions_between_sql_shape_minimal_columns() -> None:
     reader = FunnelReader(rows=_fixture_rows())
     rows = asyncio.run(list_decisions_between(reader, since=_ts(20, 0), until=_ts(21, 0)))
     assert len(rows) == 7
-    assert rows[0].decision_kind is DecisionKind.PUBLISHED
-    assert rows[0].scan_started_at == LONDON_20
+    # The four LONDON rows share created_at (ties order by id): compare as a set.
+    assert {r.decision_kind for r in rows[:4]} == set(DecisionKind)
+    assert {r.scan_started_at for r in rows[:4]} == {LONDON_20}
 
     ((sql, params),) = reader.calls
-    assert params == {"since": _ts(20, 0).isoformat(), "until": _ts(21, 0).isoformat()}
+    assert params == {
+        "since": _ts(20, 0).isoformat(),
+        "until": _ts(21, 0).isoformat(),
+        "after_ts": None,
+        "after_id": None,
+        "page_limit": 1000,
+    }
     # Minimal columns (Data API 1 MB cap): no whole JSONB, no journal extras.
     for forbidden in ("payload::text", "output::text", "features", "outcome_metadata", "SELECT *"):
         assert forbidden not in sql
@@ -263,7 +371,13 @@ def test_decisions_between_sql_shape_minimal_columns() -> None:
     assert "LEFT JOIN LATERAL" in sql
     assert "EXISTS (SELECT 1 FROM active_setups t WHERE t.signal_id = s.id) AS has_setup" in sql
     assert "s.created_at >= :since::timestamptz AND s.created_at < :until::timestamptz" in sql
-    assert "ORDER BY s.created_at" in sql
+    assert "ORDER BY s.created_at ASC, s.id ASC" in sql
+    # Paged in keyset chunks (Data API 1 MB cap at 365 days).
+    assert (
+        "(:after_ts::timestamptz IS NULL OR "
+        "(s.created_at, s.id) > (:after_ts::timestamptz, :after_id::uuid))"
+    ) in sql
+    assert sql.rstrip().endswith("LIMIT :page_limit")
     # Every value is bound: the timestamps never appear in the SQL text.
     assert "2026-10" not in sql
 

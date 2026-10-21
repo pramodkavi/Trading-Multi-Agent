@@ -44,6 +44,8 @@ from src.persistence.repositories import _parse_jsonb_field
 from src.persistence.store import _cursor_params, _long_param, _str_param, _utc_iso
 
 __all__ = [
+    "ASC_KEYSET_PREDICATE",
+    "PAGE_LIMIT_SQL",
     "DashboardReader",
     "DecisionRow",
     "JournalRow",
@@ -57,6 +59,7 @@ __all__ = [
     "list_scan_runs_since",
     "list_signals_for_scans",
     "list_signals_page",
+    "read_all_pages",
 ]
 
 logger = logging.getLogger(__name__)
@@ -312,6 +315,54 @@ WHERE s.scan_id = ANY(string_to_array(:ids, ',')::uuid[])
 # Funnel (P4)
 # ---------------------------------------------------------------------------
 
+# Ascending keyset over ``(s.created_at, s.id)`` for :func:`read_all_pages`; both
+# cursor params NULL on the first page (``store._cursor_params(None)``).
+ASC_KEYSET_PREDICATE = (
+    "(:after_ts::timestamptz IS NULL OR "
+    "(s.created_at, s.id) > (:after_ts::timestamptz, :after_id::uuid))"
+)
+PAGE_LIMIT_SQL = "LIMIT :page_limit"
+
+
+async def read_all_pages(
+    reader: DashboardReader,
+    sql_with_keyset: str,
+    params: list[dict[str, Any]],
+    *,
+    page_size: int = 1000,
+    max_pages: int = 20,
+) -> list[dict[str, Any]]:
+    """Every row of a range statement, fetched in keyset pages (Data API 1 MB cap).
+
+    A 365-day aggregate can exceed the Data API's 1 MB response, so the range
+    readers (the funnel's :func:`list_decisions_between`, Task 3's
+    ``list_outcome_rows``) page through it instead of reading it in one call.
+    ``sql_with_keyset`` must contain :data:`ASC_KEYSET_PREDICATE` in its
+    ``WHERE``, end with ``ORDER BY s.created_at ASC, s.id ASC`` +
+    :data:`PAGE_LIMIT_SQL`, and project ``id`` and ``created_at`` (the
+    ``_utc_iso`` string). The cursor advances from the last row of each page
+    until a page returns fewer than ``page_size`` rows. More than
+    ``max_pages * page_size`` rows raises ``RuntimeError`` rather than looping on.
+    """
+    if ASC_KEYSET_PREDICATE not in sql_with_keyset or PAGE_LIMIT_SQL not in sql_with_keyset:
+        raise ValueError("statement lacks the ascending keyset predicate / LIMIT :page_limit")
+    if page_size < 1 or max_pages < 1:
+        raise ValueError("page_size and max_pages must be >= 1")
+    rows: list[dict[str, Any]] = []
+    after: tuple[datetime, UUID] | None = None
+    for _ in range(max_pages):
+        page = await reader.read_rows(
+            sql_with_keyset,
+            [*params, *_cursor_params(after), _long_param("page_limit", page_size)],
+        )
+        rows.extend(page)
+        if len(page) < page_size:
+            return rows
+        last = page[-1]
+        after = (datetime.fromisoformat(str(last["created_at"])), UUID(str(last["id"])))
+    raise RuntimeError(f"result too large: more than {max_pages * page_size} rows")
+
+
 # The funnel projection: eight short columns per decision, nothing from the payload
 # but the one ``violated_rule`` extract. ``scan_started_at`` is the funnel's marker.
 _DECISIONS_BETWEEN_SQL = f"""SELECT s.id::text AS id,
@@ -324,14 +375,21 @@ _DECISIONS_BETWEEN_SQL = f"""SELECT s.id::text AS id,
        {_HAS_SETUP_SQL}
 {_SIGNAL_SCAN_JUDGE_FROM}
 WHERE s.created_at >= :since::timestamptz AND s.created_at < :until::timestamptz
-ORDER BY s.created_at ASC, s.id ASC"""
+  AND {ASC_KEYSET_PREDICATE}
+ORDER BY s.created_at ASC, s.id ASC
+{PAGE_LIMIT_SQL}"""
 
 
 async def list_decisions_between(
     reader: DashboardReader, *, since: datetime, until: datetime
 ) -> list[DecisionRow]:
-    """Every decision with ``since <= created_at < until``, oldest first (the funnel)."""
-    rows = await reader.read_rows(
+    """Every decision with ``since <= created_at < until``, oldest first (the funnel).
+
+    Read in 1 000-row keyset pages (:func:`read_all_pages`) so a capped year never
+    hits the Data API's 1 MB response limit.
+    """
+    rows = await read_all_pages(
+        reader,
         _DECISIONS_BETWEEN_SQL,
         [_str_param("since", since.isoformat()), _str_param("until", until.isoformat())],
     )
