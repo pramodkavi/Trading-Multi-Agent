@@ -1,7 +1,8 @@
 """Slice 4 Step 4.1 — dashboard API skeleton: app factory, /api/health, Mangum handler.
 
 The `lambda_event_loop` fixture used by the direct `handler(...)` tests lives in
-`tests/unit/conftest.py` (shared with the Step 4.2 route tests).
+`tests/unit/conftest.py` (shared with the Step 4.2 route tests); the v2 event /
+context builders live in `tests/unit/dashboard_fakes.py`.
 """
 
 from __future__ import annotations
@@ -12,56 +13,9 @@ from typing import Any
 import boto3
 import pytest
 from fastapi.testclient import TestClient
-from mangum.types import LambdaCognitoIdentity, LambdaMobileClientContext
 
 from src.dashboard.api.app import create_app, handler
-
-
-def _v2_event(path: str = "/api/health", method: str = "GET") -> dict[str, Any]:
-    """Minimal API Gateway HTTP API payload-2.0 event for the $default stage."""
-    return {
-        "version": "2.0",
-        "routeKey": f"{method} {path}",
-        "rawPath": path,
-        "rawQueryString": "",
-        "headers": {"host": "abc.execute-api.ap-south-1.amazonaws.com", "accept": "*/*"},
-        "requestContext": {
-            "accountId": "123456789012",
-            "apiId": "abc",
-            "domainName": "abc.execute-api.ap-south-1.amazonaws.com",
-            "domainPrefix": "abc",
-            "requestId": "req-1",
-            "routeKey": f"{method} {path}",
-            "stage": "$default",
-            "time": "20/Oct/2026:10:00:00 +0000",
-            "timeEpoch": 1792490400000,
-            "http": {
-                "method": method,
-                "path": path,
-                "protocol": "HTTP/1.1",
-                "sourceIp": "203.0.113.1",
-                "userAgent": "pytest",
-            },
-        },
-        "isBase64Encoded": False,
-    }
-
-
-class _Ctx:
-    """Structural stand-in for `mangum.types.LambdaContext`."""
-
-    aws_request_id = "req-1"
-    function_name = "dashboard-api"
-    function_version = "$LATEST"
-    memory_limit_in_mb = 512
-    invoked_function_arn = "arn:aws:lambda:ap-south-1:123456789012:function:dashboard-api"
-    log_group_name = "/aws/lambda/dashboard-api"
-    log_stream_name = "2026/10/20/[$LATEST]abc"
-    identity: LambdaCognitoIdentity | None = None
-    client_context: LambdaMobileClientContext | None = None
-
-    def get_remaining_time_in_millis(self) -> int:
-        return 25_000
+from tests.unit.dashboard_fakes import CLAIMS, _Ctx, _v2_event
 
 
 def test_health_returns_ok_and_version() -> None:
@@ -117,4 +71,4 @@ def test_lambda_handler_serves_http_api_v2_event(monkeypatch: pytest.MonkeyPatch
 
 @pytest.mark.usefixtures("lambda_event_loop")
 def test_lambda_handler_404_for_unknown_path() -> None:
-    assert handler(_v2_event("/api/nope"), _Ctx())["statusCode"] == 404
+    assert handler(_v2_event("/api/nope", claims=CLAIMS), _Ctx())["statusCode"] == 404
