@@ -539,16 +539,18 @@ The FastAPI app also defines `/api/openapi.json` and `/api/docs` (`openapi_url` 
 behind the JWT authorizer (design §6: "OpenAPI served at `/api/docs` (behind the
 authorizer)").
 
-A request also produces one line in `DashboardApiAccessLogs`; the fields should be
-real values, not all `-` (CDK's default access-log format uses REST-era variables —
-if they come out blank, switch to an HTTP-API-specific format in Step 4.4).
+A request also produces one line in `DashboardApiAccessLogs` — since Step 4.2 a
+JSON object per request (`routeKey`, `path`, `status`, … — fields in §8.6). Before
+4.2 the stage used CDK's default Common Log Format, whose REST-era
+`$context.resourcePath` an HTTP API logs as `-` (`"GET - HTTP/1.1" 200 35`).
 
 ### 8.4 Console editing
 
 The function is zip-packaged like the scan Lambda (§4.1): **Code** tab shows
 `src/dashboard/api/…`, Deploy, then call the URL. The same caveat applies — any
-`cdk deploy` replaces console edits with the git contents. There is no console
-**Test** event for an HTTP API Lambda worth saving; use the URL.
+`cdk deploy` replaces console edits with the git contents. For `/api/health` use
+the URL; for the data routes, which are not routed until Step 4.4, use the
+console **Test** event in §8.6.
 
 ### 8.5 Removal
 
@@ -558,3 +560,81 @@ pipeline stacks. No workflow exposes `cdk destroy` for it (the deploy workflow's
 `recreate_stateless_stacks` covers Monitoring / Scheduling / Compute only), and the
 hard rule rules out a local CLI — the console delete is the path. Note that the next
 `cdk deploy --all` recreates it.
+
+### 8.6 Data routes before Step 4.4 (console-only)
+
+Step 4.2 added the first data routes to the FastAPI app (`src/dashboard/api/routers/`):
+
+| Route | Returns |
+|---|---|
+| `GET /api/system/db` | `{"db": "ok" \| "resuming" \| "error", "latency_ms": …}` — the DB probe; **always 200** (it catches the Data API error itself because it *is* the probe) |
+| `GET /api/overview` | health strip, risk budget (the §1.6 gates via `risk_gates`), open setups, today's scan windows (`src/common/schedule.py`), Forecaster coverage (`last_sweep_at`); `alarms: null` until Step 4.3 |
+| `GET /api/setups/open` | OPEN setups with signal summary + latest evaluation; `unrealised_r: null` until Step 4.3 |
+| `GET /api/signals?since&until&symbol&kind&outcome&tag&session&violated_rule&limit&cursor` | journal page with the derived decision kind (`classify.py`); `limit` 1..200 (default 50); `cursor` is the opaque keyset cursor from the previous page |
+| `GET /api/signals/{id}` | lifecycle: signal, agent runs in order (trimmed per-step summaries), Historian neighbours, Forecaster evaluations, setup row |
+| `GET /api/signals/{id}/runs/{run_id}` | one agent run's full output |
+
+**None of these is routed through the HTTP API yet.** The API still has the single
+route `GET /api/health`; every other path returns API Gateway's
+`{"message":"Not Found"}`. The data routes read Aurora, and there is no
+authentication until Step 4.4 adds the Cognito JWT authorizer — routing them earlier
+would let any scanner read the journal and keep the cluster awake. Step 4.4 adds
+`ANY /api/{proxy+}` behind the authorizer; until then the only way to exercise a
+data route is the Lambda console.
+
+**Exercising one from the Lambda console.** Lambda → `DashboardApi…` function →
+**Test** → create a new event (name it e.g. `api-overview`) with a minimal API
+Gateway **v2** (HTTP API) payload — Mangum needs `version`, `rawPath`,
+`rawQueryString`, `headers` and `requestContext.http`; the rest is filler:
+
+```json
+{
+  "version": "2.0",
+  "routeKey": "GET /api/overview",
+  "rawPath": "/api/overview",
+  "rawQueryString": "",
+  "headers": {"host": "s2bc8yifa1.execute-api.ap-south-1.amazonaws.com"},
+  "requestContext": {
+    "http": {"method": "GET", "path": "/api/overview", "protocol": "HTTP/1.1",
+             "sourceIp": "127.0.0.1", "userAgent": "console"},
+    "requestId": "console", "stage": "$default", "routeKey": "GET /api/overview",
+    "accountId": "097853039368", "apiId": "s2bc8yifa1",
+    "domainName": "s2bc8yifa1.execute-api.ap-south-1.amazonaws.com",
+    "domainPrefix": "s2bc8yifa1", "time": "21/Oct/2026:00:00:00 +0000", "timeEpoch": 0
+  },
+  "isBase64Encoded": false
+}
+```
+
+Change `rawPath` (and the two `routeKey` / `http.path` copies) for another route;
+query parameters go in `rawQueryString` (e.g. `"limit=5&symbol=BTCUSDT"` — Mangum
+reads that field, not `queryStringParameters`). The response is the Lambda proxy
+shape: `{"statusCode": 200, "headers": {...}, "body": "<JSON string>",
+"isBase64Encoded": false}`. Save the event — it survives in the console and is the
+smoke test for any console edit of a data route (§8.4).
+
+**Error bodies** (`src/dashboard/api/errors.py`, app-wide; uniform `{"reason": …}`):
+
+| Status | Body | When |
+|---|---|---|
+| 503 + `Retry-After: 10` | `{"reason":"db_resuming"}` | Aurora is waking from scale-to-zero (`DatabaseResumingException`). The dashboard store is built with `resume_attempts=1` — **no retry**, the first resume error propagates at once (the scan Lambda's default budget is 6 attempts / ~75 s) — because an HTTP request behind API Gateway's 30 s cap cannot wait out the resume. |
+| 502 | `{"reason":"db_error"}` | any other Data API `ClientError`; the AWS code + message are in the function log at WARNING, never in the body |
+| 404 | `{"reason":"not_found"}` | `/api/signals/{id}` or `/runs/{run_id}` addresses a row that does not exist |
+| 400 | `{"reason":"bad_cursor"}` | `cursor` is not one this deployment issued |
+
+**Expect the first call after idle to return 503 `db_resuming`** (Aurora takes
+~10–30 s to resume); re-run the Test after ~10 s and it answers 200. `/api/system/db`
+reports the same state as `{"db":"resuming"}` with a 200 instead. Every Test
+invocation of a data route wakes the cluster (the usual scale-to-zero cost note
+applies — do not poll it in a loop).
+
+**Access-log fields.** Since Step 4.2 the `$default` stage writes one JSON object
+per request to `DashboardApiAccessLogs` (`ACCESS_LOG_FORMAT` in
+`infrastructure/stacks/dashboard_stack.py`): `requestId`, `ip`, `requestTime`,
+`method`, `routeKey`, `path`, `status`, `responseLength`, `integrationLatency`,
+`integrationError`. `routeKey` is the matched route (`GET /api/health`), `path`
+the raw request path (populated even when no route matched); `integrationError`
+is non-empty only when API Gateway, not the app, produced the 5xx. From Step 4.4 these
+lines are also the only record of requests the JWT authorizer rejects before the
+Lambda runs. Console Test invocations bypass the API and therefore write no access-log
+line — only the function log.

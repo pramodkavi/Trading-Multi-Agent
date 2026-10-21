@@ -295,6 +295,8 @@ OpenAPI served at `/api/docs` (behind the authorizer). Pagination is `?limit=&cu
 | `GET /api/market/klines?symbol=&tf=H4&limit=` | P5, P2 | OHLCV via `BinanceProvider` |
 | `GET /api/system/scans` , `/api/system/agents` , `/api/system/alarms` , `/api/system/metrics` , `/api/system/config` | P7 | as described in §4.2 P7 |
 
+Step 4.2 implemented `/api/system/db`, `/api/overview`, `/api/setups/open`, `/api/signals`, `/api/signals/{id}` (+ `/runs/{run_id}`) in the FastAPI app; they are routed through the HTTP API from Step 4.4 together with the authorizer.
+
 ### 6.2 Module layout
 
 ```
