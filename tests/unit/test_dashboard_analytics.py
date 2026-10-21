@@ -206,6 +206,7 @@ def test_skeptic_value_buckets_and_no_macro_excluded() -> None:
     assert value.overruled_with_caveat == SkepticBucket(n=1, wins=1, losses=0, win_rate=1.0)
     assert value.overruled == SkepticBucket(n=2, wins=0, losses=2, win_rate=0.0)
     assert value.no_macro_data_excluded == 2
+    assert value.unruled == 0
     # Sources of the outcomes that landed in a bucket: 3 replayed, 2 forecaster.
     assert value.source_counts == SourceCounts(replayed=3, forecaster=2)
 
@@ -223,6 +224,23 @@ def test_skeptic_counts_only_high_or_recommends_against() -> None:
     assert value.respected.n == 1
     assert value.overruled_with_caveat == SkepticBucket(n=0, wins=0, losses=0, win_rate=None)
     assert value.no_macro_data_excluded == 0
+    assert value.unruled == 0
+
+
+def test_skeptic_counted_objection_without_ruling_is_unruled() -> None:
+    # The Skeptic objected but no Judge ruling was recorded (Judge failed / pipeline
+    # aborted): counted, outside the three bars, with no outcome and no source.
+    orphan = _o(P, severity="HIGH", against=True, signal_outcome="WIN").model_copy(
+        update={"judge_ruling": None}
+    )
+    odd = _o(P, severity="HIGH", against=True).model_copy(update={"judge_ruling": "MAYBE"})
+    weak = _o(P, severity="LOW", against=False).model_copy(update={"judge_ruling": None})
+    rows = [orphan, odd, weak, _o(P, severity="HIGH", against=True, signal_outcome="LOSS")]
+    value = skeptic_value(rows)
+    assert value.unruled == 2  # `weak` is not a counted objection
+    assert value.overruled == SkepticBucket(n=1, wins=0, losses=1, win_rate=0.0)
+    assert value.respected.n == 0 and value.overruled_with_caveat.n == 0
+    assert value.source_counts == SourceCounts(replayed=0, forecaster=1)
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +526,7 @@ def test_analytics_routes_defaults_and_422(frozen_clock: datetime) -> None:
     assert skeptic["overruled_with_caveat"] == {"n": 1, "wins": 1, "losses": 0, "win_rate": 1.0}
     assert skeptic["overruled"] == {"n": 0, "wins": 0, "losses": 0, "win_rate": None}
     assert skeptic["no_macro_data_excluded"] == 1
+    assert skeptic["unruled"] == 0
     assert skeptic["source_counts"] == {"replayed": 1, "forecaster": 1}
 
     equity = client.get("/api/analytics/equity-curve").json()

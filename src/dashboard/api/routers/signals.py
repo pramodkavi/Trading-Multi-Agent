@@ -25,7 +25,8 @@
   Analyzer run's rejected proposal for a GATE_REJECTED one, `null` for NO_SETUP.
   404 before any provider is built; a `ProviderError` is 502 `market_unavailable`.
   The lifecycle's setup card carries no live price (`unrealised_r` null with
-  "price unavailable"); the overview / setups pages fetch it.
+  "not fetched on this view" -- distinct from "price unavailable", which means
+  the fetch failed); the overview / setups pages fetch it.
 """
 
 from __future__ import annotations
@@ -162,7 +163,11 @@ async def signal_lifecycle(store: StoreDep, signal_id: UUID) -> LifecycleRespons
         if resolution is None
         else ResolutionOut.model_validate(resolution.model_dump()),
         review=None if review is None else ReviewOut.model_validate(review.model_dump()),
-        setup=None if card is None else assembly.setup_card_out(card, now=now),
+        setup=None
+        if card is None
+        else assembly.setup_card_out(
+            card, now=now, price=None, unavailable_note=assembly.PRICE_NOT_FETCHED
+        ),
     )
 
 

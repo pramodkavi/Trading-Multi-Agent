@@ -31,6 +31,7 @@ from src.common.schedule import AD_HOC
 from src.dashboard.api.classify import DecisionKind
 from src.dashboard.api.overview import (
     AD_HOC_GROUP_TOLERANCE,
+    PRICE_NOT_FETCHED,
     SWEEP_OFFSET,
     SWEEP_RUN_BUDGET,
     bucket_windows,
@@ -503,9 +504,21 @@ def test_setup_card_out_unrealised_r_from_price() -> None:
     assert out.unrealised_r is None and out.unrealised_r_note == "risk undefined (entry == stop)"
 
 
+def test_setup_card_out_price_is_required_and_note_is_caller_given() -> None:
+    now = _at(13, 10)
+    card = _card(opened_at=now, last_evaluated_at=None)
+    with pytest.raises(TypeError):
+        setup_card_out(card, now=now)  # type: ignore[call-arg]
+    out = setup_card_out(card, now=now, price=None, unavailable_note=PRICE_NOT_FETCHED)
+    assert out.unrealised_r is None and out.unrealised_r_note == "not fetched on this view"
+    # A real price wins over the note; a zero-risk card still says so.
+    out = setup_card_out(card, now=now, price=97.0, unavailable_note=PRICE_NOT_FETCHED)
+    assert out.unrealised_r == 1.5 and out.unrealised_r_note is None
+
+
 def test_setup_card_out_without_evaluation() -> None:
     now = _at(13, 10)
-    out = setup_card_out(_card(opened_at=now, last_evaluated_at=None), now=now)
+    out = setup_card_out(_card(opened_at=now, last_evaluated_at=None), now=now, price=None)
     assert out.age_seconds == 0
     assert out.last_evaluated_at is None and out.evaluation_age_seconds is None
     assert out.latest_status is None and out.latest_reasoning is None
@@ -516,7 +529,7 @@ def test_setup_card_out_clamps_negative_ages() -> None:
     future = _card(
         opened_at=now + timedelta(seconds=5), last_evaluated_at=now + timedelta(seconds=5)
     )
-    out = setup_card_out(future, now=now)
+    out = setup_card_out(future, now=now, price=None)
     assert out.age_seconds == 0 and out.evaluation_age_seconds == 0
 
 

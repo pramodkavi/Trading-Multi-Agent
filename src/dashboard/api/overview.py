@@ -67,6 +67,7 @@ from src.persistence.models import StoredActiveSetup, StoredAgentRun, StoredScan
 
 __all__ = [
     "AD_HOC_GROUP_TOLERANCE",
+    "PRICE_NOT_FETCHED",
     "PRICE_UNAVAILABLE",
     "SWEEP_OFFSET",
     "SWEEP_RUN_BUDGET",
@@ -319,17 +320,27 @@ def count_stale(cards: Sequence[SetupCard], *, sweep_at: datetime | None) -> int
 
 
 PRICE_UNAVAILABLE = "price unavailable"
+PRICE_NOT_FETCHED = "not fetched on this view"
 ZERO_RISK = "risk undefined (entry == stop)"
 
 
-def setup_card_out(card: SetupCard, *, now: datetime, price: float | None = None) -> SetupCardOut:
+def setup_card_out(
+    card: SetupCard,
+    *,
+    now: datetime,
+    price: float | None,
+    unavailable_note: str = PRICE_UNAVAILABLE,
+) -> SetupCardOut:
     """Add the clock-relative ages, the latest verdict and the best-effort unrealised R.
 
-    ``price`` is the latest close the router fetched (``market.latest_prices``);
-    ``None`` -- provider down, budget blown, no candles, or a caller that does not
-    fetch prices (the lifecycle page) -- leaves ``unrealised_r`` null with
-    :data:`PRICE_UNAVAILABLE`. A degenerate ``entry == stop`` card (no risk unit)
-    gets :data:`ZERO_RISK` instead of failing the page.
+    ``price`` is required so every caller decides: the latest close the router
+    fetched (``market.latest_prices``), or ``None``. ``None`` leaves
+    ``unrealised_r`` null with ``unavailable_note`` -- :data:`PRICE_UNAVAILABLE`
+    (the default: provider down, budget blown, no candles) or, for a view that
+    does not fetch prices at all (the lifecycle page), :data:`PRICE_NOT_FETCHED`
+    so the UI never reports a phantom Binance outage. A degenerate
+    ``entry == stop`` card (no risk unit) gets :data:`ZERO_RISK` instead of
+    failing the page.
     """
     evaluation = card.latest_evaluation or {}
     status = evaluation.get("status")
@@ -337,7 +348,7 @@ def setup_card_out(card: SetupCard, *, now: datetime, price: float | None = None
     r_value: float | None = None
     r_note: str | None = None
     if price is None:
-        r_note = PRICE_UNAVAILABLE
+        r_note = unavailable_note
     else:
         try:
             r_value = market.unrealised_r(card.direction, card.entry_price, card.stop_loss, price)

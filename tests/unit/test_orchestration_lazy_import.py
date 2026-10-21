@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 import src.agents.orchestration as orchestration
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]  # `import src...` from any start dir
 
 _PROBE = (
     "import sys, src.agents.orchestration.risk_gates as r; "
@@ -24,7 +27,12 @@ _PROBE = (
 
 def test_importing_risk_gates_does_not_load_langgraph_or_anthropic() -> None:
     result = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, text=True, check=True, timeout=120
+        [sys.executable, "-c", _PROBE],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+        cwd=_REPO_ROOT,
     )
     assert result.stdout.split() == ["False", "False"], result.stdout
 

@@ -17,7 +17,10 @@ the scan Lambda's daily invocation / error / p95-duration metrics). Rules:
 * **A CloudWatch hiccup never takes a page down.** The reader lets
   ``ClientError`` / ``BotoCoreError`` propagate; the routes catch them
   (:func:`read_alarms` and the metrics route) and answer **200** with the
-  section ``null`` and ``note = "cloudwatch unavailable"``.
+  section ``null`` and ``note = "cloudwatch unavailable"`` -- or
+  ``"cloudwatch access denied"`` (logged at ERROR) when the error code starts
+  with ``AccessDenied``: an IAM gap is a deploy bug, not a hiccup
+  (:func:`failure_note`).
 
 Routes depend on :data:`CloudWatchDep` (``get_cloudwatch_reader``), never on a
 client, so tests override the dependency (or the cached ``_CLIENT``) and no
@@ -42,6 +45,7 @@ __all__ = [
     "ALARM_BUDGET_S",
     "ALARM_PREFIX",
     "CLIENT_CONFIG",
+    "CLOUDWATCH_ACCESS_DENIED",
     "CLOUDWATCH_UNAVAILABLE",
     "SCAN_FUNCTION_PREFIX",
     "AlarmState",
@@ -50,6 +54,7 @@ __all__ = [
     "CloudWatchReader",
     "MetricDay",
     "display_name",
+    "failure_note",
     "get_cloudwatch_client",
     "get_cloudwatch_reader",
     "read_alarms",
@@ -62,8 +67,10 @@ logger = logging.getLogger(__name__)
 ALARM_PREFIX: Final = "CryptoSignals-Monitoring-"
 # ComputeStack's scan function, CDK-named `CryptoSignals-Compute-ScanLambda<hash>-<suffix>`.
 SCAN_FUNCTION_PREFIX: Final = "CryptoSignals-Compute-ScanLambda"
-# The section note when CloudWatch refused or failed (AccessDenied, throttling, network).
+# The section note when CloudWatch failed (throttling, network, timeout).
 CLOUDWATCH_UNAVAILABLE: Final = "cloudwatch unavailable"
+# The section note when the dashboard role lacks a CloudWatch permission (an IAM bug).
+CLOUDWATCH_ACCESS_DENIED: Final = "cloudwatch access denied"
 
 # Overall budget for the overview's alarm-strip fetch. Routers read it at call time
 # (`cloudwatch.ALARM_BUDGET_S`) so tests can shrink it, like `market.PRICE_BUDGET_S`.
@@ -349,6 +356,25 @@ async def read_alarms(
         logger.warning("CloudWatch DescribeAlarms exceeded the %.1f s budget", budget_s)
         return None, CLOUDWATCH_UNAVAILABLE
     except (ClientError, BotoCoreError) as exc:
-        logger.warning("CloudWatch DescribeAlarms failed: %s", exc)
-        return None, CLOUDWATCH_UNAVAILABLE
+        return None, failure_note("DescribeAlarms", exc)
     return alarms, None
+
+
+def failure_note(operation: str, exc: ClientError | BotoCoreError) -> str:
+    """Log a CloudWatch failure and return the section note for it.
+
+    An ``AccessDenied*`` error code is an IAM gap in the deployed role -- a bug,
+    not a hiccup -- so it is logged at ERROR and gets its own note
+    (:data:`CLOUDWATCH_ACCESS_DENIED`); anything else (throttling, network) is a
+    WARNING with :data:`CLOUDWATCH_UNAVAILABLE`. Never raises.
+    """
+    code = (
+        str(exc.response.get("Error", {}).get("Code", "")) if isinstance(exc, ClientError) else ""
+    )
+    if code.startswith("AccessDenied"):
+        logger.error(
+            "CloudWatch %s denied (%s): %s -- check the dashboard role", operation, code, exc
+        )
+        return CLOUDWATCH_ACCESS_DENIED
+    logger.warning("CloudWatch %s failed: %s", operation, exc)
+    return CLOUDWATCH_UNAVAILABLE

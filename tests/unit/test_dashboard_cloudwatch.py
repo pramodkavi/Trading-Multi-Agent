@@ -8,6 +8,7 @@ client factory, and the routes get a fake `CloudWatchReader` through the
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, date, datetime
 from typing import Any
 
@@ -19,6 +20,7 @@ from src.dashboard.api import cloudwatch
 from src.dashboard.api.app import create_app
 from src.dashboard.api.cloudwatch import (
     ALARM_PREFIX,
+    CLOUDWATCH_ACCESS_DENIED,
     CLOUDWATCH_UNAVAILABLE,
     AlarmState,
     Boto3CloudWatchReader,
@@ -352,7 +354,6 @@ def test_system_alarms_ok(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     "error",
     [
-        _client_error("AccessDenied"),
         _client_error("Throttling"),
         EndpointConnectionError(endpoint_url="https://monitoring.ap-south-1.amazonaws.com"),
     ],
@@ -363,6 +364,20 @@ def test_system_alarms_degrades_on_client_error(
     resp = _client(FakeReader(error=error), monkeypatch).get("/api/system/alarms")
     assert resp.status_code == 200
     assert resp.json() == {"alarms": None, "note": CLOUDWATCH_UNAVAILABLE}
+
+
+@pytest.mark.parametrize("code", ["AccessDenied", "AccessDeniedException"])
+def test_system_alarms_access_denied_note_and_error_log(
+    code: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # An IAM gap is a deploy bug, not a hiccup: its own note, logged at ERROR.
+    reader = FakeReader(error=_client_error(code))
+    with caplog.at_level(logging.WARNING, logger="src.dashboard.api.cloudwatch"):
+        resp = _client(reader, monkeypatch).get("/api/system/alarms")
+    assert resp.status_code == 200
+    assert resp.json() == {"alarms": None, "note": CLOUDWATCH_ACCESS_DENIED}
+    assert CLOUDWATCH_ACCESS_DENIED == "cloudwatch access denied"
+    assert [r.levelno for r in caplog.records] == [logging.ERROR]
 
 
 def test_system_metrics_ok(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -388,9 +403,21 @@ def test_system_metrics_function_not_found(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_system_metrics_degrades_on_client_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    resp = _client(FakeReader(error=_client_error()), monkeypatch).get("/api/system/metrics")
+    reader = FakeReader(error=_client_error("Throttling"))
+    resp = _client(reader, monkeypatch).get("/api/system/metrics")
     assert resp.status_code == 200
     assert resp.json() == {"function_name": None, "days": None, "note": CLOUDWATCH_UNAVAILABLE}
+
+
+def test_system_metrics_access_denied_note(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    reader = FakeReader(error=_client_error("AccessDenied"))
+    with caplog.at_level(logging.WARNING, logger="src.dashboard.api.cloudwatch"):
+        resp = _client(reader, monkeypatch).get("/api/system/metrics")
+    assert resp.status_code == 200
+    assert resp.json() == {"function_name": None, "days": None, "note": CLOUDWATCH_ACCESS_DENIED}
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
 
 
 @pytest.mark.parametrize("days", [0, 31])

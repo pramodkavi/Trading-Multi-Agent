@@ -1264,6 +1264,10 @@ def test_lifecycle_published_signal(client: TestClient, scenario: Scenario) -> N
     assert setup["age_seconds"] == 5 * 3600 + 6 * 60
     assert setup["evaluation_age_seconds"] == 4 * 60 + 30
     assert setup["latest_status"] == "AT_RISK" and setup["entry_price"] == 100.0
+    # The lifecycle page fetches no live price: a distinct note, not "price unavailable"
+    # (which means Binance failed), so the UI does not report a phantom outage.
+    assert setup["unrealised_r"] is None
+    assert setup["unrealised_r_note"] == "not fetched on this view"
 
 
 def test_lifecycle_vetoed_signal(client: TestClient, scenario: Scenario) -> None:

@@ -22,8 +22,10 @@
 
 The DB-backed routes map Data API failures app-wide (503 / 502, `errors.py`).
 The CloudWatch routes never fail on CloudWatch: a `ClientError` /
-`BotoCoreError` (AccessDenied, throttling, network) answers **200** with the
-section `null` and `note = "cloudwatch unavailable"`. Ranges start at midnight
+`BotoCoreError` answers **200** with the section `null` and
+`note = "cloudwatch unavailable"` (throttling, network) or
+`"cloudwatch access denied"` (an `AccessDenied*` code, logged at ERROR: the
+role is missing a grant). Ranges start at midnight
 UTC `days` days ago and end now (`overview.utcnow()`).
 """
 
@@ -39,7 +41,7 @@ from fastapi import APIRouter, Query
 
 from src.dashboard.api import overview as assembly
 from src.dashboard.api import system as health
-from src.dashboard.api.cloudwatch import CLOUDWATCH_UNAVAILABLE, CloudWatchDep, read_alarms
+from src.dashboard.api.cloudwatch import CloudWatchDep, failure_note, read_alarms
 from src.dashboard.api.deps import SettingsDep, StoreDep
 from src.dashboard.api.errors import DATA_ROUTE_RESPONSES, error_code, is_resuming
 from src.dashboard.api.queries import (
@@ -144,8 +146,8 @@ async def metrics(cw: CloudWatchDep, days: DaysQuery = DEFAULT_SYSTEM_DAYS) -> M
             return MetricsResponse(function_name=None, days=None, note=SCAN_FUNCTION_NOT_FOUND)
         series = await cw.lambda_daily_metrics(function_name, days=days, now=now)
     except (ClientError, BotoCoreError) as exc:
-        logger.warning("CloudWatch metrics failed: %s", exc)
-        return MetricsResponse(function_name=None, days=None, note=CLOUDWATCH_UNAVAILABLE)
+        note = failure_note("metrics", exc)
+        return MetricsResponse(function_name=None, days=None, note=note)
     return MetricsResponse(function_name=function_name, days=series, note=None)
 
 

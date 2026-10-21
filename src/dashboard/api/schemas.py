@@ -194,7 +194,9 @@ class SetupCardOut(BaseModel):
     )
     unrealised_r_note: str | None = Field(
         default=None,
-        description="Why `unrealised_r` is null (e.g. 'price unavailable'); null when it is set.",
+        description="Why `unrealised_r` is null: 'price unavailable' (the fetch failed), "
+        "'not fetched on this view' (lifecycle page), 'risk undefined (entry == stop)'; "
+        "null when it is set.",
     )
 
 
@@ -570,7 +572,7 @@ class SweepsResponse(BaseModel):
 
 
 class AlarmsResponse(BaseModel):
-    """`GET /api/system/alarms` body: null `alarms` + note when CloudWatch failed."""
+    """`GET /api/system/alarms` body: null `alarms` + note when CloudWatch failed or denied."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -581,8 +583,9 @@ class AlarmsResponse(BaseModel):
 class MetricsResponse(BaseModel):
     """`GET /api/system/metrics` body: the scan Lambda's daily metrics.
 
-    `days` is null with a note when CloudWatch failed ("cloudwatch unavailable")
-    or no `CryptoSignals-Compute-ScanLambda*` metric exists ("scan function not found").
+    `days` is null with a note when CloudWatch failed ("cloudwatch unavailable"),
+    refused the role ("cloudwatch access denied") or no
+    `CryptoSignals-Compute-ScanLambda*` metric exists ("scan function not found").
     """
 
     model_config = ConfigDict(extra="forbid")

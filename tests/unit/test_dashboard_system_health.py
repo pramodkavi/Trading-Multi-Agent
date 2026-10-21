@@ -472,11 +472,22 @@ def test_overview_alarm_strip_filled(overview_scenario: Scenario) -> None:
 
 def test_overview_alarm_strip_degrades(overview_scenario: Scenario) -> None:
     app, client = _client_for(overview_scenario.store)
-    app.dependency_overrides[get_cloudwatch_reader] = lambda: FakeReader(error=_client_error())
+    reader = FakeReader(error=_client_error("Throttling"))
+    app.dependency_overrides[get_cloudwatch_reader] = lambda: reader
     resp = client.get("/api/overview")
     assert resp.status_code == 200
     health = resp.json()["health"]
     assert health["alarms"] is None and health["alarms_note"] == CLOUDWATCH_UNAVAILABLE
+
+
+def test_overview_alarm_strip_access_denied(overview_scenario: Scenario) -> None:
+    app, client = _client_for(overview_scenario.store)
+    reader = FakeReader(error=_client_error("AccessDenied"))
+    app.dependency_overrides[get_cloudwatch_reader] = lambda: reader
+    resp = client.get("/api/overview")
+    assert resp.status_code == 200
+    health = resp.json()["health"]
+    assert health["alarms"] is None and health["alarms_note"] == "cloudwatch access denied"
 
 
 class _SlowReader(FakeReader):

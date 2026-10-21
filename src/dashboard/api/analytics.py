@@ -16,7 +16,8 @@ Decisive = WIN / LOSS; ``win_rate = wins / (wins + losses)``, ``None`` (never
 - **Skeptic value**: an objection counts when ``recommends_against`` is true or
   severity is ``HIGH``; Judge SKIP -> ``respected``, PUBLISH_WITH_CAVEAT ->
   ``overruled_with_caveat``, PUBLISH -> ``overruled``. NoMacroData runs are
-  excluded and counted in ``no_macro_data_excluded``. A respected objection is a
+  excluded and counted in ``no_macro_data_excluded``; a counted objection with no
+  Judge ruling recorded is counted in ``unruled`` (no outcome). A respected objection is a
   veto, so its outcomes are the vetoed **counterfactuals, from replays only**;
   the overruled buckets use the effective outcome.
 - **Equity curves** (1 R risk per decision), points ordered by ``created_at``:
@@ -112,6 +113,9 @@ class SkepticValue(BaseModel):
     overruled_with_caveat: SkepticBucket
     overruled: SkepticBucket
     no_macro_data_excluded: int = Field(description="NoMacroData Skeptic runs left out.")
+    unruled: int = Field(
+        description="Counted objections with no Judge ruling recorded: counted, no outcome."
+    )
     source_counts: SourceCounts
 
 
@@ -227,6 +231,9 @@ def win_rate_by(rows: Sequence[OutcomeRow], *, by: WinRateBy) -> list[WinRateBuc
 # ---------------------------------------------------------------------------
 
 
+_RULINGS = frozenset(r.value for r in JudgeRuling)
+
+
 def _objection_counts(row: OutcomeRow) -> bool:
     return row.skeptic_recommends_against is True or row.skeptic_severity == "HIGH"
 
@@ -244,13 +251,16 @@ def skeptic_value(rows: Sequence[OutcomeRow]) -> SkepticValue:
     overruled: list[str | None] = []
     sources: list[OutcomeSource | None] = []
     excluded = 0
+    unruled = 0
     for row in rows:
         if row.skeptic_is_no_macro:
             excluded += 1
             continue
         if not _objection_counts(row):
             continue
-        if row.judge_ruling == JudgeRuling.SKIP.value:
+        if row.judge_ruling not in _RULINGS:
+            unruled += 1  # the Judge never ruled (failed / aborted run): no bar to put it in
+        elif row.judge_ruling == JudgeRuling.SKIP.value:
             outcome = _replayed_outcome(row)
             respected.append(outcome)
             sources.append(None if outcome is None else "replayed")
@@ -267,6 +277,7 @@ def skeptic_value(rows: Sequence[OutcomeRow]) -> SkepticValue:
         overruled_with_caveat=_bucket(caveat),
         overruled=_bucket(overruled),
         no_macro_data_excluded=excluded,
+        unruled=unruled,
         source_counts=_count(sources),
     )
 

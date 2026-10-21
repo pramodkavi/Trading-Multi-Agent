@@ -11,23 +11,33 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 import src.providers as providers
 
-_PROBE = (
-    "import sys, src.dashboard.api.app; "
-    "print('ccxt' in sys.modules, 'aiohttp' in sys.modules, 'httpx' in sys.modules)"
-)
+# The repo root, so `import src...` resolves the same in the subprocess wherever
+# pytest was started from.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+_HEAVY = ("ccxt", "aiohttp", "httpx", "boto3")
+_PROBE = f"import sys, src.dashboard.api.app; print(*[m in sys.modules for m in {_HEAVY!r}])"
 
 
-def test_dashboard_app_import_does_not_load_ccxt_or_aiohttp() -> None:
+def test_dashboard_app_import_does_not_load_heavy_clients() -> None:
+    # ccxt / aiohttp: the Binance provider; httpx: the macro providers; boto3: the
+    # dashboard needs botocore only (its clients are built lazily per container).
     result = subprocess.run(
-        [sys.executable, "-c", _PROBE], capture_output=True, text=True, check=True, timeout=120
+        [sys.executable, "-c", _PROBE],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+        cwd=_REPO_ROOT,
     )
-    ccxt_loaded, aiohttp_loaded, _httpx_loaded = result.stdout.split()
-    assert (ccxt_loaded, aiohttp_loaded) == ("False", "False"), result.stdout
+    loaded = dict(zip(_HEAVY, result.stdout.split(), strict=True))
+    assert loaded == dict.fromkeys(_HEAVY, "False"), result.stdout
 
 
 def test_package_names_resolve_lazily_to_the_submodule_objects() -> None:

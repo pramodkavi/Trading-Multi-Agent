@@ -403,6 +403,31 @@ def test_chart_overlay_from_analyzer_for_gate_rejected(scenario: Scenario) -> No
 
 
 @pytest.mark.usefixtures("frozen_clock")
+def test_chart_overlay_for_vetoed_decision(scenario: Scenario) -> None:
+    # A Judge veto still has its stored proposal: it draws exactly like a published one,
+    # from the payload, with no agent-run lookup.
+    vetoed = scenario.vetoed  # SOLUSDT SHORT, Judge SKIP, two days ago
+    factory = _h4_factory("SOLUSDT")
+    _, client = _client_for(scenario.store, factory)
+    resp = client.get(f"/api/signals/{vetoed.id}/chart", params={"before": 3, "after": 2})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["overlay"] == {
+        "direction": "SHORT",
+        "entry_price": 100.0,
+        "stop_loss": 102.0,
+        "take_profit_1": 94.0,
+        "take_profit_2": 90.0,
+        "poi_low": None,
+        "poi_high": None,
+    }
+    (provider,) = factory.built
+    assert provider.calls == [
+        ("SOLUSDT", Timeframe.H4, vetoed.created_at - 3 * H4, vetoed.created_at + 2 * H4)
+    ]
+
+
+@pytest.mark.usefixtures("frozen_clock")
 def test_chart_no_setup_has_null_overlay(scenario: Scenario) -> None:
     no_setup = _signal(uuid4(), symbol="BNBUSDT", created_at=NOW - timedelta(hours=1))
     scenario.store.signals[no_setup.id] = no_setup
