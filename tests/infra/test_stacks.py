@@ -646,6 +646,14 @@ def test_health_route_has_no_authorizer(templates: dict[str, Any]) -> None:
     health = _routes_by_key(templates)["GET /api/health"]
     assert "AuthorizerId" not in health
     assert health.get("AuthorizationType", "NONE") == "NONE"
+    assert "AuthorizationScopes" not in health
+
+
+def test_proxy_route_requires_openid_scope(templates: dict[str, Any]) -> None:
+    # Access tokens only: Cognito ID tokens carry no `scope` claim, so API Gateway
+    # rejects them; access tokens from the code grant carry `openid`.
+    proxy = _routes_by_key(templates)["ANY /api/{proxy+}"]
+    assert proxy["AuthorizationScopes"] == ["openid"]
 
 
 def test_jwt_authorizer_issuer_and_audience(templates: dict[str, Any]) -> None:

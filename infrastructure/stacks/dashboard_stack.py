@@ -384,6 +384,9 @@ class DashboardStack(Stack):
             methods=[apigwv2.HttpMethod.ANY],
             integration=self.integration,
             authorizer=self.jwt_authorizer,
+            # Access tokens only: a Cognito ID token has no `scope` claim, so API
+            # Gateway rejects it; the code-grant access token carries `openid`.
+            authorization_scopes=["openid"],
         )
         self.proxy_route = proxy_routes[0]
 

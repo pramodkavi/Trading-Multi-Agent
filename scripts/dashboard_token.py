@@ -15,6 +15,9 @@ Flow:
        so an idle connection cannot hold the single-threaded listener.
     5. ``POST {domain}/oauth2/token`` (form-encoded, public client, no secret).
     6. Print the **access token** to stdout -- nothing is written to disk.
+       It must be the access token: the API's ``ANY /api/{proxy+}`` route
+       requires the ``openid`` scope, and a Cognito ID token carries no
+       ``scope`` claim, so API Gateway rejects ID tokens with 401.
 
 Usage:
     python -m scripts.dashboard_token \\
