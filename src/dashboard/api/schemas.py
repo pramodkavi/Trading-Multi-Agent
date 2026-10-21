@@ -23,9 +23,10 @@ Step 4.2 adds the read-only data payloads (design §4.2 P1 / P2 / P3, §3.4):
   resolution / review and the setup. The full agent output is served per step
   by `AgentRunOut`.
 
-Fields marked "pending Step 4.3" are placeholders the UI can already bind to:
-CloudWatch alarm states and unrealised R need the metrics / price providers
-that Step 4.3 wires in.
+Step 4.3 adds the market payloads (`KlinesResponse`, `SignalChartResponse` with
+its `ChartOverlay`) and fills `SetupCardOut.unrealised_r` best-effort from a
+live price. Fields still marked "pending Step 4.3" (CloudWatch alarm states)
+are placeholders the UI can already bind to until the system endpoints land.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from src.agents.orchestration.risk_gates import MAX_CONCURRENT_SETUPS, MAX_SIGNA
 from src.common.models import ScanStatus, SignalDirection, SignalOutcome, SignalStatus
 from src.dashboard.api.classify import DecisionKind
 from src.persistence.models import StoredAgentRun, StoredReview, StoredSetupEvaluation
+from src.providers.base import Timeframe
 
 PENDING_4_3 = "pending Step 4.3"
 
@@ -63,9 +65,9 @@ class ErrorResponse(BaseModel):
     """Body of the app-wide error replies (design §3.4).
 
     `reason` is a stable machine token the UI switches on: `db_resuming` (503,
-    with `Retry-After`), `db_error` (502), `not_found` (404), `bad_cursor`
-    (400). Data routers list this model under `responses={...}` so it lands in
-    OpenAPI.
+    with `Retry-After`), `db_error` (502), `market_unavailable` (502),
+    `not_found` (404), `bad_cursor` (400), `unknown_symbol` (400). Data routers
+    list this model under `responses={...}` so it lands in OpenAPI.
     """
 
     reason: str
@@ -161,8 +163,15 @@ class SetupCardOut(BaseModel):
     evaluation_age_seconds: int | None = Field(default=None, ge=0)
     latest_status: str | None = Field(description="Forecaster verdict of the latest evaluation.")
     latest_reasoning: str | None
-    unrealised_r: None = Field(default=None, description="Needs a live price; " + PENDING_4_3)
-    unrealised_r_note: str = PENDING_4_3
+    unrealised_r: float | None = Field(
+        default=None,
+        description="Open R at the latest 5m close (LONG (price-entry)/(entry-stop), SHORT "
+        "(entry-price)/(stop-entry), 2 dp). Best-effort: null when no price was available.",
+    )
+    unrealised_r_note: str | None = Field(
+        default=None,
+        description="Why `unrealised_r` is null (e.g. 'price unavailable'); null when it is set.",
+    )
 
 
 class SymbolChip(BaseModel):
@@ -303,3 +312,66 @@ class LifecycleResponse(BaseModel):
     resolution: ResolutionOut | None
     review: ReviewOut | None
     setup: SetupCardOut | None
+
+
+# ---------------------------------------------------------------------------
+# Market data (Step 4.3)
+# ---------------------------------------------------------------------------
+
+
+class KlineOut(BaseModel):
+    """One OHLCV candle on the wire (`providers.base.Kline` field for field)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    open_time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+
+class KlinesResponse(BaseModel):
+    """`GET /api/market/klines` body: the most recent candles, ascending."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    timeframe: Timeframe
+    klines: list[KlineOut]
+
+
+class ChartOverlay(BaseModel):
+    """The levels drawn over a signal's chart; every field optional (older payloads).
+
+    Prices come from the proposal -- the stored payload, or for a gate-rejected
+    decision the Analyzer run's rejected proposal. The POI zone is the order
+    block the Analyzer anchored on (`features.ob_zone_low` / `ob_zone_high`).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    direction: SignalDirection | None = None
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit_1: float | None = None
+    take_profit_2: float | None = None
+    poi_low: float | None = None
+    poi_high: float | None = None
+
+
+class SignalChartResponse(BaseModel):
+    """`GET /api/signals/{id}/chart` body: H4 candles around the decision plus its levels."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    signal_id: UUID
+    symbol: str
+    timeframe: Timeframe = Timeframe.H4
+    created_at: datetime
+    klines: list[KlineOut]
+    overlay: ChartOverlay | None = Field(
+        description="Null for a NO_SETUP decision (no proposal ever existed) or when the "
+        "rejected proposal of a gate-rejected decision cannot be found."
+    )

@@ -13,7 +13,10 @@ prefix and routes are declared with their full `/api/...` paths.
 (Step 4.2) and is created lazily on the first request that depends on it, so
 startup stays I/O-free and the unauthenticated `/api/health` probe can never
 wake Aurora. `errors.py` installs the app-wide error mapping for the data
-routes (503 `db_resuming` / 502 `db_error` / 404 `not_found` / 400 `bad_cursor`).
+routes (503 `db_resuming` / 502 `db_error` / 404 `not_found` / 400 `bad_cursor`)
+and, since Step 4.3, the market routes (502 `market_unavailable` / 400
+`unknown_symbol`). The market provider is also built lazily, per request
+(`market.get_provider_factory`), so startup imports no ccxt.
 
 `APP_VERSION` is the short git SHA injected by CDK; it falls back to `"dev"`
 when unset (local runs, tests).
@@ -27,7 +30,7 @@ from fastapi import FastAPI
 from mangum import Mangum
 
 from src.dashboard.api.errors import register_error_handlers
-from src.dashboard.api.routers import health, overview, setups, signals, system
+from src.dashboard.api.routers import health, market, overview, setups, signals, system
 
 
 def create_app(*, version: str | None = None) -> FastAPI:
@@ -52,6 +55,8 @@ def create_app(*, version: str | None = None) -> FastAPI:
     app.include_router(overview.router)
     app.include_router(setups.router)
     app.include_router(signals.router)
+    # Step 4.3 market data (candle proxy; the chart route lives in `signals`).
+    app.include_router(market.router)
     return app
 
 

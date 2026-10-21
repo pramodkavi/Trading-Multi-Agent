@@ -27,7 +27,7 @@ from typing import Annotated
 from botocore.config import Config
 from fastapi import Depends
 
-from src.dashboard.api.settings import get_dashboard_settings
+from src.dashboard.api.settings import DashboardSettings, get_dashboard_settings
 from src.persistence.store import DataApiSignalStore
 
 # Dashboard store resume budget (design §3.4): fail fast, let the client retry.
@@ -72,3 +72,7 @@ def reset_store() -> None:
 # Route parameter annotation: `async def route(store: StoreDep)`. Tests swap the
 # store with `app.dependency_overrides[get_store] = lambda: fake`.
 StoreDep = Annotated[DataApiSignalStore, Depends(get_store)]
+
+# The per-container settings (watchlist for the market routes). Tests override
+# `get_dashboard_settings` the same way.
+SettingsDep = Annotated[DashboardSettings, Depends(get_dashboard_settings)]

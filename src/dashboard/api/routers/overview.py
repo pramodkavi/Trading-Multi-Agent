@@ -12,6 +12,11 @@ succeeded; a Data API failure is mapped to 503 / 502 by `errors.py` instead.
 Scans are fetched from the start of *yesterday*, not today: the last-scan badge
 must show yesterday's 22:03 wrap overnight instead of going blind until 08:03.
 Only today's rows feed the window list and the per-symbol chips.
+
+Step 4.3: the OPEN setup cards carry a best-effort unrealised R -- one
+`market.latest_prices` call (one provider, one fetch per distinct symbol,
+5 s overall budget). Binance down or slow leaves `unrealised_r` null with
+"price unavailable"; the landing page is still 200.
 """
 
 from __future__ import annotations
@@ -21,9 +26,11 @@ from datetime import UTC, datetime, timedelta
 from fastapi import APIRouter
 
 from src.agents.orchestration.risk_gates import gather_risk_context
+from src.dashboard.api import market
 from src.dashboard.api import overview as assembly
 from src.dashboard.api.deps import StoreDep
 from src.dashboard.api.errors import DATA_ROUTE_RESPONSES
+from src.dashboard.api.market import ProviderFactoryDep
 from src.dashboard.api.queries import (
     count_evaluations_since,
     list_open_setup_cards,
@@ -36,7 +43,7 @@ router = APIRouter(tags=["overview"], responses=DATA_ROUTE_RESPONSES)
 
 
 @router.get("/api/overview", response_model=OverviewResponse)
-async def overview(store: StoreDep) -> OverviewResponse:
+async def overview(store: StoreDep, factory: ProviderFactoryDep) -> OverviewResponse:
     """Health strip, risk budget, OPEN setups and today's scan windows."""
     now = assembly.utcnow()
     day = now.astimezone(UTC).date()
@@ -54,6 +61,11 @@ async def overview(store: StoreDep) -> OverviewResponse:
     # windows, so it is set in practice -- the start-of-day fallback is degenerate-only).
     sweep_at = assembly.last_sweep_at(now)
     evaluations, errors = await count_evaluations_since(store, since=sweep_at or start_of_day)
+    # Best-effort unrealised R (Step 4.3): bounded by the 5 s budget, never raises on a
+    # provider failure -- the cards then read "price unavailable".
+    prices = await market.latest_prices(
+        factory, sorted({card.symbol for card in cards}), now=now, budget_s=market.PRICE_BUDGET_S
+    )
 
     health = HealthStrip(
         last_scan=assembly.last_scan_outcome(scans),
@@ -69,6 +81,8 @@ async def overview(store: StoreDep) -> OverviewResponse:
         generated_at=now,
         health=health,
         risk=assembly.build_risk_budget(ctx, now=now),
-        open_setups=[assembly.setup_card_out(card, now=now) for card in cards],
+        open_setups=[
+            assembly.setup_card_out(card, now=now, price=prices.get(card.symbol)) for card in cards
+        ],
         windows_today=assembly.bucket_windows(todays, rows, day=day),
     )

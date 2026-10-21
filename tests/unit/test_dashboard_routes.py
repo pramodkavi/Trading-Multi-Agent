@@ -9,6 +9,7 @@ every age / countdown / session in the responses is deterministic.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -29,12 +30,13 @@ from src.common.models import (
     SignalDirection,
     SignalStatus,
 )
-from src.dashboard.api import deps
+from src.dashboard.api import deps, market
 from src.dashboard.api import overview as assembly
 from src.dashboard.api.app import create_app, handler
 from src.dashboard.api.cursor import decode_cursor, encode_cursor
 from src.dashboard.api.deps import get_store
-from src.dashboard.api.settings import get_dashboard_settings
+from src.dashboard.api.market import get_provider_factory
+from src.dashboard.api.settings import DashboardSettings, get_dashboard_settings
 from src.persistence.models import (
     StoredActiveSetup,
     StoredAgentRun,
@@ -42,6 +44,14 @@ from src.persistence.models import (
     StoredSignal,
 )
 from src.persistence.store import DataApiSignalStore
+from src.providers.base import (
+    DataProvider,
+    Kline,
+    MarketSnapshot,
+    ProviderError,
+    ProviderUnavailableError,
+    Timeframe,
+)
 from tests.unit.test_dashboard_app import _Ctx, _v2_event
 
 DAY = date(2026, 10, 20)
@@ -160,6 +170,88 @@ class FakeStore:
                 if run.id == run_id:
                     return run
         return None
+
+
+# ---------------------------------------------------------------------------
+# Fake market data provider (BinanceProvider is NEVER constructed in tests)
+# ---------------------------------------------------------------------------
+
+
+def _kline(open_time: datetime, close: float) -> Kline:
+    return Kline(
+        open_time=open_time, open=close, high=close + 1.0, low=close - 1.0, close=close, volume=1.0
+    )
+
+
+def _series(tf: Timeframe, *, end: datetime, count: int, first_close: float = 100.0) -> list[Kline]:
+    """`count` ascending candles of ``tf`` whose last one opens one bar before ``end``."""
+    step = market.TIMEFRAME_DURATION[tf]
+    return [_kline(end - (count - i) * step, first_close + i) for i in range(count)]
+
+
+@dataclass
+class FakeProvider(DataProvider):
+    """`DataProvider` double: serves canned candles, records calls, tracks `aclose`."""
+
+    klines: dict[tuple[str, Timeframe], list[Kline]] = field(default_factory=dict)
+    errors: dict[str, ProviderError] = field(default_factory=dict)
+    delay_s: float = 0.0
+    calls: list[tuple[str, Timeframe, datetime, datetime]] = field(default_factory=list)
+    closed: bool = False
+    name: str = "fake"
+
+    async def fetch_market_snapshot(
+        self,
+        symbol: str,
+        timeframes: list[Timeframe],
+        *,
+        limit: int = 200,
+        include_derivatives: bool = False,
+    ) -> MarketSnapshot:  # pragma: no cover - the dashboard never asks for snapshots
+        raise NotImplementedError
+
+    async def fetch_klines(
+        self, symbol: str, timeframe: Timeframe, *, start: datetime, end: datetime
+    ) -> list[Kline]:
+        self.calls.append((symbol, timeframe, start, end))
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        if symbol in self.errors:
+            raise self.errors[symbol]
+        return [k for k in self.klines.get((symbol, timeframe), []) if start <= k.open_time < end]
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@dataclass
+class FakeProviderFactory:
+    """`ProviderFactory` double: builds a fresh `FakeProvider` per call and keeps them all."""
+
+    klines: dict[tuple[str, Timeframe], list[Kline]] = field(default_factory=dict)
+    errors: dict[str, ProviderError] = field(default_factory=dict)
+    delay_s: float = 0.0
+    built: list[FakeProvider] = field(default_factory=list)
+
+    def __call__(self) -> FakeProvider:
+        provider = FakeProvider(klines=self.klines, errors=dict(self.errors), delay_s=self.delay_s)
+        self.built.append(provider)
+        return provider
+
+
+def default_factory() -> FakeProviderFactory:
+    """BTCUSDT 5m candles up to NOW, last close 101.0 (LONG 100 / 98 -> +0.5 R)."""
+    series = _series(Timeframe.M5, end=NOW, count=6, first_close=96.0)  # closes 96..101
+    return FakeProviderFactory(klines={("BTCUSDT", Timeframe.M5): series})
+
+
+def make_settings() -> DashboardSettings:
+    return DashboardSettings(
+        _env_file=None,  # type: ignore[call-arg]
+        db_cluster_arn="arn:aws:rds:ap-south-1:123456789012:cluster:signals",
+        db_secret_arn="arn:aws:secretsmanager:ap-south-1:123456789012:secret:x",
+        scan_symbols=["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -620,9 +712,14 @@ def frozen_clock(monkeypatch: pytest.MonkeyPatch) -> datetime:
     return NOW
 
 
-def _client_for(store: FakeStore) -> tuple[FastAPI, TestClient]:
+def _client_for(
+    store: FakeStore, factory: FakeProviderFactory | None = None
+) -> tuple[FastAPI, TestClient]:
     app = create_app(version="t")
     app.dependency_overrides[get_store] = lambda: store
+    provider_factory = factory if factory is not None else default_factory()
+    app.dependency_overrides[get_provider_factory] = lambda: provider_factory
+    app.dependency_overrides[get_dashboard_settings] = make_settings
     return app, TestClient(app)
 
 
@@ -835,12 +932,95 @@ def test_setups_open_cards(client: TestClient, scenario: Scenario) -> None:
         "evaluation_age_seconds": 4 * 60 + 30,
         "latest_status": "AT_RISK",
         "latest_reasoning": "price near the stop",
-        "unrealised_r": None,
-        "unrealised_r_note": "pending Step 4.3",
+        "unrealised_r": 0.5,  # LONG entry 100 / stop 98, last 5m close 101
+        "unrealised_r_note": None,
     }
     # One query, no typed-method round trips, and the setup list is the only SQL.
     assert [sql for sql, _ in scenario.store.calls if "FROM active_setups t" in sql]
     assert len(scenario.store.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Best-effort unrealised R on setup cards (overview + /api/setups/open)
+# ---------------------------------------------------------------------------
+
+
+def test_overview_unrealised_r_present(scenario: Scenario, frozen_clock: datetime) -> None:
+    factory = default_factory()
+    _, client = _client_for(scenario.store, factory)
+    (card,) = client.get("/api/overview").json()["open_setups"]
+    assert card["unrealised_r"] == 0.5 and card["unrealised_r_note"] is None
+    (setups_card,) = client.get("/api/setups/open").json()
+    assert setups_card["unrealised_r"] == 0.5 and setups_card["unrealised_r_note"] is None
+    # One provider per request, one latest-price fetch per distinct OPEN-setup symbol:
+    # the last 30 minutes of 5m candles, closed afterwards.
+    assert len(factory.built) == 2
+    for provider in factory.built:
+        assert provider.closed
+        assert provider.calls == [
+            ("BTCUSDT", Timeframe.M5, NOW - timedelta(minutes=30), NOW),
+        ]
+
+
+def test_overview_unrealised_r_present_short(scenario: Scenario, frozen_clock: datetime) -> None:
+    base = scenario.store.setup_card_rows[0]
+    scenario.store.setup_card_rows = [
+        dict(base, symbol="ETHUSDT", direction="SHORT", stop_loss=102.0, take_profit_1=94.0),
+        dict(base, setup_id=str(uuid4())),  # a second BTCUSDT card: still one fetch for BTC
+    ]
+    factory = default_factory()
+    factory.klines[("ETHUSDT", Timeframe.M5)] = _series(
+        Timeframe.M5, end=NOW, count=3, first_close=95.0
+    )  # last close 97 -> SHORT (100 - 97) / (102 - 100) = 1.5
+    _, client = _client_for(scenario.store, factory)
+    eth, btc = client.get("/api/setups/open").json()
+    assert (eth["symbol"], eth["unrealised_r"]) == ("ETHUSDT", 1.5)
+    assert (btc["symbol"], btc["unrealised_r"]) == ("BTCUSDT", 0.5)
+    (provider,) = factory.built
+    assert sorted(c[0] for c in provider.calls) == ["BTCUSDT", "ETHUSDT"]
+
+
+def test_overview_unrealised_r_degrades_on_provider_error(
+    scenario: Scenario, frozen_clock: datetime
+) -> None:
+    # Review Focus 2: Binance down must not 500 the landing page.
+    factory = default_factory()
+    factory.errors["BTCUSDT"] = ProviderUnavailableError("binance 503", provider="binance")
+    _, client = _client_for(scenario.store, factory)
+    resp = client.get("/api/overview")
+    assert resp.status_code == 200
+    (card,) = resp.json()["open_setups"]
+    assert card["unrealised_r"] is None and card["unrealised_r_note"] == "price unavailable"
+    resp = client.get("/api/setups/open")
+    assert resp.status_code == 200
+    (card,) = resp.json()
+    assert card["unrealised_r"] is None and card["unrealised_r_note"] == "price unavailable"
+    assert all(p.closed for p in factory.built)
+
+
+def test_overview_unrealised_r_degrades_on_timeout(
+    scenario: Scenario, frozen_clock: datetime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review Focus 2: Binance slow -> the 5 s budget (patched down here) expires, 200 + null.
+    monkeypatch.setattr(market, "PRICE_BUDGET_S", 0.05)
+    factory = default_factory()
+    factory.delay_s = 10.0
+    _, client = _client_for(scenario.store, factory)
+    for path in ("/api/overview", "/api/setups/open"):
+        resp = client.get(path)
+        assert resp.status_code == 200
+        body = resp.json()
+        (card,) = body["open_setups"] if path == "/api/overview" else body
+        assert card["unrealised_r"] is None and card["unrealised_r_note"] == "price unavailable"
+    assert len(factory.built) == 2 and all(p.closed for p in factory.built)
+
+
+def test_no_open_setups_builds_no_provider(frozen_clock: datetime) -> None:
+    factory = default_factory()
+    _, client = _client_for(FakeStore(), factory)
+    assert client.get("/api/overview").status_code == 200
+    assert client.get("/api/setups/open").json() == []
+    assert factory.built == []
 
 
 # ---------------------------------------------------------------------------
@@ -1164,8 +1344,16 @@ def test_openapi_lists_new_routes() -> None:
         "/api/signals",
         "/api/signals/{signal_id}",
         "/api/signals/{signal_id}/runs/{run_id}",
+        "/api/signals/{signal_id}/chart",
+        "/api/market/klines",
     ):
         assert path in spec["paths"], path
+    klines = spec["paths"]["/api/market/klines"]["get"]
+    assert {"400", "502"} <= set(klines["responses"])
+    kparams = {p["name"]: p for p in klines["parameters"]}
+    assert kparams["limit"]["schema"]["default"] == 200
+    assert kparams["limit"]["schema"]["minimum"] == 1
+    assert kparams["limit"]["schema"]["maximum"] == 500
     journal = spec["paths"]["/api/signals"]["get"]
     assert {"400", "502", "503"} <= set(journal["responses"])
     assert "404" in spec["paths"]["/api/signals/{signal_id}"]["get"]["responses"]
@@ -1195,6 +1383,8 @@ def container_store(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> Iter
     get_dashboard_settings.cache_clear()
     deps.reset_store()
     monkeypatch.setattr(DataApiSignalStore, "from_arns", lambda **_kwargs: scenario.store)
+    # The import-time app has no override hook: swap the default factory itself.
+    monkeypatch.setattr(market, "default_provider_factory", default_factory())
     yield scenario.store
     deps.reset_store()
     get_dashboard_settings.cache_clear()
@@ -1207,6 +1397,7 @@ def test_mangum_serves_overview_event(container_store: FakeStore) -> None:
     body = json.loads(result["body"])
     assert body["risk"]["open_setups"] == 1 and body["risk"]["published_24h"] == 2
     assert body["health"]["last_scan"]["label"] == "NY"
+    assert body["open_setups"][0]["unrealised_r"] == 0.5
     assert datetime.fromisoformat(body["generated_at"]) == NOW
     assert container_store.calls_matching("FROM scan_runs")
 

@@ -476,7 +476,7 @@ def test_setup_card_out_ages_from_the_clock() -> None:
         last_evaluated_at=now - timedelta(minutes=2),
         latest_evaluation={"status": "AT_RISK", "reasoning": "near SL", "outcome": None},
     )
-    out = setup_card_out(card, now=now)
+    out = setup_card_out(card, now=now, price=None)
     assert out.setup_id == card.setup_id and out.signal_id == card.signal_id
     assert (out.symbol, out.direction) == ("ETHUSDT", SignalDirection.SHORT)
     assert (out.entry_price, out.stop_loss, out.take_profit_1, out.take_profit_2) == (
@@ -488,7 +488,19 @@ def test_setup_card_out_ages_from_the_clock() -> None:
     assert out.opened_at == card.opened_at and out.age_seconds == 3600
     assert out.last_evaluated_at == card.last_evaluated_at and out.evaluation_age_seconds == 120
     assert out.latest_status == "AT_RISK" and out.latest_reasoning == "near SL"
-    assert out.unrealised_r is None and out.unrealised_r_note == "pending Step 4.3"
+    assert out.unrealised_r is None and out.unrealised_r_note == "price unavailable"
+
+
+def test_setup_card_out_unrealised_r_from_price() -> None:
+    now = _at(13, 10)
+    card = _card(opened_at=now, last_evaluated_at=None)  # SHORT entry 100 / stop 102
+    out = setup_card_out(card, now=now, price=97.0)
+    assert out.unrealised_r == 1.5 and out.unrealised_r_note is None
+    out = setup_card_out(card, now=now, price=101.0)
+    assert out.unrealised_r == -0.5 and out.unrealised_r_note is None
+    zero_risk = card.model_copy(update={"stop_loss": 100.0})
+    out = setup_card_out(zero_risk, now=now, price=101.0)
+    assert out.unrealised_r is None and out.unrealised_r_note == "risk undefined (entry == stop)"
 
 
 def test_setup_card_out_without_evaluation() -> None:

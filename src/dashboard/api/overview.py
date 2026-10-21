@@ -47,11 +47,13 @@ from src.agents.orchestration.risk_gates import (
     check_loss_streak,
     check_session,
 )
-from src.common.models import AgentRole, ScanStatus
+from src.common.models import AgentRole, ScanStatus, SignalDirection
 from src.common.schedule import AD_HOC, SCAN_WINDOWS, next_scan_at, window_for, windows_for_day
 from src.common.sessions import session_for
+from src.dashboard.api import market
 from src.dashboard.api.queries import JournalRow, SetupCard
 from src.dashboard.api.schemas import (
+    ChartOverlay,
     LifecycleStep,
     RiskBudget,
     SetupCardOut,
@@ -65,14 +67,18 @@ from src.persistence.models import StoredActiveSetup, StoredAgentRun, StoredScan
 
 __all__ = [
     "AD_HOC_GROUP_TOLERANCE",
+    "PRICE_UNAVAILABLE",
     "SWEEP_OFFSET",
     "SWEEP_RUN_BUDGET",
+    "ZERO_RISK",
     "bucket_windows",
     "build_risk_budget",
+    "chart_overlay",
     "count_stale",
     "last_scan_outcome",
     "last_sweep_at",
     "lifecycle_step",
+    "rejected_proposal",
     "scans_on",
     "setup_card_for_signal",
     "setup_card_out",
@@ -312,11 +318,31 @@ def count_stale(cards: Sequence[SetupCard], *, sweep_at: datetime | None) -> int
 # ---------------------------------------------------------------------------
 
 
-def setup_card_out(card: SetupCard, *, now: datetime) -> SetupCardOut:
-    """Add the clock-relative ages and lift the latest verdict out of the evaluation JSON."""
+PRICE_UNAVAILABLE = "price unavailable"
+ZERO_RISK = "risk undefined (entry == stop)"
+
+
+def setup_card_out(card: SetupCard, *, now: datetime, price: float | None = None) -> SetupCardOut:
+    """Add the clock-relative ages, the latest verdict and the best-effort unrealised R.
+
+    ``price`` is the latest close the router fetched (``market.latest_prices``);
+    ``None`` -- provider down, budget blown, no candles, or a caller that does not
+    fetch prices (the lifecycle page) -- leaves ``unrealised_r`` null with
+    :data:`PRICE_UNAVAILABLE`. A degenerate ``entry == stop`` card (no risk unit)
+    gets :data:`ZERO_RISK` instead of failing the page.
+    """
     evaluation = card.latest_evaluation or {}
     status = evaluation.get("status")
     reasoning = evaluation.get("reasoning")
+    r_value: float | None = None
+    r_note: str | None = None
+    if price is None:
+        r_note = PRICE_UNAVAILABLE
+    else:
+        try:
+            r_value = market.unrealised_r(card.direction, card.entry_price, card.stop_loss, price)
+        except ValueError:
+            r_note = ZERO_RISK
     return SetupCardOut(
         setup_id=card.setup_id,
         signal_id=card.signal_id,
@@ -336,6 +362,8 @@ def setup_card_out(card: SetupCard, *, now: datetime) -> SetupCardOut:
         ),
         latest_status=str(status) if status is not None else None,
         latest_reasoning=str(reasoning) if reasoning is not None else None,
+        unrealised_r=r_value,
+        unrealised_r_note=r_note,
     )
 
 
@@ -373,6 +401,64 @@ def setup_card_for_signal(setup: StoredActiveSetup, signal: StoredSignal) -> Set
     except (KeyError, TypeError, ValueError) as exc:
         logger.warning("setup %s skipped: malformed payload: %r", setup.id, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Signal chart overlay (Step 4.3)
+# ---------------------------------------------------------------------------
+
+
+def _opt_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def chart_overlay(proposal: Mapping[str, Any]) -> ChartOverlay:
+    """The chart levels of one ``SignalProposal`` JSON: prices plus the order-block POI.
+
+    Lenient on purpose -- an older or malformed payload renders with the missing
+    levels as ``None`` instead of failing the chart: the POI zone comes from
+    ``features.ob_zone_low`` / ``ob_zone_high`` (the Analyzer's anchor), the
+    direction is dropped when it is not a ``SignalDirection`` value.
+    """
+    features = proposal.get("features")
+    features = features if isinstance(features, Mapping) else {}
+    raw_direction = proposal.get("direction")
+    try:
+        direction = SignalDirection(raw_direction) if raw_direction is not None else None
+    except ValueError:
+        direction = None
+    return ChartOverlay(
+        direction=direction,
+        entry_price=_opt_float(proposal.get("entry_price")),
+        stop_loss=_opt_float(proposal.get("stop_loss")),
+        take_profit_1=_opt_float(proposal.get("take_profit_1")),
+        take_profit_2=_opt_float(proposal.get("take_profit_2")),
+        poi_low=_opt_float(features.get("ob_zone_low")),
+        poi_high=_opt_float(features.get("ob_zone_high")),
+    )
+
+
+def rejected_proposal(runs: Sequence[StoredAgentRun], *, symbol: str) -> Mapping[str, Any] | None:
+    """The gate-rejected proposal: the scan's Analyzer run output that is a proposal.
+
+    A gate rejection stores a skip row in ``signals``, but the Analyzer's own
+    ``agent_runs`` output for the scan still holds the proposal the gate refused
+    (``direction`` set). The latest such run for ``symbol`` wins; ``None`` when
+    there is none (the chart then has no overlay).
+    """
+    candidates = [
+        run.output
+        for run in runs
+        if run.agent_role is AgentRole.ANALYZER
+        and "direction" in run.output
+        and run.output.get("symbol", symbol) == symbol
+    ]
+    return candidates[-1] if candidates else None
 
 
 # ---------------------------------------------------------------------------
