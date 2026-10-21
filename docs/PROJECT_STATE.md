@@ -213,7 +213,10 @@ merge is the `$default` stage's access-log format (JSON, below):
 3. **Routers** — `system`: `GET /api/system/db` → `{db: ok|resuming|error, latency_ms}` (always
    200 — it is the probe); `overview`: `GET /api/overview`; `setups`: `GET /api/setups/open`;
    `signals`: `GET /api/signals?since&until&symbol&kind&outcome&tag&session&violated_rule&limit
-   (1..200, default 50)&cursor`, `GET /api/signals/{id}` (lifecycle with trimmed per-step
+   (1..200, default 50)&cursor` — **journal rows are trimmed** (design §3.4, Data API 1 MB cap:
+   no `payload` / `features` / `outcome_metadata`; the analyzer summary `entry_price` …
+   `risk_reward_ratio` / `skip_reason` / `skip_details` is lifted out of the payload in SQL),
+   `GET /api/signals/{id}` (lifecycle: the **full** signal as `SignalDetailOut` + trimmed per-step
    summaries), `GET /api/signals/{id}/runs/{run_id}` (full output). Placeholders until Step 4.3:
    `alarms: null` on the overview, `unrealised_r: null` on open setups.
 4. **Step 4.1 follow-ups closed** — the stage access log is now an HTTP-API **JSON** format

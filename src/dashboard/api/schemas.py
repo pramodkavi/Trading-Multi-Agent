@@ -10,12 +10,18 @@ Step 4.2 adds the read-only data payloads (design §4.2 P1 / P2 / P3, §3.4):
 - `OverviewResponse` -- the landing page in one round trip: health strip, risk
   budget (numbers from `risk_gates`, never re-implemented -- design §5.3), the
   OPEN setup cards and today's four scan windows with per-symbol decision chips.
-- `SignalsPage` / `SignalRowOut` -- the paged journal (`JournalRow` flattened).
-- `LifecycleResponse` -- one decision's timeline: the journal row, every agent
-  run **trimmed** to the fields the timeline renders (`LifecycleStep.summary`),
-  the Forecaster evaluations, the Critic's resolution / review and the setup.
-  The full agent output is served per step by `AgentRunOut` (design §3.4:
-  the Data API caps a response at 1 MB).
+- `SignalsPage` / `SignalRowOut` -- the paged journal. A row is **trimmed**
+  (design §3.4: the Data API caps a response at 1 MB and a page is up to 201
+  rows): the `signals` columns minus `payload` / `features` / `outcome_metadata`,
+  plus the analyzer summary lifted out of the payload in SQL (`entry_price`,
+  `stop_loss`, `take_profit_1/2`, `risk_reward_ratio` for a proposal;
+  `skip_reason` / `skip_details` for a skip) and the derived columns.
+- `LifecycleResponse` -- one decision's timeline: the **full** signal
+  (`SignalDetailOut` = the row plus `payload` / `features` / `outcome_metadata`),
+  every agent run **trimmed** to the fields the timeline renders
+  (`LifecycleStep.summary`), the Forecaster evaluations, the Critic's
+  resolution / review and the setup. The full agent output is served per step
+  by `AgentRunOut`.
 
 Fields marked "pending Step 4.3" are placeholders the UI can already bind to:
 CloudWatch alarm states and unrealised R need the metrics / price providers
@@ -199,11 +205,15 @@ class OverviewResponse(BaseModel):
 
 
 class SignalRowOut(BaseModel):
-    """`queries.JournalRow` flattened: the `signals` row plus its derived columns."""
+    """One journal row on the wire -- mirrors `queries.JournalRow` field for field.
+
+    Trimmed by design (§3.4): no `payload` / `features` / `outcome_metadata`.
+    Fetch `/api/signals/{id}` (`SignalDetailOut`) for the full signal.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    # -- signals columns (StoredSignal) ----------------------------------------
+    # -- signals columns (trimmed) ---------------------------------------------
     id: UUID
     scan_id: UUID
     symbol: str
@@ -211,11 +221,16 @@ class SignalRowOut(BaseModel):
     direction: SignalDirection | None
     status: SignalStatus
     created_at: datetime
-    payload: dict[str, Any]
     tags: list[str]
-    features: dict[str, Any]
     outcome: SignalOutcome | None
-    outcome_metadata: dict[str, Any] | None
+    # -- analyzer summary (lifted from the payload in SQL) ----------------------
+    entry_price: float | None = Field(description="Proposal rows only; null for skips.")
+    stop_loss: float | None
+    take_profit_1: float | None
+    take_profit_2: float | None
+    risk_reward_ratio: float | None
+    skip_reason: str | None = Field(description="Skip rows only (`SkipDecision.reason`).")
+    skip_details: str | None = Field(description="Skip rows only; first 200 chars of `details`.")
     # -- derived (design §5.1) --------------------------------------------------
     decision_kind: DecisionKind
     judge_ruling: str | None
@@ -224,6 +239,14 @@ class SignalRowOut(BaseModel):
     violated_rule: str | None
     resolution_outcome: str | None
     realized_r: float | None
+
+
+class SignalDetailOut(SignalRowOut):
+    """`SignalRowOut` plus the full stored signal -- the lifecycle's `signal` (one row)."""
+
+    payload: dict[str, Any]
+    features: dict[str, Any]
+    outcome_metadata: dict[str, Any] | None
 
 
 class SignalsPage(BaseModel):
@@ -274,7 +297,7 @@ class LifecycleResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    signal: SignalRowOut
+    signal: SignalDetailOut = Field(description="The journal row plus the full stored signal.")
     steps: list[LifecycleStep] = Field(description="Agent runs of the scan, oldest first.")
     evaluations: list[EvaluationOut] = Field(description="Forecaster evaluations, oldest first.")
     resolution: ResolutionOut | None

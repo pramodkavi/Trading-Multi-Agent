@@ -19,6 +19,12 @@ Rules every statement follows (plan Global Constraints, PROJECT_STATE §5):
   ``limit + 1`` rows so the caller can tell whether a next page exists.
 * Decision kind is derived in SQL by :data:`DECISION_KIND_SQL` (design §5.1), so
   the ``decision_kind`` filter is a server-side predicate, not a post-filter.
+* **Journal rows are trimmed** (design §3.4): the Data API caps a response at
+  1 MB and ``confluence_narrative`` alone may be 4 000 chars, so a 201-row page
+  of full rows could not be served. The projection never selects ``payload``,
+  ``features`` or ``outcome_metadata`` whole; it lifts the analyzer summary out
+  of the payload in SQL (:data:`_JOURNAL_COLUMNS`). The full ``StoredSignal``
+  travels only on the lifecycle, via ``store.get_signal``.
 """
 
 from __future__ import annotations
@@ -30,18 +36,11 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.common.models import ActiveSetupStatus, SignalDirection, SignalOutcome
+from src.common.models import ActiveSetupStatus, SignalDirection, SignalOutcome, SignalStatus
 from src.dashboard.api.classify import DECISION_KIND_SQL, DecisionKind
-from src.persistence.models import StoredActiveSetup, StoredReview, StoredScanRun, StoredSignal
+from src.persistence.models import StoredActiveSetup, StoredReview, StoredScanRun
 from src.persistence.repositories import _parse_jsonb_field
-from src.persistence.store import (
-    DataApiSignalStore,
-    _cursor_params,
-    _long_param,
-    _str_param,
-    _utc_iso,
-    signal_projection,
-)
+from src.persistence.store import _cursor_params, _long_param, _str_param, _utc_iso
 
 __all__ = [
     "DashboardReader",
@@ -87,11 +86,34 @@ class SignalFilters(BaseModel):
 
 
 class JournalRow(BaseModel):
-    """One journal line: the stored signal plus the columns derived around it."""
+    """One journal line: the trimmed ``signals`` row plus the columns derived around it.
+
+    Deliberately **not** a ``StoredSignal`` (design §3.4): no ``payload`` /
+    ``features`` / ``outcome_metadata``. The analyzer summary (prices, R:R for a
+    proposal; reason / details for a skip) is lifted out of the payload in SQL.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    signal: StoredSignal
+    # -- signals columns (trimmed) -------------------------------------------
+    id: UUID
+    scan_id: UUID
+    symbol: str
+    strategy: str
+    direction: SignalDirection | None
+    status: SignalStatus
+    created_at: datetime
+    tags: list[str]
+    outcome: SignalOutcome | None
+    # -- analyzer summary, lifted from the payload in SQL -------------------
+    entry_price: float | None = Field(description="payload->>'entry_price' (proposals).")
+    stop_loss: float | None
+    take_profit_1: float | None
+    take_profit_2: float | None
+    risk_reward_ratio: float | None
+    skip_reason: str | None = Field(description="payload->>'reason' (skips).")
+    skip_details: str | None = Field(description="left(payload->>'details', 200) (skips).")
+    # -- derived (design §5.1) ---------------------------------------------
     decision_kind: DecisionKind = Field(description="Derived in SQL by DECISION_KIND_SQL.")
     judge_ruling: str | None = Field(description="Latest Judge run's ruling for the scan.")
     session: str | None = Field(description="scan_runs.session (never from the payload).")
@@ -123,19 +145,22 @@ class SetupCard(BaseModel):
 # Journal projection (shared by the page and the per-scan listing)
 # ---------------------------------------------------------------------------
 
-# Columns of the journal projection that are *not* ``signals`` columns; popped
-# off the row before it is handed to ``row_to_signal`` (which forbids extras).
-_JOURNAL_EXTRA_COLUMNS: tuple[str, ...] = (
-    "decision_kind",
-    "judge_ruling",
-    "session",
-    "has_setup",
-    "violated_rule",
-    "resolution_outcome",
-    "realized_r",
-)
+# The trimmed ``signals`` projection (design §3.4): never the whole ``payload`` /
+# ``features`` / ``outcome_metadata`` JSONB -- only the analyzer summary, cast in
+# SQL. The full row is ``store.signal_projection`` (lifecycle via ``get_signal``).
+_JOURNAL_COLUMNS = f"""s.id::text AS id, s.scan_id::text AS scan_id, s.symbol, s.strategy,
+       s.direction, s.status,
+       {_utc_iso("s.created_at", alias="created_at")},
+       s.tags, s.outcome,
+       (s.payload->>'entry_price')::double precision AS entry_price,
+       (s.payload->>'stop_loss')::double precision AS stop_loss,
+       (s.payload->>'take_profit_1')::double precision AS take_profit_1,
+       (s.payload->>'take_profit_2')::double precision AS take_profit_2,
+       (s.payload->>'risk_reward_ratio')::double precision AS risk_reward_ratio,
+       s.payload->>'reason' AS skip_reason,
+       left(s.payload->>'details', 200) AS skip_details"""
 
-_JOURNAL_SELECT = f"""SELECT {signal_projection("s")},
+_JOURNAL_SELECT = f"""SELECT {_JOURNAL_COLUMNS},
        ({DECISION_KIND_SQL}) AS decision_kind,
        j.ruling AS judge_ruling,
        r.session AS session,
@@ -167,11 +192,8 @@ _KEYSET_PREDICATE = (
 
 
 def _row_to_journal(row: dict[str, Any]) -> JournalRow:
-    """Split a journal row into its ``signals`` part and the derived columns."""
-    data = dict(row)  # row_to_signal mutates in place; never touch the reader's dict
-    extras = {name: data.pop(name) for name in _JOURNAL_EXTRA_COLUMNS}
-    signal = DataApiSignalStore.row_to_signal(data)
-    return JournalRow.model_validate({"signal": signal, **extras})
+    """A journal projection row (every column already a plain value) -> ``JournalRow``."""
+    return JournalRow.model_validate(row)
 
 
 def _filter_predicates(filters: SignalFilters) -> tuple[list[str], list[dict[str, Any]]]:

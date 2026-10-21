@@ -41,13 +41,14 @@ from src.dashboard.api.overview import (
     lifecycle_step,
     setup_card_for_signal,
     setup_card_out,
+    signal_detail_out,
     signal_row_out,
     trim_output,
     utcnow,
     window_outcome,
 )
 from src.dashboard.api.queries import JournalRow, SetupCard
-from src.dashboard.api.schemas import SignalRowOut, WindowOutcome
+from src.dashboard.api.schemas import SignalDetailOut, SignalRowOut, WindowOutcome
 from src.persistence.models import StoredActiveSetup, StoredAgentRun, StoredScanRun, StoredSignal
 
 DAY = date(2026, 10, 20)
@@ -167,8 +168,24 @@ def _row(
     resolution_outcome: str | None = None,
     realized_r: float | None = None,
 ) -> JournalRow:
+    payload = signal.payload
     return JournalRow(
-        signal=signal,
+        id=signal.id,
+        scan_id=signal.scan_id,
+        symbol=signal.symbol,
+        strategy=signal.strategy,
+        direction=signal.direction,
+        status=signal.status,
+        created_at=signal.created_at,
+        tags=list(signal.tags),
+        outcome=signal.outcome,
+        entry_price=payload.get("entry_price"),
+        stop_loss=payload.get("stop_loss"),
+        take_profit_1=payload.get("take_profit_1"),
+        take_profit_2=payload.get("take_profit_2"),
+        risk_reward_ratio=payload.get("risk_reward_ratio"),
+        skip_reason=payload.get("reason"),
+        skip_details=payload.get("details"),
         decision_kind=kind,
         judge_ruling=ruling,
         session="LONDON",
@@ -548,14 +565,42 @@ def test_signal_row_out_flattens_the_journal_row() -> None:
     assert out.id == signal.id and out.scan_id == scan.id
     assert out.symbol == "BTCUSDT" and out.direction is SignalDirection.LONG
     assert out.status is SignalStatus.PUBLISHED and out.created_at == signal.created_at
-    assert out.payload == signal.payload and out.tags == ["fvg", "order_block"]
-    assert out.features == {"rr": 3.0} and out.outcome is None and out.outcome_metadata is None
+    assert out.tags == ["fvg", "order_block"] and out.outcome is None
+    assert (out.entry_price, out.stop_loss, out.take_profit_1, out.take_profit_2) == (
+        100.0,
+        98.0,
+        106.0,
+        110.0,
+    )
+    assert out.risk_reward_ratio == 3.0
+    assert out.skip_reason is None and out.skip_details is None
     assert out.decision_kind is DecisionKind.PUBLISHED and out.judge_ruling == "PUBLISH_WITH_CAVEAT"
     assert out.session == "LONDON" and out.has_setup is True and out.violated_rule is None
     assert out.resolution_outcome == "WIN" and out.realized_r == 2.5
     dumped = out.model_dump(mode="json")
     assert dumped["decision_kind"] == "PUBLISHED" and dumped["direction"] == "LONG"
     assert dumped["status"] == "PUBLISHED" and dumped["id"] == str(signal.id)
+    # The wire row is the trimmed contract: no full JSONB column (design §3.4).
+    for big in ("payload", "features", "outcome_metadata"):
+        assert big not in SignalRowOut.model_fields, big
+    assert set(SignalRowOut.model_fields) == set(JournalRow.model_fields)
+
+
+def test_signal_detail_out_adds_the_full_signal() -> None:
+    scan = _scan(_at(8, 3, 52))
+    signal = _signal(scan, symbol="BTCUSDT", direction=SignalDirection.LONG)
+    row = _row(signal, kind=DecisionKind.PUBLISHED, ruling="PUBLISH", has_setup=True)
+    out = signal_detail_out(row, signal)
+    assert isinstance(out, SignalDetailOut) and isinstance(out, SignalRowOut)
+    assert out.payload == signal.payload and out.payload["confluence_narrative"] == NARRATIVE
+    assert out.features == {"rr": 3.0} and out.outcome_metadata is None
+    # Every trimmed-row field is carried over unchanged.
+    assert out.model_dump(exclude={"payload", "features", "outcome_metadata"}) == row.model_dump()
+    assert set(SignalDetailOut.model_fields) == set(SignalRowOut.model_fields) | {
+        "payload",
+        "features",
+        "outcome_metadata",
+    }
 
 
 # ---------------------------------------------------------------------------

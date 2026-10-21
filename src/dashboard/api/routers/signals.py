@@ -6,10 +6,13 @@
   `limit + 1` rows; the extra one only proves a next page exists and becomes
   `next_cursor` from the `limit`-th row. A cursor that does not decode is 400
   `bad_cursor` (handler in `errors.py`). Naive `since` / `until` values are read
-  as UTC.
+  as UTC. Rows are **trimmed** (`SignalRowOut`: analyzer summary, no
+  `payload` / `features` / `outcome_metadata`) so a 201-row page stays under the
+  Data API's 1 MB response cap.
 - `GET /api/signals/{signal_id}` is the lifecycle: the journal row (same SQL
-  classification as the page), every agent run of the scan trimmed to its
-  timeline summary, the Forecaster evaluations oldest first, the Critic's
+  classification as the page) **plus the full stored signal** (`SignalDetailOut`
+  -- the only place the payload travels), every agent run of the scan trimmed to
+  its timeline summary, the Forecaster evaluations oldest first, the Critic's
   resolution and review, and the setup card. 404 `not_found` when the signal
   does not exist.
 - `GET /api/signals/{signal_id}/runs/{run_id}` is the full agent output for one
@@ -102,9 +105,7 @@ async def list_signals(
     )
     rows = await list_signals_page(store, filters=filters, limit=limit, after=after)
     page = rows[:limit]
-    next_cursor = (
-        encode_cursor(page[-1].signal.created_at, page[-1].signal.id) if len(rows) > limit else None
-    )
+    next_cursor = encode_cursor(page[-1].created_at, page[-1].id) if len(rows) > limit else None
     return SignalsPage(
         items=[assembly.signal_row_out(row) for row in page], next_cursor=next_cursor
     )
@@ -119,7 +120,7 @@ async def signal_lifecycle(store: StoreDep, signal_id: UUID) -> LifecycleRespons
     # The journal projection classifies in SQL (decision kind, Judge ruling, session,
     # setup / resolution joins) -- reuse it so the page and the detail never disagree.
     rows = await list_signals_for_scans(store, scan_ids=[signal.scan_id])
-    row = next((r for r in rows if r.signal.id == signal_id), None)
+    row = next((r for r in rows if r.id == signal_id), None)
     if row is None:
         raise NotFound
 
@@ -136,7 +137,7 @@ async def signal_lifecycle(store: StoreDep, signal_id: UUID) -> LifecycleRespons
     now = assembly.utcnow()
     card = None if setup is None else assembly.setup_card_for_signal(setup, signal)
     return LifecycleResponse(
-        signal=assembly.signal_row_out(row),
+        signal=assembly.signal_detail_out(row, signal),  # the one place the full payload travels
         steps=[assembly.lifecycle_step(run) for run in runs],
         evaluations=[
             EvaluationOut.model_validate(e.model_dump())

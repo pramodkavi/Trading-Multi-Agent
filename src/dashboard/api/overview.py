@@ -54,6 +54,7 @@ from src.dashboard.api.schemas import (
     LifecycleStep,
     RiskBudget,
     SetupCardOut,
+    SignalDetailOut,
     SignalRowOut,
     SymbolChip,
     WindowOutcome,
@@ -74,6 +75,7 @@ __all__ = [
     "scans_on",
     "setup_card_for_signal",
     "setup_card_out",
+    "signal_detail_out",
     "signal_row_out",
     "trim_output",
     "utcnow",
@@ -192,13 +194,13 @@ def scans_on(scans: Sequence[StoredScanRun], day: date) -> list[StoredScanRun]:
 def _chips_for(rows: Sequence[JournalRow], scan_ids: set[UUID]) -> list[SymbolChip]:
     chips = [
         SymbolChip(
-            symbol=row.signal.symbol,
+            symbol=row.symbol,
             kind=row.decision_kind,
             violated_rule=row.violated_rule,
-            signal_id=row.signal.id,
+            signal_id=row.id,
         )
         for row in rows
-        if row.signal.scan_id in scan_ids
+        if row.scan_id in scan_ids
     ]
     return sorted(chips, key=lambda c: (c.symbol, str(c.signal_id)))
 
@@ -369,16 +371,21 @@ def setup_card_for_signal(setup: StoredActiveSetup, signal: StoredSignal) -> Set
 
 
 def signal_row_out(row: JournalRow) -> SignalRowOut:
-    """Flatten a nested :class:`JournalRow` into the wire row."""
-    return SignalRowOut(
-        **row.signal.model_dump(),
-        decision_kind=row.decision_kind,
-        judge_ruling=row.judge_ruling,
-        session=row.session,
-        has_setup=row.has_setup,
-        violated_rule=row.violated_rule,
-        resolution_outcome=row.resolution_outcome,
-        realized_r=row.realized_r,
+    """The trimmed journal row on the wire (field-for-field with :class:`JournalRow`)."""
+    return SignalRowOut.model_validate(row.model_dump())
+
+
+def signal_detail_out(row: JournalRow, signal: StoredSignal) -> SignalDetailOut:
+    """The lifecycle's ``signal``: the journal row plus the full stored signal's JSON.
+
+    Design §3.4: only here does ``payload`` / ``features`` / ``outcome_metadata``
+    travel -- one row per request, so the 1 MB cap is not a concern.
+    """
+    return SignalDetailOut(
+        **row.model_dump(),
+        payload=signal.payload,
+        features=signal.features,
+        outcome_metadata=signal.outcome_metadata,
     )
 
 

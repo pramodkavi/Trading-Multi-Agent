@@ -111,7 +111,12 @@ def _journal_row(
     signal_id: UUID | None = None,
     created_at: str = ISO_NOW,
 ) -> dict[str, Any]:
-    """One row exactly as `read_rows` would hand it back for the journal projection."""
+    """One row exactly as `read_rows` would hand it back for the journal projection.
+
+    The projection is *trimmed* (design §3.4, Data API 1 MB cap): no `payload`,
+    `features` or `outcome_metadata` column -- the analyzer summary is lifted out
+    of the payload in SQL (`entry_price` ... `skip_details`).
+    """
     payload = _proposal_payload(direction) if direction else _skip_payload(violated_rule)
     return {
         "id": str(signal_id or uuid4()),
@@ -121,11 +126,15 @@ def _journal_row(
         "direction": direction,
         "status": "PUBLISHED" if direction else "SKIPPED",
         "created_at": created_at,
-        "payload": json.dumps(payload),
         "tags": ["fvg"] if direction else [],
-        "features": json.dumps({"rr": 3.0}) if direction else "{}",
         "outcome": "WIN" if resolution_outcome == "WIN" else None,
-        "outcome_metadata": json.dumps({"exit": 106.0}) if resolution_outcome == "WIN" else None,
+        "entry_price": payload.get("entry_price"),
+        "stop_loss": payload.get("stop_loss"),
+        "take_profit_1": payload.get("take_profit_1"),
+        "take_profit_2": payload.get("take_profit_2"),
+        "risk_reward_ratio": payload.get("risk_reward_ratio"),
+        "skip_reason": payload.get("reason"),
+        "skip_details": payload.get("details"),
         "decision_kind": kind,
         "judge_ruling": ruling,
         "session": "LONDON",
@@ -158,6 +167,19 @@ async def test_signals_page_default_sql_shape() -> None:
     assert "(t.id IS NOT NULL) AS has_setup" in sql
     assert "ORDER BY s.created_at DESC, s.id DESC" in sql
     assert "LIMIT :limit" in sql
+    # Trimmed projection (design §3.4): the three big JSONB columns are never selected
+    # as a whole -- 201 full rows could exceed the Data API's 1 MB response cap.
+    assert "s.payload::text" not in sql
+    assert "AS payload" not in sql
+    assert "s.features" not in sql
+    assert "s.outcome_metadata" not in sql
+    # ... only the analyzer summary is lifted out of the payload, in SQL.
+    for key in ("entry_price", "stop_loss", "take_profit_1", "take_profit_2", "risk_reward_ratio"):
+        assert f"(s.payload->>'{key}')::double precision AS {key}" in sql, key
+    assert "s.payload->>'reason' AS skip_reason" in sql
+    assert "left(s.payload->>'details', 200) AS skip_details" in sql
+    assert "s.payload->>'violated_rule' AS violated_rule" in sql
+    assert "s.tags" in sql and "s.outcome" in sql
     params = _params(reader.calls[0])
     assert params["after_ts"] == {"isNull": True}
     assert params["after_id"] == {"isNull": True}
@@ -307,21 +329,30 @@ async def test_signals_page_parses_rows() -> None:
     assert [r.violated_rule for r in rows] == [None, None, "RULE_3_PREMIUM_DISCOUNT", None]
     assert all(r.session == "LONDON" for r in rows)
 
-    published = rows[0].signal
+    published = rows[0]
     assert published.id == published_id
     assert published.direction is SignalDirection.LONG
     assert published.status is SignalStatus.PUBLISHED
     assert published.created_at == NOW
-    assert published.payload["entry_price"] == 100.0  # JSONB text -> dict
-    assert published.features == {"rr": 3.0}
     assert published.tags == ["fvg"]
     assert published.outcome is SignalOutcome.WIN
-    assert published.outcome_metadata == {"exit": 106.0}
+    # The analyzer summary comes from the SQL-lifted columns, not a parsed payload.
+    assert (published.entry_price, published.stop_loss) == (100.0, 98.0)
+    assert (published.take_profit_1, published.take_profit_2) == (106.0, 110.0)
+    assert published.risk_reward_ratio == 3.0
+    assert published.skip_reason is None and published.skip_details is None
 
-    gate = rows[2].signal
+    gate = rows[2]
     assert gate.direction is None and gate.status is SignalStatus.SKIPPED
-    assert gate.payload["violated_rule"] == "RULE_3_PREMIUM_DISCOUNT"
-    assert gate.features == {} and gate.outcome_metadata is None
+    assert gate.violated_rule == "RULE_3_PREMIUM_DISCOUNT"
+    assert gate.skip_reason == "INSUFFICIENT_RR"
+    assert gate.skip_details == "gate rejected the proposal"
+    assert gate.entry_price is None and gate.risk_reward_ratio is None
+    assert gate.tags == [] and gate.outcome is None
+
+    # The row model carries no full JSONB column at all (design §3.4).
+    for big in ("payload", "features", "outcome_metadata", "signal"):
+        assert big not in JournalRow.model_fields, big
 
     # Frozen value objects: the router may not mutate them.
     with pytest.raises(Exception, match="frozen"):
@@ -336,8 +367,9 @@ async def test_signals_page_vetoed_row() -> None:
     assert row.judge_ruling == "SKIP"
     # `signals.status` is PUBLISHED even for a Judge veto (design §5.1): the kind is
     # derived from the Judge run, never from the status column.
-    assert row.signal.status is SignalStatus.PUBLISHED
-    assert row.signal.direction is SignalDirection.SHORT
+    assert row.status is SignalStatus.PUBLISHED
+    assert row.direction is SignalDirection.SHORT
+    assert (row.entry_price, row.stop_loss, row.take_profit_1) == (100.0, 102.0, 94.0)
 
 
 async def test_signals_page_does_not_mutate_reader_rows() -> None:
@@ -345,7 +377,7 @@ async def test_signals_page_does_not_mutate_reader_rows() -> None:
     snapshot = dict(canned)
     reader = FakeReader([canned])
     await list_signals_page(reader, filters=SignalFilters(), limit=50, after=None)
-    assert canned == snapshot  # row_to_signal mutates in place; we must pass it a copy
+    assert canned == snapshot  # the reader's dicts are never mutated in place
 
 
 # ---------------------------------------------------------------------------

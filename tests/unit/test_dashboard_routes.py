@@ -238,7 +238,8 @@ def _journal_row(
     resolution_outcome: str | None = None,
     realized_r: float | None = None,
 ) -> dict[str, Any]:
-    """One row exactly as `read_rows` hands back the journal projection."""
+    """One row exactly as `read_rows` hands back the (trimmed) journal projection."""
+    payload = signal.payload
     return {
         "id": str(signal.id),
         "scan_id": str(signal.scan_id),
@@ -247,11 +248,15 @@ def _journal_row(
         "direction": signal.direction.value if signal.direction is not None else None,
         "status": signal.status.value,
         "created_at": signal.created_at.isoformat(),
-        "payload": json.dumps(signal.payload),
         "tags": list(signal.tags),
-        "features": json.dumps(signal.features),
         "outcome": signal.outcome.value if signal.outcome is not None else None,
-        "outcome_metadata": None,
+        "entry_price": payload.get("entry_price"),
+        "stop_loss": payload.get("stop_loss"),
+        "take_profit_1": payload.get("take_profit_1"),
+        "take_profit_2": payload.get("take_profit_2"),
+        "risk_reward_ratio": payload.get("risk_reward_ratio"),
+        "skip_reason": payload.get("reason"),
+        "skip_details": payload.get("details"),
         "decision_kind": kind.value,
         "judge_ruling": ruling,
         "session": session,
@@ -860,27 +865,56 @@ def test_signals_page_default_limit_and_next_cursor(client: TestClient, scenario
     first = body["items"][0]
     assert first["decision_kind"] == "NO_SETUP" and first["status"] == "SKIPPED"
     assert first["direction"] is None and first["has_setup"] is False
-    assert set(first) == {
-        "id",
-        "scan_id",
-        "symbol",
-        "strategy",
-        "direction",
-        "status",
-        "created_at",
-        "payload",
-        "tags",
-        "features",
-        "outcome",
-        "outcome_metadata",
-        "decision_kind",
-        "judge_ruling",
-        "session",
-        "has_setup",
-        "violated_rule",
-        "resolution_outcome",
-        "realized_r",
-    }
+    assert first["skip_reason"] == "NO_CLEAR_BIAS" and first["entry_price"] is None
+    assert set(first) == JOURNAL_ROW_KEYS
+
+
+JOURNAL_ROW_KEYS = {
+    "id",
+    "scan_id",
+    "symbol",
+    "strategy",
+    "direction",
+    "status",
+    "created_at",
+    "tags",
+    "outcome",
+    "entry_price",
+    "stop_loss",
+    "take_profit_1",
+    "take_profit_2",
+    "risk_reward_ratio",
+    "skip_reason",
+    "skip_details",
+    "decision_kind",
+    "judge_ruling",
+    "session",
+    "has_setup",
+    "violated_rule",
+    "resolution_outcome",
+    "realized_r",
+}
+
+
+def test_signals_page_rows_are_trimmed(client: TestClient, scenario: Scenario) -> None:
+    # Design §3.4 (Data API 1 MB cap): a journal row carries the analyzer summary, never
+    # the full payload / features / outcome_metadata -- those are on the lifecycle only.
+    scenario.store.page_rows = [
+        _journal_row(scenario.published, kind=DecisionKind.PUBLISHED, session="LONDON"),
+        _journal_row(scenario.gate_rejected, kind=DecisionKind.GATE_REJECTED, session="NY"),
+    ]
+    published, rejected = client.get("/api/signals").json()["items"]
+    assert set(published) == JOURNAL_ROW_KEYS and set(rejected) == JOURNAL_ROW_KEYS
+    assert "payload" not in published and "features" not in published
+    assert "outcome_metadata" not in published
+    assert (published["entry_price"], published["stop_loss"]) == (100.0, 98.0)
+    assert (published["take_profit_1"], published["take_profit_2"]) == (106.0, 110.0)
+    assert published["risk_reward_ratio"] == 3.0 and published["tags"] == ["fvg"]
+    assert published["skip_reason"] is None and published["skip_details"] is None
+    assert rejected["skip_reason"] == "INSUFFICIENT_RR"
+    assert rejected["skip_details"] == "gate rejected the proposal"
+    assert rejected["entry_price"] is None and rejected["risk_reward_ratio"] is None
+    assert NARRATIVE not in json.dumps(published)
 
 
 def test_signals_last_page_has_no_cursor(client: TestClient, scenario: Scenario) -> None:
@@ -978,7 +1012,12 @@ def test_lifecycle_published_signal(client: TestClient, scenario: Scenario) -> N
     assert signal["id"] == str(scenario.published.id)
     assert signal["decision_kind"] == "PUBLISHED" and signal["has_setup"] is True
     assert signal["judge_ruling"] == "PUBLISH_WITH_CAVEAT" and signal["session"] == "LONDON"
-    assert signal["direction"] == "LONG" and signal["payload"]["entry_price"] == 100.0
+    assert signal["direction"] == "LONG" and signal["entry_price"] == 100.0
+    # The lifecycle is the one place the FULL signal travels (journal rows are trimmed).
+    assert set(signal) == JOURNAL_ROW_KEYS | {"payload", "features", "outcome_metadata"}
+    assert signal["payload"] == scenario.published.payload
+    assert signal["payload"]["confluence_narrative"] == NARRATIVE
+    assert signal["features"] == {"rr": 3.0} and signal["outcome_metadata"] is None
 
     steps = body["steps"]
     assert [s["role"] for s in steps] == ["analyzer", "historian", "skeptic", "judge"]
