@@ -413,7 +413,14 @@ def test_dashboard_default_stage_logged_and_throttled(templates: dict[str, Any])
             "StageName": "$default",
             "AutoDeploy": True,
             "AccessLogSettings": assertions.Match.object_like(
-                {"DestinationArn": assertions.Match.any_value()}
+                {
+                    "DestinationArn": assertions.Match.any_value(),
+                    # HTTP-API variables: CDK's default (Common Log) format uses the
+                    # REST-era $context.resourcePath, which an HTTP API logs as "-".
+                    "Format": assertions.Match.string_like_regexp(
+                        r"\$context\.routeKey.*\$context\.path"
+                    ),
+                }
             ),
             "DefaultRouteSettings": assertions.Match.object_like(
                 {"ThrottlingRateLimit": 10, "ThrottlingBurstLimit": 20}

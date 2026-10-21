@@ -52,6 +52,7 @@ Telegram deep links (design §7).
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import jsii
@@ -62,6 +63,7 @@ from aws_cdk import (
     Stack,
     Tags,
 )
+from aws_cdk import aws_apigateway as apigw
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_integrations as integrations
 from aws_cdk import aws_lambda as lambda_
@@ -85,10 +87,34 @@ THROTTLE_BURST = 20
 # The one unauthenticated route (design §6.1).
 HEALTH_PATH = "/api/health"
 
+# HTTP-API access-log line, one JSON object per request. CDK's default (Common
+# Log) format uses the REST-era ``$context.resourcePath``, which an HTTP API
+# logs as ``-`` (live-verified on Step 4.1: ``"GET - HTTP/1.1" 200 35``), so the
+# path of a rejected or slow request was invisible. ``$context.routeKey`` /
+# ``$context.path`` are the HTTP-API variables; ``integrationError`` is the only
+# record of a Lambda-side failure when the integration (not the app) 5xx's, and
+# from Step 4.4 these lines are also the only record of requests the JWT
+# authorizer rejects before the Lambda runs. Values are $context variables, not
+# user input, so the JSON cannot be broken by a request.
+ACCESS_LOG_FORMAT = json.dumps(
+    {
+        "requestId": "$context.requestId",
+        "ip": "$context.identity.sourceIp",
+        "requestTime": "$context.requestTime",
+        "method": "$context.httpMethod",
+        "routeKey": "$context.routeKey",
+        "path": "$context.path",
+        "status": "$context.status",
+        "responseLength": "$context.responseLength",
+        "integrationLatency": "$context.integrationLatency",
+        "integrationError": "$context.integrationErrorMessage",
+    }
+)
+
 
 @jsii.implements(apigwv2.IAccessLogSettings)
 class _AccessLogSettings:
-    """Stage access-log settings: a destination, default (Common Log) format.
+    """Stage access-log settings: a destination + the HTTP-API JSON format above.
 
     ``HttpStage.access_log_settings`` takes the jsii *interface*
     ``IAccessLogSettings`` (``destination`` + optional ``format``), and
@@ -106,8 +132,8 @@ class _AccessLogSettings:
         return self._destination
 
     @property
-    def format(self) -> None:
-        return None  # CDK's default Common Log Format (includes the request id)
+    def format(self) -> apigw.AccessLogFormat:
+        return apigw.AccessLogFormat.custom(ACCESS_LOG_FORMAT)
 
 
 class DashboardStack(Stack):
