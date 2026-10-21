@@ -29,12 +29,13 @@ Rules every statement follows (plan Global Constraints, PROJECT_STATE §5):
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from datetime import datetime
 from typing import Any, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from src.common.models import ActiveSetupStatus, SignalDirection, SignalOutcome, SignalStatus
 from src.dashboard.api.classify import DECISION_KIND_SQL, DecisionKind
@@ -55,6 +56,8 @@ __all__ = [
     "list_signals_for_scans",
     "list_signals_page",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class DashboardReader(Protocol):
@@ -160,17 +163,20 @@ _JOURNAL_COLUMNS = f"""s.id::text AS id, s.scan_id::text AS scan_id, s.symbol, s
        s.payload->>'reason' AS skip_reason,
        left(s.payload->>'details', 200) AS skip_details"""
 
+# ``has_setup`` is an EXISTS probe rather than a LEFT JOIN: a signal with more than
+# one ``active_setups`` row (re-opened after a console edit, a replayed setup) must
+# never fan out into duplicate journal lines or a wrong page length.
 _JOURNAL_SELECT = f"""SELECT {_JOURNAL_COLUMNS},
        ({DECISION_KIND_SQL}) AS decision_kind,
        j.ruling AS judge_ruling,
        r.session AS session,
-       (t.id IS NOT NULL) AS has_setup,
+       EXISTS (SELECT 1 FROM active_setups t WHERE t.signal_id = s.id) AS has_setup,
        s.payload->>'violated_rule' AS violated_rule,
        d.outcome AS resolution_outcome,
        d.realized_r::double precision AS realized_r"""
 
 # ``j`` is the latest Judge run sharing the signal's scan (one scan_runs row per
-# symbol, design §5.1); ``t`` / ``d`` are the setup and the Critic's replay.
+# symbol, design §5.1); ``d`` is the Critic's replay (one row per signal, PK).
 _JOURNAL_FROM = """FROM signals s
 JOIN scan_runs r ON r.id = s.scan_id
 LEFT JOIN LATERAL (
@@ -180,7 +186,6 @@ LEFT JOIN LATERAL (
     ORDER BY a.created_at DESC
     LIMIT 1
 ) j ON TRUE
-LEFT JOIN active_setups t ON t.signal_id = s.id
 LEFT JOIN decision_resolutions d ON d.signal_id = s.id"""
 
 _JOURNAL_ORDER = "ORDER BY s.created_at DESC, s.id DESC"
@@ -297,7 +302,15 @@ JOIN signals s ON s.id = t.signal_id
 WHERE t.status = :status
 ORDER BY t.opened_at DESC, t.id DESC"""
     rows = await reader.read_rows(sql, [_str_param("status", ActiveSetupStatus.OPEN.value)])
-    return [SetupCard.model_validate(_parse_latest_evaluation(row)) for row in rows]
+    cards: list[SetupCard] = []
+    for row in rows:
+        try:
+            cards.append(SetupCard.model_validate(_parse_latest_evaluation(row)))
+        except ValidationError as exc:
+            # One malformed payload (a missing price after a console edit, an older
+            # row) must not take the whole overview down: skip it, say which.
+            logger.warning("setup %s skipped: malformed payload: %s", row.get("setup_id"), exc)
+    return cards
 
 
 async def get_setup_for_signal(

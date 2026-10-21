@@ -79,3 +79,50 @@ def test_decode_cursor_rejects_garbage(raw: str) -> None:
 
 def test_bad_cursor_is_a_value_error() -> None:
     assert issubclass(BadCursor, ValueError)
+
+
+def test_decode_cursor_rejects_oversized_input_before_decoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 100 kB of valid base64: rejected on length alone -- no decode / parse work is
+    # spent on it (a 200-char cursor is the real shape; 512 is the cap).
+    huge = "A" * 100_000
+
+    def _no_decode(*_a: object, **_k: object) -> bytes:
+        raise AssertionError("an oversized cursor must be rejected before base64 decoding")
+
+    monkeypatch.setattr(base64, "urlsafe_b64decode", _no_decode)
+    with pytest.raises(BadCursor, match="too long"):
+        decode_cursor(huge)
+    # The cap is a limit on the untrusted input, not on legitimate cursors.
+    assert len(encode_cursor(NOW, uuid4())) < 512
+
+
+def test_decode_cursor_accepts_input_at_the_cap() -> None:
+    # Exactly 512 characters is still decoded (and then fails on shape, not length).
+    at_cap = _b64("x" * 383)[:512]
+    assert len(at_cap) == 512
+    with pytest.raises(BadCursor) as excinfo:
+        decode_cursor(at_cap)
+    assert "too long" not in str(excinfo.value)
+
+
+def test_decode_cursor_rejects_deeply_nested_json() -> None:
+    # Deep nesting inside the cap: never a RecursionError out of the router.
+    nested = _b64("[" * 380)
+    assert len(nested) <= 512
+    with pytest.raises(BadCursor):
+        decode_cursor(nested)
+
+
+def test_decode_cursor_maps_recursion_error_to_bad_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The JSON decoder raises RecursionError (not ValueError) past the interpreter's
+    # recursion limit; it must surface as BadCursor -> 400, not a 500.
+    from src.dashboard.api import cursor as cursor_module
+
+    def _blow_up(*_a: object, **_k: object) -> object:
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(cursor_module.json, "loads", _blow_up)
+    with pytest.raises(BadCursor):
+        decode_cursor(encode_cursor(NOW, uuid4()))

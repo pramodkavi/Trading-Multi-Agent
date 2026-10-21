@@ -15,7 +15,12 @@ import json
 from datetime import datetime
 from uuid import UUID
 
-__all__ = ["BadCursor", "decode_cursor", "encode_cursor"]
+__all__ = ["MAX_CURSOR_LENGTH", "BadCursor", "decode_cursor", "encode_cursor"]
+
+# A genuine cursor is ~80 characters (ISO timestamp + UUID, base64url). Anything
+# far beyond that is not ours; reject it on length before spending base64 / JSON
+# work on it (an attacker-sized query parameter must cost nothing).
+MAX_CURSOR_LENGTH = 512
 
 
 class BadCursor(ValueError):  # noqa: N818 - name fixed by the Step 4.2 plan / router contract
@@ -32,15 +37,21 @@ def decode_cursor(raw: str) -> tuple[datetime, UUID]:
     """Inverse of :func:`encode_cursor`; padded input is accepted too.
 
     Raises:
-        BadCursor: on bad base64, bad JSON, the wrong element count / types, a
-            non-ISO or naive timestamp, or a malformed UUID.
+        BadCursor: on an over-long input (> :data:`MAX_CURSOR_LENGTH`), bad
+            base64, bad JSON (including nesting deep enough to exhaust the
+            decoder's recursion), the wrong element count / types, a non-ISO or
+            naive timestamp, or a malformed UUID.
     """
+    if len(raw) > MAX_CURSOR_LENGTH:
+        raise BadCursor(f"cursor is too long ({len(raw)} > {MAX_CURSOR_LENGTH} characters)")
     try:
         padded = raw + "=" * (-len(raw) % 4)
         decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
         parsed = json.loads(decoded)
     except ValueError as exc:  # binascii.Error, JSONDecodeError, Unicode*Error
         raise BadCursor("cursor is not base64url-encoded JSON") from exc
+    except RecursionError as exc:  # pathological nesting inside the length cap
+        raise BadCursor("cursor JSON is nested too deeply") from exc
 
     if not isinstance(parsed, list) or len(parsed) != 2:
         raise BadCursor("cursor must be a two-element list")

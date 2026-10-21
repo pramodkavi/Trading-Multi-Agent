@@ -160,11 +160,13 @@ async def test_signals_page_default_sql_shape() -> None:
     assert "JOIN scan_runs r ON r.id = s.scan_id" in sql
     assert "LEFT JOIN LATERAL" in sql
     assert "agent_role = 'judge'" in sql
-    assert "LEFT JOIN active_setups t ON t.signal_id = s.id" in sql
+    # `has_setup` is an EXISTS probe, not a join: a signal with several setup rows
+    # must never fan out into duplicate journal lines.
+    assert "LEFT JOIN active_setups" not in sql
+    assert "EXISTS (SELECT 1 FROM active_setups t WHERE t.signal_id = s.id) AS has_setup" in sql
     assert "LEFT JOIN decision_resolutions d ON d.signal_id = s.id" in sql
     assert DECISION_KIND_SQL in sql
     assert "AS decision_kind" in sql
-    assert "(t.id IS NOT NULL) AS has_setup" in sql
     assert "ORDER BY s.created_at DESC, s.id DESC" in sql
     assert "LIMIT :limit" in sql
     # Trimmed projection (design §3.4): the three big JSONB columns are never selected
@@ -443,6 +445,51 @@ async def test_open_setup_cards_sql_and_parse() -> None:
     assert first.latest_evaluation == {"status": "AT_RISK", "reasoning": "near SL"}
     assert second.take_profit_2 == 56000.0
     assert second.last_evaluated_at is None and second.latest_evaluation is None
+
+
+async def test_open_setup_cards_skip_and_log_malformed_rows(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A setup whose signal payload lacks a price (console-edited / older row) must not
+    # take the whole overview down: the row is skipped with a WARNING naming it.
+    bad_setup = uuid4()
+    good_setup = uuid4()
+    reader = FakeReader(
+        [
+            {
+                "setup_id": str(bad_setup),
+                "signal_id": str(uuid4()),
+                "symbol": "ETHUSDT",
+                "direction": "SHORT",
+                "entry_price": None,  # payload->>'entry_price' missing
+                "stop_loss": 102.0,
+                "take_profit_1": 94.0,
+                "take_profit_2": None,
+                "opened_at": ISO_NOW,
+                "last_evaluated_at": None,
+                "latest_evaluation": None,
+            },
+            {
+                "setup_id": str(good_setup),
+                "signal_id": str(uuid4()),
+                "symbol": "BTCUSDT",
+                "direction": "LONG",
+                "entry_price": 50000.0,
+                "stop_loss": 49000.0,
+                "take_profit_1": 53000.0,
+                "take_profit_2": None,
+                "opened_at": ISO_NOW,
+                "last_evaluated_at": None,
+                "latest_evaluation": None,
+            },
+        ]
+    )
+    with caplog.at_level("WARNING", logger="src.dashboard.api.queries"):
+        cards = await list_open_setup_cards(reader)
+    assert [c.setup_id for c in cards] == [good_setup]
+    (record,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert str(bad_setup) in record.getMessage()
+    assert "malformed payload" in record.getMessage()
 
 
 # ---------------------------------------------------------------------------

@@ -535,13 +535,33 @@ def test_setup_card_for_signal_lifts_prices_from_the_payload() -> None:
     )
 
 
-def test_setup_card_for_signal_is_none_for_a_skip_row() -> None:
+def test_setup_card_for_signal_is_none_for_a_skip_row(caplog: pytest.LogCaptureFixture) -> None:
     scan = _scan(_at(8, 3, 52))
     skip = _signal(scan, direction=None)
     setup = StoredActiveSetup(
         id=uuid4(), signal_id=skip.id, opened_at=_at(8, 4), status=ActiveSetupStatus.OPEN
     )
-    assert setup_card_for_signal(setup, skip) is None
+    with caplog.at_level("WARNING", logger="src.dashboard.api.overview"):
+        assert setup_card_for_signal(setup, skip) is None
+    # Never silent: the operator can find the malformed row from the log.
+    (record,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert str(setup.id) in record.getMessage() and "skipped" in record.getMessage()
+
+
+def test_setup_card_for_signal_logs_a_malformed_payload(caplog: pytest.LogCaptureFixture) -> None:
+    scan = _scan(_at(8, 3, 52))
+    signal = _signal(scan, direction=SignalDirection.LONG)
+    broken = signal.model_copy(
+        update={"payload": {k: v for k, v in signal.payload.items() if k != "stop_loss"}}
+    )
+    setup = StoredActiveSetup(
+        id=uuid4(), signal_id=broken.id, opened_at=_at(8, 4), status=ActiveSetupStatus.OPEN
+    )
+    with caplog.at_level("WARNING", logger="src.dashboard.api.overview"):
+        assert setup_card_for_signal(setup, broken) is None
+    (record,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert str(setup.id) in record.getMessage()
+    assert "malformed payload" in record.getMessage()
 
 
 # ---------------------------------------------------------------------------
@@ -682,10 +702,50 @@ def test_trim_output_skeptic_objection() -> None:
 
 
 def test_trim_output_skeptic_no_macro_data() -> None:
-    # `NoMacroData.model_dump()` is `{provider, reason}` -- no `severity` key.
+    # `NoMacroData.model_dump()` is `{provider, reason}`: detected by the `provider` key
+    # (the sentinel's own shape), not by the absence of `severity`.
     assert trim_output(
         AgentRole.SKEPTIC, {"provider": "skeptic", "reason": "no macro providers configured"}
     ) == {"no_macro_data": True}
+
+
+def test_trim_output_skeptic_without_severity_is_not_no_macro_data() -> None:
+    # An objection row written by an older model version may lack `severity`; that is
+    # a thin objection (nulls), never a false "no macro data" badge.
+    assert trim_output(AgentRole.SKEPTIC, {"headline": "USD strength", "reasoning": "..."}) == {
+        "severity": None,
+        "recommends_against": None,
+        "headline": "USD strength",
+    }
+    assert trim_output(AgentRole.SKEPTIC, {}) == {
+        "severity": None,
+        "recommends_against": None,
+        "headline": None,
+    }
+
+
+def test_trim_output_critic_is_the_decision_review_fields() -> None:
+    # `DecisionReview` (Critic v0): the grading fields, minus nothing the timeline
+    # needs -- `lesson` is bounded to 300 chars by the model, so it stays.
+    output = {
+        "smc_read_valid": True,
+        "skeptic_vindicated": "NOT_APPLICABLE",
+        "judge_correct": False,
+        "gate_correct": None,
+        "failure_category": "JUDGE_OVERRIDE",
+        "lesson": "the veto was wrong",
+        "confidence": "MEDIUM",
+        "raw_prompt": "x" * 5000,  # anything else is dropped
+    }
+    assert trim_output(AgentRole.CRITIC, output) == {
+        "smc_read_valid": True,
+        "skeptic_vindicated": "NOT_APPLICABLE",
+        "judge_correct": False,
+        "gate_correct": None,
+        "failure_category": "JUDGE_OVERRIDE",
+        "lesson": "the veto was wrong",
+        "confidence": "MEDIUM",
+    }
 
 
 def test_trim_output_judge() -> None:
@@ -713,9 +773,18 @@ def test_trim_output_missing_keys_become_null_not_errors() -> None:
     }
 
 
-@pytest.mark.parametrize("role", [AgentRole.FORECASTER, AgentRole.CRITIC])
-def test_trim_output_unknown_roles_are_empty(role: AgentRole) -> None:
-    assert trim_output(role, {"anything": 1}) == {}
+def test_trim_output_unknown_roles_are_empty() -> None:
+    # The Forecaster writes `setup_evaluations`, not a lifecycle step; any role without a
+    # dedicated trim (only FORECASTER today) summarises as `{}`.
+    assert trim_output(AgentRole.FORECASTER, {"anything": 1}) == {}
+    trimmed_roles = {r for r in AgentRole if trim_output(r, {"anything": 1}) != {}}
+    assert trimmed_roles == {
+        AgentRole.ANALYZER,
+        AgentRole.HISTORIAN,
+        AgentRole.SKEPTIC,
+        AgentRole.JUDGE,
+        AgentRole.CRITIC,
+    }
 
 
 def test_lifecycle_step_carries_accounting_and_trimmed_summary() -> None:

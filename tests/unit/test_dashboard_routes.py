@@ -99,16 +99,18 @@ class FakeStore:
     async def read_rows(self, sql: str, parameters: list[dict[str, Any]]) -> list[dict[str, Any]]:
         params = _param_values(parameters)
         self.calls.append((sql, params))
-        if "FROM active_setups t" in sql:
-            return list(self.setup_card_rows)
-        if "FROM scan_runs" in sql:
-            since = datetime.fromisoformat(params["since"])
-            return [r for r in self.scan_rows if datetime.fromisoformat(r["started_at"]) >= since]
+        # The journal projection's `has_setup` EXISTS probe also mentions
+        # `active_setups t`, so dispatch the journal statements first.
         if "string_to_array(:ids" in sql:
             ids = set(params["ids"].split(","))
             return [r for r in self.journal_rows if r["scan_id"] in ids]
         if "LIMIT :limit" in sql:
             return list(self.page_rows[: params["limit"]])
+        if "FROM active_setups t" in sql:
+            return list(self.setup_card_rows)
+        if "FROM scan_runs" in sql:
+            since = datetime.fromisoformat(params["since"])
+            return [r for r in self.scan_rows if datetime.fromisoformat(r["started_at"]) >= since]
         if "FROM setup_evaluations" in sql:
             return [dict(self.eval_count)]
         if "FROM active_setups" in sql:
@@ -931,7 +933,7 @@ def test_signals_exactly_limit_rows_has_no_cursor(client: TestClient, scenario: 
     assert len(body["items"]) == 50 and body["next_cursor"] is None
 
 
-def test_signals_limit_clamped_to_200(client: TestClient, scenario: Scenario) -> None:
+def test_signals_limit_over_200_is_422(client: TestClient, scenario: Scenario) -> None:
     # Design §3.4 says "max 200"; the plan's ruling is to *reject* out-of-range limits with
     # 422 (`Query(ge=1, le=200)`) rather than silently clamp.
     assert client.get("/api/signals?limit=500").status_code == 422

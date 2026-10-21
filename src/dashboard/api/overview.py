@@ -35,6 +35,7 @@ Three rules of the overview are decided here and nowhere else:
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -81,6 +82,8 @@ __all__ = [
     "utcnow",
     "window_outcome",
 ]
+
+logger = logging.getLogger(__name__)
 
 # The Forecaster sweep is its own EventBridge schedule, `cron(5 8,13,15,22)` UTC in
 # `infrastructure/stacks/scheduling_stack.py` (`{"mode": "forecaster"}`): it starts
@@ -339,11 +342,17 @@ def setup_card_out(card: SetupCard, *, now: datetime) -> SetupCardOut:
 def setup_card_for_signal(setup: StoredActiveSetup, signal: StoredSignal) -> SetupCard | None:
     """A :class:`SetupCard` for the lifecycle page, prices lifted from the proposal payload.
 
-    Returns ``None`` when the signal is a skip row (no direction / prices): a
-    setup can only be opened for a proposal, so this is a defensive branch for
-    malformed data rather than an expected path.
+    Returns ``None`` -- and logs a WARNING naming the setup, never silently --
+    when the signal is a skip row (no direction / prices) or the payload lacks a
+    price: a setup can only be opened for a proposal, so both are defensive
+    branches for malformed data rather than expected paths.
     """
     if signal.direction is None:
+        logger.warning(
+            "setup %s skipped: signal %s is a skip row (no direction / prices)",
+            setup.id,
+            signal.id,
+        )
         return None
     payload = signal.payload
     try:
@@ -361,7 +370,8 @@ def setup_card_for_signal(setup: StoredActiveSetup, signal: StoredSignal) -> Set
             last_evaluated_at=setup.last_evaluated_at,
             latest_evaluation=setup.latest_evaluation,
         )
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning("setup %s skipped: malformed payload: %r", setup.id, exc)
         return None
 
 
@@ -407,6 +417,17 @@ _HISTORIAN_KEYS = ("win_rate", "sample_size", "wins", "losses")
 _MATCH_KEYS = ("signal_id", "symbol", "outcome")
 _SKEPTIC_KEYS = ("severity", "recommends_against", "headline")
 _JUDGE_KEYS = ("ruling", "confidence", "caveat")
+# The Critic's `DecisionReview` fields (Critic v0 design §6.2); `lesson` is capped
+# at 300 chars by the model itself, so the whole grade fits on the timeline.
+_CRITIC_KEYS = (
+    "smc_read_valid",
+    "skeptic_vindicated",
+    "judge_correct",
+    "gate_correct",
+    "failure_category",
+    "lesson",
+    "confidence",
+)
 
 
 def _pick(output: Mapping[str, Any], keys: Sequence[str]) -> dict[str, Any]:
@@ -420,9 +441,12 @@ def trim_output(role: AgentRole, output: Mapping[str, Any]) -> dict[str, Any]:
       (a gate-rejected run holds the *rejected proposal*, so it summarises as one);
     - historian: the win-rate numbers and each match as ``{signal_id, symbol, outcome}``;
     - skeptic: severity / recommends_against / headline, or ``{"no_macro_data": true}``
-      for the ``NoMacroData`` sentinel (serialised as ``{provider, reason}``, no severity);
+      for the ``NoMacroData`` sentinel -- recognised by its own shape (a ``provider``
+      key: it serialises as ``{provider, reason}``), so an objection row that merely
+      lacks ``severity`` is a thin objection (nulls), never a false badge;
     - judge: ruling / confidence / caveat;
-    - any other role: ``{}``.
+    - critic: the ``DecisionReview`` grade (``smc_read_valid`` ... ``confidence``);
+    - any other role (the Forecaster writes ``setup_evaluations`` instead): ``{}``.
 
     Missing keys read as ``None`` rather than raising, so a row written by an older
     model version still renders.
@@ -438,11 +462,13 @@ def trim_output(role: AgentRole, output: Mapping[str, Any]) -> dict[str, Any]:
         )
         return {**_pick(output, _HISTORIAN_KEYS), "matches": matches}
     if role is AgentRole.SKEPTIC:
-        if "severity" not in output:
+        if "provider" in output:
             return {"no_macro_data": True}
         return _pick(output, _SKEPTIC_KEYS)
     if role is AgentRole.JUDGE:
         return _pick(output, _JUDGE_KEYS)
+    if role is AgentRole.CRITIC:
+        return _pick(output, _CRITIC_KEYS)
     return {}
 
 
