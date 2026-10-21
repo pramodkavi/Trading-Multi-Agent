@@ -85,7 +85,8 @@ class ErrorResponse(BaseModel):
 
     `reason` is a stable machine token the UI switches on: `db_resuming` (503,
     with `Retry-After`), `db_error` (502), `market_unavailable` (502),
-    `not_found` (404), `bad_cursor` (400), `unknown_symbol` (400). Data routers
+    `not_found` (404), `bad_cursor` (400), `unknown_symbol` (400), and
+    `unauthorized` (401, the Lambda-side authorizer defence in `auth.py`). Data routers
     list this model under `responses={...}` so it lands in OpenAPI.
     """
 

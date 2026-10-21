@@ -6,7 +6,7 @@
 > **not** cloned, so everything durable has been written here instead. Read this file
 > first; it points to everything else.
 >
-> **Last updated:** 2026-10-21 (**Slice 4 Step 4.3 shipped** on `feat/slice-4-step-4.3-analytics-system-endpoints`, stacked on 4.2 — funnel / analytics / Critic / system-health / market endpoints + CloudWatch read IAM, FastAPI-only until 4.4; **Step 4.2 shipped** on `feat/slice-4-step-4.2-read-only-queries` — read-only queries + overview/setups/signals endpoints; see §2 / §7 / §8. Earlier: Critic v0 / Step 2.14 merged via PR #12; Step 4.0 merged via PR #13 and Step 4.1 `DashboardStack` scaffold merged via PR #14 — both DEPLOYED and live-verified 2026-10-20, see §3. ⚠️ Anthropic credits are exhausted again since 2026-10-19 — see §7.)
+> **Last updated:** 2026-10-21 (**Slice 4 Step 4.4 shipped** on `feat/slice-4-step-4.4-cognito-authorizer` — Cognito user pool + PKCE app client + JWT authorizer on `ANY /api/{proxy+}` (every data route reachable with a token; `/api/health` stays open), Lambda-side claims check, local token helper `scripts/dashboard_token.py`, login runbook `docs/operations.md §8.7`; awaiting review + merge, then the 🟡 4.4 verify row in §7. Steps 4.2 + 4.3 merged to `main` via PR #15. Earlier note: **Slice 4 Step 4.3 shipped** on `feat/slice-4-step-4.3-analytics-system-endpoints`, stacked on 4.2 — funnel / analytics / Critic / system-health / market endpoints + CloudWatch read IAM, FastAPI-only until 4.4; **Step 4.2 shipped** on `feat/slice-4-step-4.2-read-only-queries` — read-only queries + overview/setups/signals endpoints; see §2 / §7 / §8. Earlier: Critic v0 / Step 2.14 merged via PR #12; Step 4.0 merged via PR #13 and Step 4.1 `DashboardStack` scaffold merged via PR #14 — both DEPLOYED and live-verified 2026-10-20, see §3. ⚠️ Anthropic credits are exhausted again since 2026-10-19 — see §7.)
 > **Authority order:** `SPEC.md` (authoritative spec) → `CLAUDE.md` (index/rules) → this file (current state).
 
 ---
@@ -38,7 +38,7 @@ UTC cron (crypto never closes). Full detail in `SPEC.md`; quick index in `CLAUDE
 
 ---
 
-## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Steps 4.0 + 4.1 merged, deployed & live-verified; Steps 4.2 + 4.3 shipped (stacked branches, awaiting review + merge)**
+## 2. Current status — **Slice 2 build COMPLETE (2.1–2.14 on `main`), deployed & live-verified; Slice 4 Steps 4.0 + 4.1 merged, deployed & live-verified; Steps 4.2 + 4.3 merged (PR #15); Step 4.4 shipped (branch, awaiting review + merge)**
 
 Slice 1 (1.1 → 1.22) and Slice 2 build steps **2.1 → 2.14** are done, on `main`, and
 **running in production** (ap-south-1). **Live-verified 2026-06-27:** a manual scan returned
@@ -298,6 +298,37 @@ suppression). Route table, error bodies and console examples: `docs/operations.m
    ruling); `"cloudwatch access denied"` note; the two lazy-import tests also forbid `httpx` /
    `boto3` and run their subprocess from the repo root.
 
+Steps 4.2 + 4.3 were merged to `main` together via **PR #15** (`cea774b`, 2026-10-21).
+
+**Step 4.4 shipped — Cognito user pool + JWT authorizer + `ANY /api/{proxy+}`** (branch
+`feat/slice-4-step-4.4-cognito-authorizer` off `main` @ `cea774b`; design §10 row 4.4 / §8). This
+is the step that makes the 4.2 + 4.3 data routes reachable through the API URL. Runbook
+`docs/operations.md §8.1 / §8.6 / §8.7`.
+1. **Infra** (`dashboard_stack.py`) — user pool `crypto-signals-dashboard`: admin-create only (no
+   self-signup), email sign-in (case-insensitive), password ≥ 12 with all four classes, temp
+   password 3 days, **TOTP MFA required** (no SMS; first login enrols TOTP; operator decision
+   2026-10-21 — optional MFA had no enrolment path on the classic Hosted UI), email-only recovery, **LITE** plan, **RETAIN +
+   deletion protection** (operator decision 2026-10-21: a stack delete keeps the pool; a recreated
+   stack gets a new empty one). Classic Hosted UI prefix domain `crypto-signals-dash-<account>`.
+   Public app client: code grant + PKCE only, SRP, `openid email profile`, callback
+   `http://localhost:8765/callback` (Step 4.5 adds CloudFront), access / ID 1 h, refresh 30 d,
+   revocation on, user-existence errors prevented. `HttpUserPoolAuthorizer` (issuer + client +
+   expiry, `openid` scope required so only access tokens pass) on the new `ANY /api/{proxy+}`
+   route; `GET /api/health` keeps no authorizer (the more
+   specific route wins). Both routes share one integration. No CORS; throttle unchanged. Outputs
+   `DashboardUserPoolId`, `DashboardUserPoolClientId`, `DashboardCognitoDomain`,
+   `DashboardJwtIssuer`. cdk-nag: APIG4 satisfied by the authorizer, COG1 by the policy;
+   COG2 satisfied by required TOTP; **COG3 / COG8 suppressed on the pool only** (advanced
+   security and the Plus plan are paid tiers).
+2. **Lambda-side defence** (`src/dashboard/api/auth.py`, `AuthorizerClaimsMiddleware`) — under
+   Lambda, any path but `/api/health` without `requestContext.authorizer.jwt.claims` carrying a
+   non-empty `sub` → **401** `{"reason":"unauthorized"}`, route never runs (so console Test events
+   need claims, and an unknown path without claims is 401, not 404). No-op outside Lambda.
+3. **Token helper** (`scripts/dashboard_token.py`, stdlib only) — PKCE S256 + `state` check,
+   one-shot listener on `127.0.0.1:8765` (bound before the browser opens, 120 s), token exchange,
+   access token on stdout only, `--call <https url>` status + 500-char preview on stderr; one-line
+   errors with the token redacted; nothing written to disk.
+
 ---
 
 ## 3. Live deployment facts (AWS)
@@ -317,7 +348,10 @@ suppression). Route table, error bodies and console examples: `docs/operations.m
 | **Lambda log group** | `CryptoSignals-Compute-ScanLambdaLogs7DF29218-H5rf5DCKJt4n` (same cutover rename) |
 | **Dashboard stack** | `CryptoSignals-Dashboard` — **CREATE_COMPLETE 2026-10-20 10:21 UTC** (first `cdk deploy --all` after the 4.1 merge, PR #14). Runbook `docs/operations.md §8`. |
 | **Dashboard function name** | `CryptoSignals-Dashboard-DashboardApi9FF75625-sBxaO23I2ara` (512 MB / 25 s / python3.11; log groups `CryptoSignals-Dashboard-DashboardApiLogs1CB09409-mackPnzDjQWJ` and `…-DashboardApiAccessLogsC0B4C96E-mziSWrU7AjJI`) |
-| **Dashboard API URL** | `https://s2bc8yifa1.execute-api.ap-south-1.amazonaws.com` — smoke test `GET /api/health` → `{"status":"ok","version":"c3ecb80"}` **verified 2026-10-20 12:42 UTC** (`c3ecb80` = the PR #14 merge commit). Only `/api/health` is routed until Step 4.4 (`/api/docs` → 404 as documented; the Step 4.2 data routes exist in the app but are console-only — `docs/operations.md §8.6`); no auth until Step 4.4. |
+| **Dashboard API URL** | `https://s2bc8yifa1.execute-api.ap-south-1.amazonaws.com` — smoke test `GET /api/health` → `{"status":"ok","version":"c3ecb80"}` **verified 2026-10-20 12:42 UTC** (`c3ecb80` = the PR #14 merge commit). Until the Step 4.4 deploy only `/api/health` is routed (data routes console-only); from 4.4 every other `/api/*` route needs a Cognito access token (`docs/operations.md §8.7`). |
+| **Dashboard user pool id** | *fill in after the Step 4.4 deploy* (`DashboardUserPoolId` output; pool `crypto-signals-dashboard`, **retained** on stack delete) |
+| **Dashboard app client id** | *fill in after the Step 4.4 deploy* (`DashboardUserPoolClientId` output) |
+| **Dashboard Cognito domain** | *fill in after the Step 4.4 deploy* (`DashboardCognitoDomain` output; expected `https://crypto-signals-dash-097853039368.auth.ap-south-1.amazoncognito.com`) |
 | **Console editing** | The scan + notifier functions — and the dashboard API function, deployed 2026-10-20 (`docs/operations.md §8.4`) — are zip-packaged: open **Code** in the Lambda console to read/edit `src/` and `scripts/`, Deploy, then Test (`docs/operations.md §4.1`). **Any `cdk deploy` overwrites console edits.** |
 | **Schedule** | EventBridge Scheduler `cron(3 8 * * ? *)` Etc/UTC, **ENABLED** (London open). NY/overlap/wrap/Critic windows added in later steps. |
 | **App secrets** | **Step 2.12 (code; activates on next deploy):** moved to **SSM Parameter Store SecureString** — `/crypto-signals/anthropic-api-key` (plain key string) and `/crypto-signals/telegram-bot-token` (**JSON** `{"bot_token":"...","chat_id":"..."}`). Created out-of-band via `aws ssm put-parameter --type SecureString` (CFN can't create SecureString) — see `docs/operations.md §1`. Pre-2.12 these were Secrets Manager secrets (no leading slash); the 2.12 deploy removes them. The Aurora DB credential stays in Secrets Manager. |
@@ -486,6 +520,7 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 | ✅ Verified (Step 4.1, 2026-10-20) | `GET https://s2bc8yifa1.execute-api.ap-south-1.amazonaws.com/api/health` → **200** `{"status":"ok","version":"c3ecb80"}` = the PR #14 merge commit; `/api/docs` → 404 (not routed, as documented). The `DashboardApiAccessLogs` group received one CLF line per request with **the path field logged as `-`** (`"GET - HTTP/1.1" 200 35`) because CDK's default format uses REST-era `$context.resourcePath` → ✅ **fixed in Step 4.2: the stage now uses an HTTP-API JSON format** (`routeKey`, `path`, `status`, `integrationLatency`, `requestId`, …) — verify after the 4.2 deploy (row below). Deploy created the stack last with no pipeline-stack changes beyond the shared code asset. |
 | 🟡 Verify after deploy (Step 4.2) | (a) `GET /api/health` once, then read the newest `DashboardApiAccessLogs` event: a JSON object whose `routeKey` is `GET /api/health` and `path` is `/api/health` (no more `-`). (b) Lambda console → `DashboardApi…` → Test with the v2 event from `docs/operations.md §8.6` against `/api/system/db`: `statusCode` 200 and a body `{"db":"ok","latency_ms":…}` — the first try after idle may say `"resuming"`, re-run after ~10 s. (c) The same event with `requestContext.http.path` (plus `rawPath` / `routeKey` — Mangum routes on the `http.path` field) set to `/api/overview`: 200 with today's windows (one `WindowOutcome` per window that has run — `LONDON` / `NY` / `OVERLAP` / `DAILY_WRAP` labels, worst per-symbol `status`, the four symbols — grouped from the per-symbol `scan_runs` rows), the risk budget, and `alarms: null` (once 4.3 is deployed: the alarm list, see the 4.3 row); a 503 `db_resuming` on the first try is expected. (d) `/api/signals?limit=5` (in `rawQueryString`): 200, five rows with a `kind`, and a `next_cursor` that pages when fed back as `cursor=`. |
 | 🟡 Verify after deploy (Step 4.3) | Lambda console Test events per `docs/operations.md §8.6`: (a) `/api/system/alarms` returns the **five** `CryptoSignals-Monitoring-*` alarms — not `"alarms": null` + `"cloudwatch unavailable"` (the AccessDenied degradation), which confirms the `DescribeAlarms` resource scoping; (b) `/api/market/klines` with `rawQueryString` `symbol=BTCUSDT` returns candles from ap-south-1 (Binance reachable from the dashboard Lambda); (c) `/api/funnel` for one day (`since` / `until` one UTC day apart) matches a manual count of that day's `signals` / `scan_runs` rows; (d) **NFR-4.3**: re-run `EXPLAIN (ANALYZE, BUFFERS)` of the funnel (`_DECISIONS_BETWEEN_SQL`) and outcome-rows (`_OUTCOME_ROWS_SQL`) queries over 365 days through the aws-mcp Data API path and record planning + execution time (< 500 ms budget) — **not run on 2026-10-21 because the MCP token had expired** (re-auth with `/mcp`, then run); (e) `/api/overview` while a setup is OPEN returns a **non-null `unrealised_r`** on its card (Binance reachable + the linear-only market load works); (f) record **cold and warm latency** of `/api/overview` and `/api/market/klines` (first Test after a deploy / idle = cold — expect the market load on the cold klines call only; a second Test = warm, cached markets); (g) `/api/system/metrics` reports the **current** `CryptoSignals-Compute-ScanLambda…` function name (discovered via `ListMetrics`; not a stale pre-redeploy name). |
+| 🟡 Verify after deploy (Step 4.4) | Runbook `docs/operations.md §8.7`. First fill in the three Cognito rows of §3 from the stack outputs. (a) **Create the user** — Cognito console → pool `crypto-signals-dashboard` → Users → Create user (email as username, email invitation, temporary password). (b) **Helper login end to end** — `.\.venv\Scripts\python.exe -m scripts.dashboard_token --domain <DashboardCognitoDomain> --client-id <DashboardUserPoolClientId> --call <DashboardApiUrl>/api/system/db`: Hosted UI forces the password change, then shows the QR code to **enrol TOTP** (MFA is required) and asks for a 6-digit code; stdout prints a token, stderr shows `200` + `{"db":…}`; a second sign-in asks for the TOTP code. (c) **No token** `GET /api/overview` → **401** `{"message":"Unauthorized"}`, and the newest `DashboardApiAccessLogs` line shows `routeKey` `ANY /api/{proxy+}`, `status` 401 and no `integrationLatency` (no function-log entry). (d) **With token** `GET /api/overview` → **200** (proves the `{proxy+}` route's Lambda permission; a first-try 503 `db_resuming` is fine). (e) `GET /api/health` → **200 without a token** (still open, still DB-free). **The 4.2 + 4.3 verify rows above become testable through the URL** with the helper's token instead of console events (console events now need `requestContext.authorizer.jwt.claims.sub`, `docs/operations.md §8.6`): NFR-4.3 `EXPLAIN`, the alarm strip, klines from ap-south-1, the one-day funnel count, a non-null `unrealised_r`, cold / warm latencies, and the metrics function name. |
 | 🟡 Test debt (Step 4.0) | Run `.\.venv\Scripts\python.exe -m pytest -m integration tests/integration/test_repositories_integration.py` the next time a local Postgres (Docker, port 5433) is available — the asyncpg `setup_evaluations` record/list round-trip was written in Step 4.0 but has never executed (no Docker on the build machine). |
 | 🟡 Finding (2.14) | **Risk gates log nothing to CloudWatch.** SPEC §5 "verified in logs" cannot be satisfied — the only evidence of a gate rejection is the `SKIPPED` row's `violated_rule`. Fix: log a structured `RULE_<id>` line from `make_risk_gate_node` on every violation (and consider a metric filter like `PROVIDER_ERROR`). |
 | ✅ Done | ~~Add a `DatabaseResumingException` retry in `DataApiSignalStore._execute` so the first daily **scan** survives Aurora waking.~~ **Shipped (`fix/aurora-resume-retry`):** `_execute` retries `DatabaseResumingException` up to 6× with linear backoff (5/10/15/20/25s, ≤75s, well under the 10-min Lambda timeout). This was the production failure — every scheduled scan was dying on its first DB call (`start_scan`) because Aurora had scaled to zero, so no Telegram ever fired. Verified in the live Lambda logs (`log-events-viewer-result.csv`). |
@@ -494,17 +529,19 @@ aws lambda invoke --function-name <fn-name> --region ap-south-1 out.json && cat 
 
 ## 8. What's next
 
-**Next step: Slice 4 Step 4.4 — Cognito user pool + JWT authorizer + `ANY /api/{proxy+}`**, per
-`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md §10` row 4.4 (also SPEC §4
-Slice 4; serverless, read-only Phase 1). This is the step that finally routes the 4.2 + 4.3 data
-routes (and `/api/docs`) through the HTTP API, behind the authorizer. Include an
-**authorizer-claims defence** in the app (reject a proxied request that arrives without the
-authorizer's JWT claims in the v2 event, so a mis-wired route can never serve data
-unauthenticated) and document the **two 422 body shapes** in the API docs (FastAPI validation
-list `{"detail":[…]}` vs the period checks' plain-string `{"detail":"…"}`, `docs/operations.md
-§8.6`). Preconditions: merge 4.2 then 4.3 (stacked) and run both 🟡 verify rows in §7 (incl. the
-NFR-4.3 `EXPLAIN` re-run). Operational blocker unchanged: **top up Anthropic credits** (🔴 Ops
-row); 4.4 itself needs no LLM.
+**Next step: Slice 4 Step 4.5 — SPA scaffold**, per
+`docs/superpowers/specs/2026-10-18-serverless-dashboard-design.md §10` row 4.5 (also SPEC §4
+Slice 4; serverless, read-only Phase 1): Vite + React + TypeScript + Tailwind + TanStack Query +
+a router; a runtime `config.json` loader (API base, Cognito domain, client id); OIDC login
+(authorization code + PKCE against the 4.4 app client); a private S3 bucket + CloudFront +
+`BucketDeployment` in `DashboardStack`; the CloudFront callback / logout URLs added to the app
+client; CloudFront also fronts `/api/*` so SPA and API share one origin (no CORS). That is also
+what makes `/api/docs` browsable. Preconditions: merge 4.4 and run its 🟡 verify row in §7 (plus
+the still-open 4.2 / 4.3 rows, now testable through the URL with a token). Operational blocker
+unchanged: **top up Anthropic credits** (🔴 Ops row); 4.5 itself needs no LLM.
+
+*(Step 4.4 — Cognito + JWT authorizer + `ANY /api/{proxy+}` + the Lambda-side claims check +
+the token helper — is done; §2.)*
 
 ### 8.1 Slice 2 progress log (Weeks 4–7, per `SPEC.md §4`) — historical
 

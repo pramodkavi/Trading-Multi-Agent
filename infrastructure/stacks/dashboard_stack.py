@@ -21,8 +21,10 @@ What it is (design §3.2):
   export, and every dependency bump would fail ``cdk deploy --all`` with
   "Cannot update export ... in use".
 - An **API Gateway HTTP API** (not a REST API; design §13): ~$1 per million
-  requests, and in Step 4.4 the Cognito **JWT authorizer** runs before the Lambda
-  so there is no auth code in Python and unauthenticated calls cost nothing. A
+  requests, and since Step 4.4 the Cognito **JWT authorizer** runs before the
+  Lambda, so authentication is not done in Python and unauthenticated calls cost
+  no Lambda/Aurora (each 401 still writes an access-log line; the stage throttle
+  is shared, so a flood can 429 the operator). A
   Lambda Function URL was rejected because it has no built-in JWT authorizer.
   The API is served on the ``$default`` stage (no stage prefix in paths), with
   access logging to its own log group and a conservative throttle.
@@ -31,7 +33,9 @@ Why ``GET /api/health`` is open and DB-free (design §6.1): it is the deploy
 smoke test and returns only ``{"status": "ok", "version": <APP_VERSION>}``. It
 must never touch the database or any AWS API -- an unauthenticated probe that
 woke Aurora would let any scanner keep it awake (~$25/month). It is the ONLY
-unauthenticated route; every other route lands behind the authorizer.
+unauthenticated route; since Step 4.4 every other ``/api/*`` path is served by
+``ANY /api/{proxy+}`` behind the Cognito JWT authorizer (API Gateway prefers
+the more specific health route).
 
 Why the role is so small (design §8): ``grant_data_api_access`` on the one
 cluster + its credential secret, CloudWatch Logs write and -- since Step 4.3 --
@@ -53,11 +57,20 @@ app only, deliberately unrouted here (no auth yet); the one change 4.2 made to
 this stack is the JSON access-log format (``ACCESS_LOG_FORMAT``). Step 4.3
 added the funnel / analytics / Critic / system-health / market routes, again
 FastAPI-only; its only change here is the read-only CloudWatch IAM above. What
-the next steps add here: 4.4 the Cognito user pool + JWT authorizer and the
-``ANY /api/{proxy+}`` route that makes the data routes reachable; 4.5 the SPA
+the next steps add here: 4.5 the SPA
 (private S3 bucket + CloudFront, which also fronts ``/api/*`` so SPA and API
 share one origin); 4.7 the SSM parameter publishing the base URL for the
 Telegram deep links (design §7).
+
+Step 4.4 (done) added the one-user Cognito pool (admin-created only, LITE plan,
+TOTP MFA required, RETAINED with deletion protection), its classic Hosted UI
+domain, the public PKCE app client (callback = the local token helper
+``scripts/dashboard_token.py``; 4.5 adds the CloudFront URLs), the
+``HttpUserPoolAuthorizer`` and the ``ANY /api/{proxy+}`` route that uses it
+(``openid`` scope required, so only access tokens pass -- ID tokens carry no
+``scope`` claim); that route makes the 4.2 / 4.3 data routes reachable.
+The app adds a second layer (``src/dashboard/api/auth.py``): under Lambda, a
+non-health request without JWT claims is a 401. Runbook: docs/operations.md §8.7.
 """
 
 from __future__ import annotations
@@ -76,7 +89,9 @@ from aws_cdk import (
 )
 from aws_cdk import aws_apigateway as apigw
 from aws_cdk import aws_apigatewayv2 as apigwv2
+from aws_cdk import aws_apigatewayv2_authorizers as authorizers
 from aws_cdk import aws_apigatewayv2_integrations as integrations
+from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
@@ -98,6 +113,16 @@ THROTTLE_RATE_RPS = 10
 THROTTLE_BURST = 20
 # The one unauthenticated route (design §6.1).
 HEALTH_PATH = "/api/health"
+# Step 4.4: every other /api/* path, behind the Cognito JWT authorizer. API
+# Gateway picks the most specific route, so GET /api/health keeps winning.
+PROXY_PATH = "/api/{proxy+}"
+# Cognito prefix domain = f"{COGNITO_DOMAIN_PREFIX_BASE}-{account id}" (globally
+# unique per account; lowercase alnum + hyphen as Cognito requires).
+COGNITO_DOMAIN_PREFIX_BASE = "crypto-signals-dash"
+# The local PKCE token helper (scripts/dashboard_token.py) listens here; Step 4.5
+# adds the CloudFront URLs for the SPA.
+TOKEN_HELPER_CALLBACK = "http://localhost:8765/callback"
+TOKEN_HELPER_LOGOUT = "http://localhost:8765/"
 # MonitoringStack's CDK-generated alarm names start with its stack name; the
 # dashboard may describe only those (mirrors `src.dashboard.api.cloudwatch.ALARM_PREFIX`).
 MONITORING_ALARM_PREFIX = "CryptoSignals-Monitoring-"
@@ -259,8 +284,8 @@ class DashboardStack(Stack):
             api_name="crypto-signals-dashboard",
             create_default_stage=False,
             description=(
-                "Crypto-signals dashboard API. Step 4.1: GET /api/health only (open); "
-                "Step 4.4 puts every other route behind a Cognito JWT authorizer."
+                "Crypto-signals dashboard API (read-only). GET /api/health is open; "
+                "ANY /api/{proxy+} is behind the Cognito JWT authorizer (access tokens)."
             ),
         )
         self.stage = self.http_api.add_stage(
@@ -275,20 +300,117 @@ class DashboardStack(Stack):
                 burst_limit=THROTTLE_BURST,
             ),
         )
+        # One integration object shared by both routes: CDK binds it once per API,
+        # so there is one AWS::ApiGatewayV2::Integration -- but it adds one Lambda
+        # permission per route (2 here: health + proxy, each scoped to its route).
+        self.integration = integrations.HttpLambdaIntegration("HealthIntegration", self.function)
         health_routes = self.http_api.add_routes(
             path=HEALTH_PATH,
             methods=[apigwv2.HttpMethod.GET],
-            integration=integrations.HttpLambdaIntegration("HealthIntegration", self.function),
+            integration=self.integration,
         )
         # One method -> exactly one route; kept so the nag suppression below
         # targets the health route alone, never the API or the stack.
         self.health_route = health_routes[0]
+
+        # ---- Cognito: one-user pool, Hosted UI domain, public PKCE client ----
+        # (Step 4.4, design §8.) Admin-created users only; email sign-in; the
+        # LITE tier (threat protection is a paid add-on); TOTP MFA REQUIRED, never
+        # SMS (no SNS role / cost) -- operator decision 2026-10-21: optional MFA
+        # had no enrolment path on the classic Hosted UI, while required MFA makes
+        # the Hosted UI enrol an authenticator app at first sign-in. RETAINED +
+        # deletion protection (operator decision 2026-10-21): an accidental stack
+        # delete must not wipe the account -- a recreated stack gets a new empty
+        # pool and the orphan is free.
+        self.user_pool = cognito.UserPool(
+            self,
+            "DashboardUserPool",
+            user_pool_name="crypto-signals-dashboard",
+            self_sign_up_enabled=False,
+            sign_in_aliases=cognito.SignInAliases(email=True),
+            sign_in_case_sensitive=False,
+            feature_plan=cognito.FeaturePlan.LITE,
+            password_policy=cognito.PasswordPolicy(
+                min_length=12,
+                require_lowercase=True,
+                require_uppercase=True,
+                require_digits=True,
+                require_symbols=True,
+                temp_password_validity=Duration.days(3),
+            ),
+            mfa=cognito.Mfa.REQUIRED,
+            mfa_second_factor=cognito.MfaSecondFactor(otp=True, sms=False),
+            account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+            deletion_protection=True,
+            removal_policy=RemovalPolicy.RETAIN,
+        )
+        self.user_pool_domain = self.user_pool.add_domain(
+            "DashboardHostedUi",
+            cognito_domain=cognito.CognitoDomainOptions(
+                domain_prefix=f"{COGNITO_DOMAIN_PREFIX_BASE}-{self.account}"
+            ),
+            managed_login_version=cognito.ManagedLoginVersion.CLASSIC_HOSTED_UI,
+        )
+        # Public client (a browser SPA / the local helper cannot keep a secret):
+        # authorization code + PKCE only, SRP for the Hosted UI, no password flow.
+        self.user_pool_client = self.user_pool.add_client(
+            "DashboardSpaClient",
+            generate_secret=False,
+            auth_flows=cognito.AuthFlow(user_srp=True),
+            o_auth=cognito.OAuthSettings(
+                flows=cognito.OAuthFlows(authorization_code_grant=True),
+                scopes=[
+                    cognito.OAuthScope.OPENID,
+                    cognito.OAuthScope.EMAIL,
+                    cognito.OAuthScope.PROFILE,
+                ],
+                callback_urls=[TOKEN_HELPER_CALLBACK],
+                logout_urls=[TOKEN_HELPER_LOGOUT],
+            ),
+            prevent_user_existence_errors=True,
+            enable_token_revocation=True,
+            access_token_validity=Duration.hours(1),
+            id_token_validity=Duration.hours(1),
+            refresh_token_validity=Duration.days(30),
+            supported_identity_providers=[cognito.UserPoolClientIdentityProvider.COGNITO],
+        )
+
+        # ---- JWT authorizer + the authenticated proxy route ------------------
+        # API Gateway validates issuer, audience (client_id) and expiry before the
+        # Lambda runs, so a rejected request invokes no Lambda and touches no DB
+        # (it still writes an access-log line and counts against the throttle).
+        self.jwt_authorizer = authorizers.HttpUserPoolAuthorizer(
+            "DashboardJwtAuthorizer",
+            self.user_pool,
+            user_pool_clients=[self.user_pool_client],
+        )
+        proxy_routes = self.http_api.add_routes(
+            path=PROXY_PATH,
+            methods=[apigwv2.HttpMethod.ANY],
+            integration=self.integration,
+            authorizer=self.jwt_authorizer,
+            # Access tokens only: a Cognito ID token has no `scope` claim, so API
+            # Gateway rejects it; the code-grant access token carries `openid`.
+            authorization_scopes=["openid"],
+        )
+        self.proxy_route = proxy_routes[0]
 
         # ---- Outputs ---------------------------------------------------------
         # No default stage, so there is no `.url`; api_endpoint is the base URL
         # and $default serves at its root.
         CfnOutput(self, "DashboardApiUrl", value=self.http_api.api_endpoint)
         CfnOutput(self, "DashboardFunctionName", value=self.function.function_name)
+        CfnOutput(self, "DashboardUserPoolId", value=self.user_pool.user_pool_id)
+        CfnOutput(
+            self, "DashboardUserPoolClientId", value=self.user_pool_client.user_pool_client_id
+        )
+        # Hosted UI base URL: https://<prefix>.auth.<region>.amazoncognito.com
+        CfnOutput(self, "DashboardCognitoDomain", value=self.user_pool_domain.base_url())
+        CfnOutput(
+            self,
+            "DashboardJwtIssuer",
+            value=f"https://cognito-idp.{self.region}.amazonaws.com/{self.user_pool.user_pool_id}",
+        )
 
         Tags.of(self).add("project", "crypto-signals")
         Tags.of(self).add("layer", "dashboard")
@@ -355,8 +477,29 @@ class DashboardStack(Stack):
                     "reason": (
                         "GET /api/health is the deploy smoke test and is deliberately "
                         "unauthenticated; it touches no database or AWS API (design §6.1). "
-                        "Every other route is added behind the Cognito JWT authorizer in "
-                        "Step 4.4."
+                        "Every other route (ANY /api/{proxy+}) is behind the Cognito JWT "
+                        "authorizer (Step 4.4)."
+                    ),
+                },
+            ],
+        )
+        # The proxy route needs no APIG4 suppression -- the authorizer satisfies it.
+        # Cognito: only the deliberate cost choices (LITE plan / no advanced
+        # security), on the pool only. COG2 (MFA) is satisfied: TOTP is required.
+        NagSuppressions.add_resource_suppressions(
+            self.user_pool,
+            [
+                {
+                    "id": "AwsSolutions-COG3",
+                    "reason": "paid tier; single user (design §3.2 / §9)",
+                },
+                {
+                    "id": "AwsSolutions-COG8",
+                    "reason": (
+                        "The Plus feature plan is Cognito's paid threat-protection tier "
+                        "(billed per active user). This pool holds one operator account with "
+                        "self-signup disabled; the design deliberately runs LITE with advanced "
+                        "security off (design §3.2 / §9; same rationale as AwsSolutions-COG3)."
                     ),
                 },
             ],

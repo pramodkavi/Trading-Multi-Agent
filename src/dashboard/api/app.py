@@ -18,6 +18,11 @@ and, since Step 4.3, the market routes (502 `market_unavailable` / 400
 `unknown_symbol`). The market provider is also built lazily, per request
 (`market.get_provider_factory`), so startup imports no ccxt.
 
+Step 4.4 registers `auth.AuthorizerClaimsMiddleware` (design §8): under Lambda
+every path but `/api/health` must carry the HTTP API JWT authorizer's claims
+with a `sub`, else 401 `{"reason": "unauthorized"}` before any route runs. It is
+a no-op outside Lambda (TestClient, local).
+
 `APP_VERSION` is the short git SHA injected by CDK; it falls back to `"dev"`
 when unset (local runs, tests).
 """
@@ -29,6 +34,7 @@ import os
 from fastapi import FastAPI
 from mangum import Mangum
 
+from src.dashboard.api.auth import AuthorizerClaimsMiddleware
 from src.dashboard.api.errors import register_error_handlers
 from src.dashboard.api.routers import (
     analytics,
@@ -58,6 +64,9 @@ def create_app(*, version: str | None = None) -> FastAPI:
     )
     app.state.version = version if version is not None else os.environ.get("APP_VERSION", "dev")
     register_error_handlers(app)
+    # Step 4.4 Lambda-side defence: under Lambda, every path but /api/health needs
+    # the JWT authorizer's claims (401 `unauthorized` otherwise); no-op locally.
+    app.add_middleware(AuthorizerClaimsMiddleware)
     app.include_router(health.router)
     app.include_router(system.router)
     # Step 4.2 data routes. They exist in the FastAPI app only: the HTTP API routes

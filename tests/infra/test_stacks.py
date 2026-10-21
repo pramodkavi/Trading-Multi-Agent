@@ -385,19 +385,19 @@ def test_dashboard_stack_owns_a_layer_with_the_dashboard_extra(templates: dict[s
     )
 
 
-def test_dashboard_http_api_routes_health_only(templates: dict[str, Any]) -> None:
+def _routes_by_key(templates: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    routes = templates["dashboard"].find_resources("AWS::ApiGatewayV2::Route")
+    return {r["Properties"]["RouteKey"]: r["Properties"] for r in routes.values()}
+
+
+def test_dashboard_http_api_routes(templates: dict[str, Any]) -> None:
+    # Step 4.4: the open health route + the authorized proxy route, nothing else.
     t = templates["dashboard"]
     t.resource_count_is("AWS::ApiGatewayV2::Api", 1)
     t.has_resource_properties("AWS::ApiGatewayV2::Api", {"ProtocolType": "HTTP"})
-    t.resource_count_is("AWS::ApiGatewayV2::Route", 1)
-    t.has_resource_properties(
-        "AWS::ApiGatewayV2::Route",
-        {
-            "RouteKey": "GET /api/health",
-            # No authorizer here; Step 4.4 adds the JWT authorizer to the other routes.
-            "AuthorizerId": assertions.Match.absent(),
-        },
-    )
+    t.resource_count_is("AWS::ApiGatewayV2::Route", 2)
+    assert set(_routes_by_key(templates)) == {"GET /api/health", "ANY /api/{proxy+}"}
+    # Both routes share ONE Lambda integration (one integration, one permission set).
     t.resource_count_is("AWS::ApiGatewayV2::Integration", 1)
     t.has_resource_properties(
         "AWS::ApiGatewayV2::Integration",
@@ -527,3 +527,200 @@ def test_dashboard_imports_only_from_data_stack(templates: dict[str, Any]) -> No
 def test_dashboard_outputs(templates: dict[str, Any]) -> None:
     templates["dashboard"].has_output("DashboardApiUrl", assertions.Match.any_value())
     templates["dashboard"].has_output("DashboardFunctionName", assertions.Match.any_value())
+
+
+# ---------------------------------------------------------------------------
+# DashboardStack Step 4.4: Cognito user pool + PKCE client + JWT authorizer
+# ---------------------------------------------------------------------------
+
+
+def _user_pool(templates: dict[str, Any]) -> dict[str, Any]:
+    pools = templates["dashboard"].find_resources("AWS::Cognito::UserPool")
+    assert len(pools) == 1
+    return next(iter(pools.values()))
+
+
+def _client_props(templates: dict[str, Any]) -> dict[str, Any]:
+    clients = templates["dashboard"].find_resources("AWS::Cognito::UserPoolClient")
+    assert len(clients) == 1
+    props: dict[str, Any] = next(iter(clients.values()))["Properties"]
+    return props
+
+
+def test_user_pool_admin_create_only(templates: dict[str, Any]) -> None:
+    props = _user_pool(templates)["Properties"]
+    assert props["AdminCreateUserConfig"]["AllowAdminCreateUserOnly"] is True
+    # Sign-in by email, case-insensitive; recovery by email only.
+    assert props["UsernameAttributes"] == ["email"]
+    assert props["UsernameConfiguration"] == {"CaseSensitive": False}
+    assert props["AccountRecoverySetting"] == {
+        "RecoveryMechanisms": [{"Name": "verified_email", "Priority": 1}]
+    }
+
+
+def test_user_pool_password_policy(templates: dict[str, Any]) -> None:
+    policy = _user_pool(templates)["Properties"]["Policies"]["PasswordPolicy"]
+    assert policy["MinimumLength"] == 12
+    assert policy["RequireLowercase"] is True
+    assert policy["RequireUppercase"] is True
+    assert policy["RequireNumbers"] is True
+    assert policy["RequireSymbols"] is True
+    assert policy["TemporaryPasswordValidityDays"] == 3
+
+
+def test_user_pool_mfa_required_totp_only(templates: dict[str, Any]) -> None:
+    # Operator decision 2026-10-21: TOTP MFA required (optional MFA had no
+    # enrolment path on the classic Hosted UI).
+    props = _user_pool(templates)["Properties"]
+    assert props["MfaConfiguration"] == "ON"
+    assert props["EnabledMfas"] == ["SOFTWARE_TOKEN_MFA"]  # no SMS (no SNS cost/role)
+    assert "SmsConfiguration" not in props
+
+
+def test_user_pool_lite_plan_and_retained(templates: dict[str, Any]) -> None:
+    pool = _user_pool(templates)
+    assert pool["UpdateReplacePolicy"] == "Retain"
+    assert pool["DeletionPolicy"] == "Retain"
+    props = pool["Properties"]
+    assert props["DeletionProtection"] == "ACTIVE"
+    assert props["UserPoolTier"] == "LITE"
+    # No paid threat protection (advanced security) on the LITE tier.
+    assert "UserPoolAddOns" not in props
+
+
+def test_client_public_code_grant_only(templates: dict[str, Any]) -> None:
+    props = _client_props(templates)
+    assert props.get("GenerateSecret", False) is False
+    assert props["AllowedOAuthFlows"] == ["code"]
+    assert props["AllowedOAuthFlowsUserPoolClient"] is True
+    assert sorted(props["AllowedOAuthScopes"]) == ["email", "openid", "profile"]
+    assert props["CallbackURLs"] == ["http://localhost:8765/callback"]
+    assert props["LogoutURLs"] == ["http://localhost:8765/"]
+    assert props["SupportedIdentityProviders"] == ["COGNITO"]
+    assert props["PreventUserExistenceErrors"] == "ENABLED"
+    assert props["EnableTokenRevocation"] is True
+    # Access + ID 1 h, refresh 30 days.
+    assert props["AccessTokenValidity"] == 60
+    assert props["IdTokenValidity"] == 60
+    assert props["RefreshTokenValidity"] == 43200
+    assert props["TokenValidityUnits"] == {
+        "AccessToken": "minutes",
+        "IdToken": "minutes",
+        "RefreshToken": "minutes",
+    }
+
+
+def test_client_flows_minimal(templates: dict[str, Any]) -> None:
+    # No USER_PASSWORD_AUTH, no custom auth, no admin flows.
+    assert sorted(_client_props(templates)["ExplicitAuthFlows"]) == [
+        "ALLOW_REFRESH_TOKEN_AUTH",
+        "ALLOW_USER_SRP_AUTH",
+    ]
+
+
+def test_cognito_domain_prefix_and_classic_ui(templates: dict[str, Any]) -> None:
+    domains = templates["dashboard"].find_resources("AWS::Cognito::UserPoolDomain")
+    assert len(domains) == 1
+    props = next(iter(domains.values()))["Properties"]
+    rendered = json.dumps(props["Domain"])
+    assert "crypto-signals-dash-" in rendered and "AWS::AccountId" in rendered
+    assert props["ManagedLoginVersion"] == 1  # classic Hosted UI
+
+
+def _authorizer_logical_id(templates: dict[str, Any]) -> str:
+    authorizers = templates["dashboard"].find_resources("AWS::ApiGatewayV2::Authorizer")
+    assert len(authorizers) == 1
+    return next(iter(authorizers))
+
+
+def test_proxy_route_uses_user_pool_authorizer(templates: dict[str, Any]) -> None:
+    proxy = _routes_by_key(templates)["ANY /api/{proxy+}"]
+    assert proxy["AuthorizationType"] == "JWT"
+    assert proxy["AuthorizerId"] == {"Ref": _authorizer_logical_id(templates)}
+    # Same integration as the health route.
+    health = _routes_by_key(templates)["GET /api/health"]
+    assert proxy["Target"] == health["Target"]
+
+
+def test_health_route_has_no_authorizer(templates: dict[str, Any]) -> None:
+    health = _routes_by_key(templates)["GET /api/health"]
+    assert "AuthorizerId" not in health
+    assert health.get("AuthorizationType", "NONE") == "NONE"
+    assert "AuthorizationScopes" not in health
+
+
+def test_proxy_route_requires_openid_scope(templates: dict[str, Any]) -> None:
+    # Access tokens only: Cognito ID tokens carry no `scope` claim, so API Gateway
+    # rejects them; access tokens from the code grant carry `openid`.
+    proxy = _routes_by_key(templates)["ANY /api/{proxy+}"]
+    assert proxy["AuthorizationScopes"] == ["openid"]
+
+
+def test_jwt_authorizer_issuer_and_audience(templates: dict[str, Any]) -> None:
+    authorizers = templates["dashboard"].find_resources("AWS::ApiGatewayV2::Authorizer")
+    props = next(iter(authorizers.values()))["Properties"]
+    assert props["AuthorizerType"] == "JWT"
+    assert props["IdentitySource"] == ["$request.header.Authorization"]
+    jwt = props["JwtConfiguration"]
+    assert len(jwt["Audience"]) == 1
+    assert jwt["Audience"][0]["Ref"].startswith("DashboardUserPoolDashboardSpaClient")
+    issuer = json.dumps(jwt["Issuer"])
+    assert "https://cognito-idp." in issuer and "DashboardUserPool" in issuer
+
+
+def test_cognito_outputs(templates: dict[str, Any]) -> None:
+    t = templates["dashboard"]
+    outputs = t.find_outputs("*")
+    for name in (
+        "DashboardUserPoolId",
+        "DashboardUserPoolClientId",
+        "DashboardCognitoDomain",
+        "DashboardJwtIssuer",
+    ):
+        assert name in outputs, name
+    domain = json.dumps(outputs["DashboardCognitoDomain"]["Value"])
+    assert "https://" in domain and ".auth." in domain and "amazoncognito.com" in domain
+    issuer = json.dumps(outputs["DashboardJwtIssuer"]["Value"])
+    assert "https://cognito-idp." in issuer
+
+
+def test_dashboard_nag_clean_with_cognito() -> None:
+    # Full AwsSolutions pack on the dashboard stack: no error or warning at all,
+    # with COG3/COG8 the only Cognito suppressions (pool only) and APIG4 on the
+    # health route only (the proxy route is satisfied by the authorizer). COG2
+    # (MFA) is satisfied by required TOTP and must not be suppressed anywhere.
+    import aws_cdk as core
+    from aws_cdk import assertions as cdk_assertions
+    from cdk_nag import AwsSolutionsChecks
+    from stacks.dashboard_stack import DashboardStack
+    from stacks.data_stack import DataStack
+    from stacks.network_stack import NetworkStack
+
+    app = core.App(context={"aws:cdk:bundling-stacks": []})
+    network = NetworkStack(app, "Network")
+    data = DataStack(app, "Data", vpc=network.vpc, db_security_group=network.db_security_group)
+    dashboard = DashboardStack(app, "Dashboard", cluster=data.cluster, app_version="t")
+    core.Aspects.of(dashboard).add(AwsSolutionsChecks())
+    annotations = cdk_assertions.Annotations.from_stack(dashboard)
+    nag = cdk_assertions.Match.string_like_regexp("AwsSolutions-")
+    assert annotations.find_error("*", nag) == []
+    assert annotations.find_warning("*", nag) == []
+
+    template = cdk_assertions.Template.from_stack(dashboard).to_json()
+    suppressed: dict[str, set[str]] = {}
+    for logical_id, res in template["Resources"].items():
+        rules = res.get("Metadata", {}).get("cdk_nag", {}).get("rules_to_suppress", [])
+        for rule in rules:
+            suppressed.setdefault(rule["id"], set()).add(logical_id)
+    pool_ids = {
+        lid for lid, r in template["Resources"].items() if r["Type"] == "AWS::Cognito::UserPool"
+    }
+    assert "AwsSolutions-COG2" not in suppressed, suppressed.get("AwsSolutions-COG2")
+    allowed_cog = ("AwsSolutions-COG3", "AwsSolutions-COG8")
+    for rule in allowed_cog:  # pool-scoped only: on any other construct this fails
+        assert suppressed[rule] == pool_ids, rule
+    assert not any(
+        rule.startswith("AwsSolutions-COG") and rule not in allowed_cog for rule in suppressed
+    )
+    (apig4,) = suppressed["AwsSolutions-APIG4"]
+    assert template["Resources"][apig4]["Properties"]["RouteKey"] == "GET /api/health"

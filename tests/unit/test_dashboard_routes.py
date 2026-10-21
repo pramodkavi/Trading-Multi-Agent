@@ -52,7 +52,7 @@ from src.providers.base import (
     ProviderUnavailableError,
     Timeframe,
 )
-from tests.unit.test_dashboard_app import _Ctx, _v2_event
+from tests.unit.dashboard_fakes import CLAIMS, _Ctx, _v2_event
 
 DAY = date(2026, 10, 20)
 NOW = datetime(2026, 10, 20, 13, 10, 0, tzinfo=UTC)  # NY session; the 13:05 sweep finished 13:08
@@ -1423,7 +1423,7 @@ def container_store(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> Iter
 
 @pytest.mark.usefixtures("lambda_event_loop", "frozen_clock")
 def test_mangum_serves_overview_event(container_store: FakeStore) -> None:
-    result = handler(_v2_event("/api/overview"), _Ctx())
+    result = handler(_v2_event("/api/overview", claims=CLAIMS), _Ctx())
     assert result["statusCode"] == 200
     body = json.loads(result["body"])
     assert body["risk"]["open_setups"] == 1 and body["risk"]["published_24h"] == 2
@@ -1436,6 +1436,6 @@ def test_mangum_serves_overview_event(container_store: FakeStore) -> None:
 
 @pytest.mark.usefixtures("lambda_event_loop", "frozen_clock")
 def test_mangum_serves_lifecycle_404(container_store: FakeStore) -> None:
-    result = handler(_v2_event(f"/api/signals/{uuid4()}"), _Ctx())
+    result = handler(_v2_event(f"/api/signals/{uuid4()}", claims=CLAIMS), _Ctx())
     assert result["statusCode"] == 404
     assert json.loads(result["body"]) == {"reason": "not_found"}
