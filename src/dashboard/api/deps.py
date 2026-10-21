@@ -12,12 +12,19 @@ dashboard cannot wait out an Aurora scale-from-zero resume (~75 s worst case in
 the scan Lambda's default budget), so the first `DatabaseResumingException`
 propagates immediately and `errors.py` turns it into HTTP 503 `db_resuming`
 for the UI to retry.
+
+The boto3 client itself is bounded too (`_DASHBOARD_CLIENT_CONFIG`): botocore's
+defaults (60 s connect / 60 s read, several retries) could sit past the Lambda's
+own timeout, in which case API Gateway answers a bare 504 and the app-wide
+error handler never runs. With a 3 s connect, a 15 s read and a single attempt
+the slowest Data API call fails well inside the function's 25 s budget.
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
+from botocore.config import Config
 from fastapi import Depends
 
 from src.dashboard.api.settings import get_dashboard_settings
@@ -25,6 +32,17 @@ from src.persistence.store import DataApiSignalStore
 
 # Dashboard store resume budget (design §3.4): fail fast, let the client retry.
 _DASHBOARD_RESUME_ATTEMPTS = 1
+
+# Bounded botocore timeouts. Lambda timeout is 25 s and API Gateway's cap is 30 s:
+# the Lambda must give up FIRST so `errors.py` turns the failure into 503 / 502
+# (a body the UI understands) and the gateway never has to answer 504 for us.
+# 3 s connect + 15 s read + no botocore retry (`max_attempts=1`) keeps one call
+# under 18 s; the store's own resume budget (above) is the only retry layer.
+_DASHBOARD_CLIENT_CONFIG = Config(
+    connect_timeout=3,
+    read_timeout=15,
+    retries={"max_attempts": 1},
+)
 
 _STORE: DataApiSignalStore | None = None
 
@@ -40,6 +58,7 @@ def get_store() -> DataApiSignalStore:
             database=settings.db_name,
             region_name=settings.aws_region,
             resume_attempts=_DASHBOARD_RESUME_ATTEMPTS,
+            client_config=_DASHBOARD_CLIENT_CONFIG,
         )
     return _STORE
 

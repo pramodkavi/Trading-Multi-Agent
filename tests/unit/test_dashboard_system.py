@@ -117,6 +117,17 @@ def test_is_resuming_matches_only_the_resume_code() -> None:
     assert not is_resuming(ClientError({}, "ExecuteStatement"))  # no Error block at all
 
 
+def test_is_resuming_shares_the_store_retry_codes() -> None:
+    # `errors.py` must classify exactly the codes the store retries (one shared constant,
+    # no duplicated literal), so the 503 mapping can never drift from the retry loop.
+    from src.dashboard.api import errors
+    from src.persistence.store import RESUME_RETRY_CODES
+
+    assert errors.RESUME_RETRY_CODES is RESUME_RETRY_CODES
+    for code in RESUME_RETRY_CODES:
+        assert is_resuming(_client_error(code))
+
+
 def test_resuming_maps_to_503_without_sleep(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

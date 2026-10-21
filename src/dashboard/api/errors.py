@@ -30,12 +30,9 @@ from fastapi.responses import JSONResponse
 
 from src.dashboard.api.cursor import BadCursor
 from src.dashboard.api.schemas import ErrorResponse
+from src.persistence.store import RESUME_RETRY_CODES
 
 logger = logging.getLogger(__name__)
-
-# Aurora Serverless v2 waking from auto-pause; mirrors
-# `src.persistence.store._RESUME_RETRY_CODES` (the only code the store retries).
-_RESUMING_CODE = "DatabaseResumingException"
 
 RETRY_AFTER_SECONDS = "10"
 
@@ -63,8 +60,12 @@ def error_code(exc: ClientError) -> str:
 
 
 def is_resuming(exc: ClientError) -> bool:
-    """True when `exc` is Aurora's scale-from-zero resume error."""
-    return error_code(exc) == _RESUMING_CODE
+    """True when `exc` is Aurora's scale-from-zero resume error.
+
+    The codes are the store's own `RESUME_RETRY_CODES` (the only ones its
+    `_execute` retries), so the 503 mapping and the retry loop cannot drift apart.
+    """
+    return error_code(exc) in RESUME_RETRY_CODES
 
 
 def register_error_handlers(app: FastAPI) -> None:

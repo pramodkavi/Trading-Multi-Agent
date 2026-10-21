@@ -79,6 +79,9 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import AsyncIterator, Mapping, Sequence
     from datetime import datetime
 
+    # Typing-only: ``botocore`` is imported lazily in ``from_arns`` alongside boto3.
+    from botocore.config import Config
+
     # Typing-only: ``src.agents.critic.models`` itself imports
     # ``src.persistence.models`` (-> this package's __init__ -> this module), so a
     # runtime import here would be a cycle whenever the critic package loads first.
@@ -102,6 +105,9 @@ logger = logging.getLogger(__name__)
 # _RESUME_MAX_ATTEMPTS is the *default* budget; DataApiSignalStore(resume_attempts=)
 # lets request-scoped callers (API Gateway, 30 s cap) shrink it.
 _RESUME_RETRY_CODES: frozenset[str] = frozenset({"DatabaseResumingException"})
+# Public alias: the dashboard's error mapping (``src.dashboard.api.errors``)
+# classifies the same codes as "resuming" so its 503 can never drift from the loop.
+RESUME_RETRY_CODES = _RESUME_RETRY_CODES
 _RESUME_MAX_ATTEMPTS: int = 6
 _RESUME_BACKOFF_SECONDS: float = 5.0
 
@@ -555,17 +561,22 @@ class DataApiSignalStore:
         database: str,
         region_name: str | None = None,
         resume_attempts: int = _RESUME_MAX_ATTEMPTS,
+        client_config: Config | None = None,
     ) -> DataApiSignalStore:
         """Construct with a fresh boto3 ``rds-data`` client.
 
         ``boto3`` is imported lazily so importing this module (and the unit
         tests, which inject a mock) never depends on AWS credentials or region
         resolution. ``resume_attempts`` is forwarded to the constructor; see the
-        class docstring for when to lower it.
+        class docstring for when to lower it. ``client_config`` is handed to
+        ``boto3.client(config=...)`` untouched -- request-scoped callers (the
+        dashboard, ``deps.py``) use it to bound the connect / read timeouts and
+        the botocore retries so the HTTP request fails inside its own budget;
+        ``None`` keeps botocore's defaults (the scan Lambda).
         """
         import boto3
 
-        client = boto3.client("rds-data", region_name=region_name)
+        client = boto3.client("rds-data", region_name=region_name, config=client_config)
         return cls(
             client=client,
             cluster_arn=cluster_arn,

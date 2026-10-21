@@ -12,6 +12,7 @@ from typing import Any
 
 import boto3
 import pytest
+from botocore.config import Config
 
 from src.dashboard.api import deps
 from src.dashboard.api.settings import get_dashboard_settings
@@ -69,6 +70,7 @@ def test_store_is_built_with_one_resume_attempt(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(DataApiSignalStore, "from_arns", _fake_from_arns)
 
     assert deps.get_store() is sentinel
+    config = captured.pop("client_config")
     assert captured == {
         "cluster_arn": _CLUSTER,
         "secret_arn": _SECRET,
@@ -76,6 +78,12 @@ def test_store_is_built_with_one_resume_attempt(monkeypatch: pytest.MonkeyPatch)
         "region_name": "ap-south-1",
         "resume_attempts": 1,
     }
+    # Bounded botocore timeouts: the Lambda (25 s) must give up before API Gateway
+    # (30 s) so the app-wide handler answers 503 / 502, never a gateway 504.
+    assert isinstance(config, Config)
+    assert config.connect_timeout == 3
+    assert config.read_timeout == 15
+    assert config.retries == {"max_attempts": 1}
 
 
 def test_store_is_cached_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
