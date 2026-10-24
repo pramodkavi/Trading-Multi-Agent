@@ -18,7 +18,7 @@ const linkActive = "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-90
 /** Main navigation; `vertical` is the < md (768 px) menu variant. */
 export function Nav({ vertical = false, onNavigate }: { vertical?: boolean; onNavigate?: () => void }) {
   return (
-    <nav aria-label={vertical ? "Menu" : "Main"} id={vertical ? "mobile-menu" : undefined}>
+    <nav aria-label={vertical ? "Menu" : "Main"}>
       <ul className={vertical ? "flex flex-col gap-1" : "flex items-center gap-1"}>
         {NAV_ITEMS.map((item) => (
           <li key={item.to}>

@@ -1,11 +1,10 @@
-import { deriveApiStatus, type ApiStatus, type DbState, type HealthState } from "../lib/apiStatus";
-
-const LABEL: Record<ApiStatus, string> = {
-  ok: "API ok",
-  waking: "Waking the database…",
-  error: "API error",
-  checking: "Checking API…",
-};
+import {
+  apiStatusLabel,
+  deriveApiStatus,
+  type ApiStatus,
+  type DbState,
+  type HealthState,
+} from "../lib/apiStatus";
 
 // Text colours chosen for ≥ 4.5:1 on their backgrounds in both themes.
 const STYLE: Record<ApiStatus, string> = {
@@ -27,8 +26,11 @@ const DOT: Record<ApiStatus, string> = {
 
 export function StatusChip({ health, db }: { health: HealthState; db: DbState }) {
   const status = deriveApiStatus(health, db);
-  const version = health.data?.version.slice(0, 7);
-  const latency = status === "ok" ? db.data?.latency_ms : undefined;
+  // Response bodies are untrusted JSON: guard the shape before using it.
+  const rawVersion: unknown = health.data?.version;
+  const version = typeof rawVersion === "string" ? rawVersion.slice(0, 7) : undefined;
+  const rawLatency: unknown = db.data?.latency_ms;
+  const latency = status === "ok" && typeof rawLatency === "number" ? rawLatency : undefined;
   return (
     <span
       role="status"
@@ -38,7 +40,7 @@ export function StatusChip({ health, db }: { health: HealthState; db: DbState })
       className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset ${STYLE[status]}`}
     >
       <span aria-hidden="true" className={`h-2 w-2 rounded-full ${DOT[status]}`} />
-      <span>{LABEL[status]}</span>
+      <span>{apiStatusLabel(status, health, db)}</span>
       {version ? <span className="font-mono opacity-90">v{version}</span> : null}
     </span>
   );

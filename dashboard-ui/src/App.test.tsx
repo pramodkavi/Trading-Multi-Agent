@@ -1,12 +1,16 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { Boot } from "./App";
+import { SESSION_STORAGE_KEY, SIGNED_OUT_KEY } from "./auth/SplitTokenStore";
 import { ConfigError, loadConfig, type DashboardConfig } from "./config";
 
 const mocks = vi.hoisted(() => ({
   auth: {} as Record<string, unknown>,
 }));
+
+const nav = vi.hoisted(() => ({ navigateTo: vi.fn() }));
+vi.mock("./lib/navigate", () => nav);
 
 vi.mock("react-oidc-context", () => ({
   AuthProvider: ({ children }: { children: ReactNode }) => children,
@@ -33,7 +37,7 @@ function baseAuth(overrides: Record<string, unknown> = {}): Record<string, unkno
     activeNavigator: undefined,
     signinRedirect: vi.fn(async () => undefined),
     signinSilent: vi.fn(async () => null),
-    signoutRedirect: vi.fn(async () => undefined),
+    revokeTokens: vi.fn(async () => undefined),
     removeUser: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -50,13 +54,11 @@ function signedIn(): Record<string, unknown> {
   });
 }
 
-function stubApi(): void {
+function stubApi(health: unknown = { status: "ok", version: "deadbeefcafe" }): void {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
-      const body = url.endsWith("/health")
-        ? { status: "ok", version: "deadbeefcafe" }
-        : { db: "ok", latency_ms: 9 };
+      const body = url.endsWith("/health") ? health : { db: "ok", latency_ms: 9 };
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -72,6 +74,7 @@ function renderAt(path: string, load: () => Promise<DashboardConfig> = async () 
 
 beforeEach(() => {
   stubApi();
+  nav.navigateTo.mockClear();
 });
 
 afterEach(() => {
@@ -167,7 +170,84 @@ describe("App", () => {
     mocks.auth = signedIn();
     renderAt("/");
     await userEvent.click(await screen.findByRole("button", { name: /sign out/i }));
-    expect(mocks.auth.signoutRedirect).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(nav.navigateTo).toHaveBeenCalledTimes(1));
+    expect(mocks.auth.revokeTokens).toHaveBeenCalledWith(["refresh_token"]);
+    expect(mocks.auth.removeUser).toHaveBeenCalledTimes(1);
+    const revokeOrder = (mocks.auth.revokeTokens as ReturnType<typeof vi.fn>).mock
+      .invocationCallOrder[0];
+    expect(revokeOrder).toBeLessThan(nav.navigateTo.mock.invocationCallOrder[0] ?? 0);
+    const url = new URL(String(nav.navigateTo.mock.calls[0]?.[0]));
+    expect(`${url.origin}${url.pathname}`).toBe(`${CONFIG.cognitoDomain}/logout`);
+    expect(url.searchParams.has("id_token_hint")).toBe(false);
+    expect(localStorage.getItem(SIGNED_OUT_KEY)).not.toBeNull();
+    expect(mocks.auth.signinRedirect).not.toHaveBeenCalled();
+  });
+
+  it("after sign-out a reload shows 'signed out' instead of auto-redirecting", async () => {
+    localStorage.setItem(SIGNED_OUT_KEY, String(Date.now()));
+    mocks.auth = baseAuth();
+    renderAt("/");
+    expect(await screen.findByText(/you are signed out/i)).toBeInTheDocument();
+    expect(mocks.auth.signinRedirect).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: /^sign in$/i }));
+    expect(localStorage.getItem(SIGNED_OUT_KEY)).toBeNull();
+    expect(mocks.auth.signinRedirect).toHaveBeenCalledTimes(1);
+  });
+
+  it("cross-tab sign-out: the stub disappearing removes the user locally and shows signed out", async () => {
+    mocks.auth = signedIn();
+    renderAt("/");
+    await screen.findByRole("navigation", { name: /main/i });
+
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: SESSION_STORAGE_KEY, oldValue: "{}", newValue: null }),
+      );
+    });
+    expect(mocks.auth.removeUser).toHaveBeenCalledTimes(1);
+    expect(await screen.findByText(/you are signed out/i)).toBeInTheDocument();
+    expect(mocks.auth.signinRedirect).not.toHaveBeenCalled();
+    expect(nav.navigateTo).not.toHaveBeenCalled();
+  });
+
+  it("an unrelated storage event does not sign out", async () => {
+    mocks.auth = signedIn();
+    renderAt("/");
+    await screen.findByRole("navigation", { name: /main/i });
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: "other", newValue: null }));
+    });
+    expect(screen.queryByText(/you are signed out/i)).not.toBeInTheDocument();
+    expect(mocks.auth.removeUser).not.toHaveBeenCalled();
+  });
+
+  it("mobile menu: aria-controls resolves while closed; toggles; Escape closes", async () => {
+    mocks.auth = signedIn();
+    renderAt("/");
+    const button = await screen.findByRole("button", { name: /open menu/i });
+    const controlled = document.getElementById(button.getAttribute("aria-controls") ?? "");
+    expect(controlled).not.toBeNull();
+    expect(controlled).not.toBeVisible();
+    expect(button).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(button);
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    expect(controlled).toBeVisible();
+    expect(within(controlled as HTMLElement).getByRole("link", { name: "Signals" })).toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(controlled).not.toBeVisible();
+    expect(button).toHaveFocus();
+  });
+
+  it("a malformed health body does not crash the shell", async () => {
+    stubApi({ status: "ok", version: 12345 });
+    mocks.auth = signedIn();
+    renderAt("/");
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(/API ok/i));
+    expect(screen.getByRole("heading", { level: 1, name: "Overview" })).toBeInTheDocument();
   });
 
   it("test_config_error_page: a ConfigError renders a full-page error", async () => {

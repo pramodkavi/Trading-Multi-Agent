@@ -47,24 +47,43 @@ function isHttpsUrl(value: string): boolean {
   }
 }
 
-function isAbsoluteAppUrl(value: string): boolean {
+/** Same-origin path: `/api`, never `//host` or `/\host` (protocol-relative). */
+const API_BASE_RE = /^\/[^/\\]/;
+
+export interface ValidateOptions {
+  /** The page origin the redirect/logout URIs must match (default: `window.location.origin`). */
+  origin: string;
+  /** `vite dev`: additionally accept any `http://localhost:*` / `http://127.0.0.1:*` origin. */
+  dev: boolean;
+}
+
+function defaultOptions(): ValidateOptions {
+  return { origin: window.location.origin, dev: import.meta.env.DEV };
+}
+
+function isAppUrl(value: string, opts: ValidateOptions): boolean {
+  let url: URL;
   try {
-    const url = new URL(value);
-    // http is only acceptable for a local dev server.
-    return (
-      url.protocol === "https:" ||
-      (url.protocol === "http:" && (url.hostname === "localhost" || url.hostname === "127.0.0.1"))
-    );
+    url = new URL(value);
   } catch {
     return false;
   }
+  if (url.origin === opts.origin) return true;
+  return (
+    opts.dev &&
+    url.protocol === "http:" &&
+    (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+  );
 }
 
 function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-export function validateConfig(raw: unknown): DashboardConfig {
+export function validateConfig(
+  raw: unknown,
+  opts: ValidateOptions = defaultOptions(),
+): DashboardConfig {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new ConfigError("config.json must be a JSON object.");
   }
@@ -91,15 +110,16 @@ export function validateConfig(raw: unknown): DashboardConfig {
     throw new ConfigError("config.json field cognitoDomain must be an https:// URL.");
   }
   config.cognitoDomain = stripTrailingSlash(config.cognitoDomain);
-  if (!config.apiBase.startsWith("/") && !isHttpsUrl(config.apiBase)) {
-    throw new ConfigError("config.json field apiBase must be a path (/api) or an https:// URL.");
+  if (!API_BASE_RE.test(config.apiBase)) {
+    throw new ConfigError("config.json field apiBase must be a same-origin path such as /api.");
   }
   config.apiBase = stripTrailingSlash(config.apiBase);
-  if (!isAbsoluteAppUrl(config.redirectUri)) {
-    throw new ConfigError("config.json field redirectUri must be an absolute https:// URL.");
-  }
-  if (!isAbsoluteAppUrl(config.logoutUri)) {
-    throw new ConfigError("config.json field logoutUri must be an absolute https:// URL.");
+  for (const field of ["redirectUri", "logoutUri"] as const) {
+    if (!isAppUrl(config[field], opts)) {
+      throw new ConfigError(
+        `config.json field ${field} (${config[field]}) must be an absolute URL on this site's origin (${opts.origin}).`,
+      );
+    }
   }
   return config;
 }
@@ -123,7 +143,10 @@ async function fetchJson(fetchFn: typeof fetch, url: string): Promise<unknown> {
 }
 
 /** Fetch and validate the runtime config. Throws {@link ConfigError}. */
-export async function loadConfig(fetchFn: typeof fetch = fetch): Promise<DashboardConfig> {
+export async function loadConfig(
+  fetchFn: typeof fetch = fetch,
+  opts: ValidateOptions = defaultOptions(),
+): Promise<DashboardConfig> {
   if (import.meta.env.DEV && import.meta.env.MODE !== "test") {
     let local: unknown;
     try {
@@ -133,7 +156,7 @@ export async function loadConfig(fetchFn: typeof fetch = fetch): Promise<Dashboa
       local = undefined;
     }
     // Present but wrong is an error worth seeing, not a silent fallback.
-    if (local !== undefined) return validateConfig(local);
+    if (local !== undefined) return validateConfig(local, opts);
   }
-  return validateConfig(await fetchJson(fetchFn, "/config.json"));
+  return validateConfig(await fetchJson(fetchFn, "/config.json"), opts);
 }

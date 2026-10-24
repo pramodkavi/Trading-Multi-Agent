@@ -1,16 +1,31 @@
-import type { SignoutRedirectArgs, StateStore, UserManagerSettings } from "oidc-client-ts";
+import { WebStorageStateStore, type StateStore, type UserManagerSettings } from "oidc-client-ts";
 import type { DashboardConfig } from "../config";
+import { navigateTo } from "../lib/navigate";
+import { clearSession, markSignedOut } from "./SplitTokenStore";
 
 export const OIDC_SCOPE = "openid email profile";
+
+function sessionStorageOrNull(): Storage | null {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * oidc-client-ts settings for the Cognito user pool (code grant; PKCE is
  * automatic for `response_type: "code"`).
  *
- * Cognito's discovery document has no `end_session_endpoint`, so it is seeded
- * here (`metadataSeed` is merged under the fetched discovery document).
+ * - `metadataSeed` is merged over the fetched discovery document: Cognito's
+ *   discovery has no `end_session_endpoint` / `revocation_endpoint`.
+ * - `stateStore` is sessionStorage, so the in-flight sign-in state (PKCE
+ *   verifier) is tab-scoped; oidc-client-ts v3 defaults to localStorage.
+ * - Only the refresh token is revoked (Cognito's /oauth2/revoke takes refresh
+ *   tokens and invalidates the access tokens issued from it).
  */
 export function buildOidcSettings(config: DashboardConfig, userStore: StateStore): UserManagerSettings {
+  const session = sessionStorageOrNull();
   return {
     authority: `https://cognito-idp.${config.region}.amazonaws.com/${config.userPoolId}`,
     client_id: config.clientId,
@@ -22,30 +37,55 @@ export function buildOidcSettings(config: DashboardConfig, userStore: StateStore
     // Cognito has no check_session_iframe and its /userInfo adds nothing the ID token lacks.
     monitorSession: false,
     loadUserInfo: false,
+    revokeTokensOnSignout: true,
+    revokeTokenTypes: ["refresh_token"],
     userStore,
+    ...(session ? { stateStore: new WebStorageStateStore({ store: session }) } : {}),
     metadataSeed: {
       end_session_endpoint: `${config.cognitoDomain}/logout`,
+      revocation_endpoint: `${config.cognitoDomain}/oauth2/revoke`,
     },
   };
 }
 
 /**
- * Cognito's `/logout` wants `client_id` + `logout_uri` (it ignores the
- * standard `id_token_hint` / `post_logout_redirect_uri`), and `logout_uri`
- * must exactly match one of the app client's sign-out URLs.
- *
- * `post_logout_redirect_uri: ""` suppresses oidc-client-ts's own
- * `post_logout_redirect_uri`/`state` and its fallback `client_id` (which it adds
- * only when there is no ID token — that would duplicate ours). The resulting URL
- * is `<cognitoDomain>/logout?[id_token_hint=…&]client_id=…&logout_uri=…`.
- * oidc-client-ts removes the stored user (memory + localStorage stub) before
- * it navigates.
+ * Cognito's `/logout?client_id=…&logout_uri=…` (it ignores the standard
+ * `id_token_hint` / `post_logout_redirect_uri`, and `logout_uri` must exactly
+ * match one of the app client's sign-out URLs). Built here — not through
+ * `signoutRedirect` — so the ID token never appears in a URL.
  */
-export function buildSignoutArgs(config: DashboardConfig): SignoutRedirectArgs {
-  return {
-    post_logout_redirect_uri: "",
-    extraQueryParams: { client_id: config.clientId, logout_uri: config.logoutUri },
-  };
+export function buildLogoutUrl(config: DashboardConfig): string {
+  const url = new URL(`${config.cognitoDomain}/logout`);
+  url.searchParams.set("client_id", config.clientId);
+  url.searchParams.set("logout_uri", config.logoutUri);
+  return url.toString();
+}
+
+/** The slice of the auth context (or `UserManager`) sign-out needs. */
+export interface SignOutClient {
+  revokeTokens(types?: ("access_token" | "refresh_token")[]): Promise<void>;
+  removeUser(): Promise<void>;
+}
+
+/**
+ * Sign out: mark signed-out (so no tab re-persists the session), revoke the
+ * refresh token (best effort), drop the user + storage, then go to Cognito's
+ * /logout to end the Hosted UI session.
+ */
+export async function signOut(client: SignOutClient, config: DashboardConfig): Promise<void> {
+  markSignedOut();
+  try {
+    await client.revokeTokens(["refresh_token"]);
+  } catch {
+    // Revocation is best effort; the local session is still dropped.
+  }
+  try {
+    await client.removeUser();
+  } catch {
+    // ignore
+  }
+  clearSession();
+  navigateTo(buildLogoutUrl(config));
 }
 
 /** Where to land after the sign-in callback: a same-origin path, never `/callback`. */

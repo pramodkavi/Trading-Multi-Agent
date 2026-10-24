@@ -80,6 +80,40 @@ function renewOnce(auth: AuthClient): Promise<AccessUser | null> {
   return silentInFlight;
 }
 
+/**
+ * Cross-page-load loop guard: if the API rejects a token that was just issued
+ * (e.g. CloudFront dropping `Authorization`, authorizer misconfig), a redirect
+ * would sign in instantly via the Hosted UI cookie and 401 again, forever.
+ * A 401-driven redirect is allowed once per {@link AUTH_REDIRECT_WINDOW_MS}.
+ */
+export const AUTH_REDIRECT_KEY = "crypto-signals-dashboard.authRedirectAt";
+export const AUTH_REDIRECT_WINDOW_MS = 120_000;
+
+function recentAuthRedirect(): boolean {
+  try {
+    const at = Number(window.sessionStorage.getItem(AUTH_REDIRECT_KEY));
+    return Number.isFinite(at) && at > 0 && Date.now() - at < AUTH_REDIRECT_WINDOW_MS;
+  } catch {
+    return false;
+  }
+}
+
+function recordAuthRedirect(): void {
+  try {
+    window.sessionStorage.setItem(AUTH_REDIRECT_KEY, String(Date.now()));
+  } catch {
+    // ignore
+  }
+}
+
+function clearAuthRedirect(): void {
+  try {
+    window.sessionStorage.removeItem(AUTH_REDIRECT_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 function returnState(): { returnTo: string } {
   return { returnTo: `${window.location.pathname}${window.location.search}` };
 }
@@ -125,12 +159,21 @@ export async function apiFetch<T>(path: string, opts: ApiFetchOptions = {}): Pro
     const renewed = await renewOnce(auth);
     if (renewed?.access_token) response = await send(renewed);
     if (response.status === 401) {
+      if (recentAuthRedirect()) {
+        throw new ApiError(
+          401,
+          "unauthorized_after_signin",
+          "Signed in, but the API rejected the token (HTTP 401). Not redirecting again.",
+        );
+      }
+      recordAuthRedirect();
       await auth.signinRedirect({ state: returnState() }).catch(() => undefined);
       throw await toApiError(response);
     }
   }
 
   if (!response.ok) throw await toApiError(response);
+  if (withAuth) clearAuthRedirect();
 
   try {
     return (await response.json()) as T;

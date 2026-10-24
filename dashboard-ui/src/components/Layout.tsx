@@ -1,9 +1,9 @@
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useAuth } from "react-oidc-context";
 import { Outlet } from "react-router-dom";
 import { dbProbeKey, healthKey, useDbProbe, useHealth } from "../api/queries";
-import { buildSignoutArgs } from "../auth/oidcSettings";
+import { signOut } from "../auth/oidcSettings";
 import type { DashboardConfig } from "../config";
 import { formatAgo } from "../lib/apiStatus";
 import { buttonClass } from "./ErrorPage";
@@ -61,14 +61,24 @@ export function Layout({ config }: { config: DashboardConfig }) {
     void queryClient.invalidateQueries({ queryKey: dbProbeKey });
   };
 
-  const signOut = () => {
+  const onSignOut = () => {
     queryClient.clear();
-    // signoutRedirect removes the stored user (memory + localStorage stub) before
-    // navigating to Cognito's /logout; removeUser is the fallback if it fails.
-    auth.signoutRedirect(buildSignoutArgs(config)).catch(() => {
-      void auth.removeUser();
-    });
+    // Marker → revoke refresh token → remove user + storage → Cognito /logout.
+    void signOut(auth, config);
   };
+
+  const menuButton = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setMenuOpen(false);
+        menuButton.current?.focus();
+      }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [menuOpen]);
 
   return (
     <div className="min-h-screen">
@@ -82,6 +92,7 @@ export function Layout({ config }: { config: DashboardConfig }) {
         <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3">
           <div className="flex items-center gap-2">
             <button
+              ref={menuButton}
               type="button"
               className="rounded-md p-2 text-slate-800 hover:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-600 md:hidden dark:text-slate-200 dark:hover:bg-slate-800 dark:focus-visible:outline-sky-400"
               aria-expanded={menuOpen}
@@ -108,16 +119,19 @@ export function Layout({ config }: { config: DashboardConfig }) {
                 {email}
               </span>
             ) : null}
-            <button type="button" className={buttonClass} onClick={signOut}>
+            <button type="button" className={buttonClass} onClick={onSignOut}>
               Sign out
             </button>
           </div>
         </div>
-        {menuOpen ? (
-          <div className="border-t border-slate-200 px-4 py-2 md:hidden dark:border-slate-800">
-            <Nav vertical onNavigate={() => setMenuOpen(false)} />
-          </div>
-        ) : null}
+        {/* Always in the DOM so aria-controls resolves; `hidden` when closed. */}
+        <div
+          id="mobile-menu"
+          hidden={!menuOpen}
+          className="border-t border-slate-200 px-4 py-2 md:hidden dark:border-slate-800"
+        >
+          <Nav vertical onNavigate={() => setMenuOpen(false)} />
+        </div>
       </header>
       <main id="main" className="mx-auto max-w-7xl px-4 py-6">
         <Outlet />

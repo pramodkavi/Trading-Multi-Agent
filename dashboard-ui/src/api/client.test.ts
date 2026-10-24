@@ -1,4 +1,6 @@
 import {
+  AUTH_REDIRECT_KEY,
+  AUTH_REDIRECT_WINDOW_MS,
   ApiError,
   apiFetch,
   configureApi,
@@ -105,6 +107,46 @@ describe("apiFetch", () => {
     expect(auth.signinSilent).toHaveBeenCalledTimes(1);
     expect(auth.signinRedirect).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("no_cross_load_401_loop: a second 401-driven redirect within 2 min is refused", async () => {
+    const unauthorized = () => jsonResponse({ message: "Unauthorized" }, 401);
+
+    // Page load 1: token rejected → silent ok → rejected again → redirect.
+    let auth = makeAuth();
+    configureApi({ apiBase: "/api", auth: auth as unknown as AuthClient });
+    fetchMock.mockResolvedValueOnce(unauthorized()).mockResolvedValueOnce(unauthorized());
+    await expect(apiFetch("/system/db")).rejects.toMatchObject({ status: 401 });
+    expect(auth.signinRedirect).toHaveBeenCalledTimes(1);
+    expect(sessionStorage.getItem(AUTH_REDIRECT_KEY)).not.toBeNull();
+
+    // Page load 2 (after the Hosted UI signed in instantly): same failure → no redirect.
+    resetApiForTests();
+    auth = makeAuth();
+    configureApi({ apiBase: "/api", auth: auth as unknown as AuthClient });
+    fetchMock.mockResolvedValueOnce(unauthorized()).mockResolvedValueOnce(unauthorized());
+    await expect(apiFetch("/system/db")).rejects.toMatchObject({
+      status: 401,
+      reason: "unauthorized_after_signin",
+    });
+    expect(auth.signinRedirect).not.toHaveBeenCalled();
+  });
+
+  it("allows a 401-driven redirect again after the window, and clears the marker on success", async () => {
+    sessionStorage.setItem(AUTH_REDIRECT_KEY, String(Date.now() - AUTH_REDIRECT_WINDOW_MS - 1));
+    let auth = makeAuth();
+    configureApi({ apiBase: "/api", auth: auth as unknown as AuthClient });
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({}, 401))
+      .mockResolvedValueOnce(jsonResponse({}, 401));
+    await expect(apiFetch("/x")).rejects.toMatchObject({ status: 401 });
+    expect(auth.signinRedirect).toHaveBeenCalledTimes(1);
+
+    auth = makeAuth();
+    configureApi({ apiBase: "/api", auth: auth as unknown as AuthClient });
+    fetchMock.mockResolvedValueOnce(jsonResponse({ db: "ok", latency_ms: 1 }));
+    await apiFetch("/system/db");
+    expect(sessionStorage.getItem(AUTH_REDIRECT_KEY)).toBeNull();
   });
 
   it("503 db_resuming surfaces as a typed ApiError", async () => {

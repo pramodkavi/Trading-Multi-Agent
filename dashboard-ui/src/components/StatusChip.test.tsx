@@ -1,5 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { ApiError } from "../api/client";
+import type { Health } from "../api/queries";
 import { deriveApiStatus, formatAgo, type DbState, type HealthState } from "../lib/apiStatus";
 import { StatusChip } from "./StatusChip";
 
@@ -8,13 +9,16 @@ const HEALTH_OK: HealthState = {
   error: null,
   failureReason: null,
   isPending: false,
+  isFetching: false,
 };
 const DB_OK: DbState = {
   data: { db: "ok", latency_ms: 14 },
   error: null,
   failureReason: null,
   isPending: false,
+  isFetching: false,
 };
+const resuming = () => new ApiError(503, "db_resuming");
 
 describe("StatusChip", () => {
   it("shows ok with the short API version", () => {
@@ -29,12 +33,38 @@ describe("StatusChip", () => {
     const db: DbState = {
       data: undefined,
       error: null,
-      failureReason: new ApiError(503, "db_resuming"),
+      failureReason: resuming(),
       isPending: true,
+      isFetching: true,
     };
     render(<StatusChip health={HEALTH_OK} db={db} />);
     expect(screen.getByRole("status")).toHaveTextContent(/waking the database/i);
     expect(screen.getByRole("status")).toHaveAttribute("data-status", "waking");
+  });
+
+  it("shows waking again while a later poll is retrying after an exhausted round", () => {
+    const db: DbState = {
+      data: undefined,
+      error: resuming(),
+      failureReason: resuming(),
+      isPending: false,
+      isFetching: true,
+    };
+    expect(deriveApiStatus(HEALTH_OK, db)).toBe("waking");
+  });
+
+  it("shows error 'database did not wake' once the bounded retries are exhausted", () => {
+    const db: DbState = {
+      data: undefined,
+      error: resuming(),
+      failureReason: resuming(),
+      isPending: false,
+      isFetching: false,
+    };
+    render(<StatusChip health={HEALTH_OK} db={db} />);
+    const chip = screen.getByRole("status");
+    expect(chip).toHaveAttribute("data-status", "error");
+    expect(chip).toHaveTextContent(/database did not wake/i);
   });
 
   it("shows waking when the probe reports resuming", () => {
@@ -48,10 +78,18 @@ describe("StatusChip", () => {
       error: new ApiError(500, "internal"),
       failureReason: new ApiError(500, "internal"),
       isPending: false,
+      isFetching: false,
     };
     render(<StatusChip health={HEALTH_OK} db={db} />);
     expect(screen.getByRole("status")).toHaveTextContent(/API error/i);
     expect(screen.getByRole("status")).toHaveAttribute("data-status", "error");
+  });
+
+  it("explains a token the API rejected right after sign-in", () => {
+    const err = new ApiError(401, "unauthorized_after_signin");
+    const db: DbState = { ...DB_OK, data: undefined, error: err, failureReason: err };
+    render(<StatusChip health={HEALTH_OK} db={db} />);
+    expect(screen.getByRole("status")).toHaveTextContent(/API rejected the token/i);
   });
 
   it("shows error when health fails or the probe says error", () => {
@@ -63,8 +101,25 @@ describe("StatusChip", () => {
   });
 
   it("shows checking while the first requests are in flight", () => {
-    const pending = { data: undefined, error: null, failureReason: null, isPending: true };
+    const pending = {
+      data: undefined,
+      error: null,
+      failureReason: null,
+      isPending: true,
+      isFetching: true,
+    };
     expect(deriveApiStatus(pending, pending)).toBe("checking");
+  });
+
+  it("does not crash on a malformed health body (non-string version)", () => {
+    const health: HealthState = {
+      ...HEALTH_OK,
+      data: { status: "ok", version: 12345 } as unknown as Health,
+    };
+    render(<StatusChip health={health} db={DB_OK} />);
+    const chip = screen.getByRole("status");
+    expect(chip).toHaveTextContent(/API ok/i);
+    expect(chip).not.toHaveTextContent(/v12345/);
   });
 });
 

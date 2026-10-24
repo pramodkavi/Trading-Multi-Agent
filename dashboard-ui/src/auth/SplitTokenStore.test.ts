@@ -1,4 +1,11 @@
-import { SESSION_STORAGE_KEY, SplitTokenStore } from "./SplitTokenStore";
+import {
+  SESSION_STORAGE_KEY,
+  SplitTokenStore,
+  clearSession,
+  clearSignedOut,
+  isSignedOut,
+  markSignedOut,
+} from "./SplitTokenStore";
 
 const USER_KEY = "user:https://cognito-idp.ap-south-1.amazonaws.com/pool:client";
 
@@ -116,6 +123,26 @@ describe("SplitTokenStore", () => {
     await expect(store.get(USER_KEY)).resolves.toBe(JSON.stringify(FULL_USER));
     await expect(store.remove(USER_KEY)).resolves.toBe(JSON.stringify(FULL_USER));
     expect(await store.getAllKeys()).toEqual([]);
+  });
+
+  it("does_not_recreate_stub_after_sign_out", async () => {
+    const store = new SplitTokenStore();
+    await store.set(USER_KEY, JSON.stringify(FULL_USER));
+    markSignedOut();
+    clearSession();
+    expect(isSignedOut()).toBe(true);
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+
+    // A late silent renew (this or another tab) stores a user again.
+    await store.set(USER_KEY, JSON.stringify(FULL_USER));
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
+    await expect(simulateReload().get(USER_KEY)).resolves.toBeNull();
+
+    // The next interactive sign-in clears the marker; persistence resumes.
+    clearSignedOut();
+    expect(isSignedOut()).toBe(false);
+    await store.set(USER_KEY, JSON.stringify(FULL_USER));
+    expect(localStorage.getItem(SESSION_STORAGE_KEY)).not.toBeNull();
   });
 
   it("keeps memory-only when the value is not JSON", async () => {

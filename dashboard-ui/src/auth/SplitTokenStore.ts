@@ -15,6 +15,8 @@ import type { StateStore } from "oidc-client-ts";
  */
 
 export const SESSION_STORAGE_KEY = "crypto-signals-dashboard.session";
+/** Written at sign-out, cleared when the user starts an interactive sign-in. */
+export const SIGNED_OUT_KEY = "crypto-signals-dashboard.signedOutAt";
 
 interface PersistedStub {
   key: string;
@@ -34,6 +36,42 @@ function defaultStorage(): Storage | null {
     return window.localStorage;
   } catch {
     return null; // e.g. storage disabled / sandboxed iframe
+  }
+}
+
+export function isSignedOut(getStorage: () => Storage | null = defaultStorage): boolean {
+  try {
+    return getStorage()?.getItem(SIGNED_OUT_KEY) != null;
+  } catch {
+    return false;
+  }
+}
+
+/** Sign-out step 1: from now on `set` keeps the session in memory only. */
+export function markSignedOut(getStorage: () => Storage | null = defaultStorage): void {
+  try {
+    getStorage()?.setItem(SIGNED_OUT_KEY, String(Date.now()));
+  } catch {
+    // ignore (private mode)
+  }
+}
+
+/** Drop both halves of the session (memory + localStorage stub). */
+export function clearSession(getStorage: () => Storage | null = defaultStorage): void {
+  memory.clear();
+  try {
+    getStorage()?.removeItem(SESSION_STORAGE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+/** Interactive sign-in starting: persistence is allowed again. */
+export function clearSignedOut(getStorage: () => Storage | null = defaultStorage): void {
+  try {
+    getStorage()?.removeItem(SIGNED_OUT_KEY);
+  } catch {
+    // ignore
   }
 }
 
@@ -69,7 +107,9 @@ export class SplitTokenStore implements StateStore {
   set(key: string, value: string): Promise<void> {
     memory.set(key, value);
     const stub = this.toStub(key, value);
-    if (stub) {
+    // After a sign-out (in any tab) a late silent renew must not resurrect the
+    // persisted session; the marker is cleared by the next interactive sign-in.
+    if (stub && !isSignedOut(this.getStorage)) {
       this.write(JSON.stringify(stub));
     } else {
       this.erase();
