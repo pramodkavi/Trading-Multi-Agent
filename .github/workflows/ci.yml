@@ -1,9 +1,12 @@
 # Continuous integration (Slice 1 Step 1.20; repackaged 2026-10-03).
 #
-# Two jobs:
+# Three jobs:
 #   quality   - lint, format, type-check, test, and a full `cdk synth` (which runs
-#               the zip/layer bundlers + cdk-nag + the asset size guards). Runs on
+#               the zip/layer bundlers + cdk-nag + the asset size guards). Builds
+#               the dashboard SPA first: synth uploads dashboard-ui/dist. Runs on
 #               every push and PR.
+#   frontend  - the dashboard SPA (dashboard-ui/, Step 4.5): npm ci, eslint, tsc,
+#               vitest (run mode), vite build. Runs on every push and PR.
 #   deps-scan - build the Lambda dependency layer, pin it with `pip freeze`, and
 #               scan the pinned set with Trivy. Runs only on a push to main (after
 #               quality passes), replacing the former container-image scan.
@@ -64,6 +67,18 @@ jobs:
       - name: Tests + coverage
         run: pytest --cov=src --cov-report=term-missing --cov-report=xml
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard-ui/package-lock.json
+
+      - name: Build the dashboard SPA (synth uploads dashboard-ui/dist)
+        # infrastructure/app.py refuses to synth without dashboard-ui/dist/index.html
+        # (DashboardStack's BucketDeployment, Step 4.5).
+        working-directory: dashboard-ui
+        run: npm ci && npm run build
+
       - name: CDK synth (bundlers + cdk-nag + size guards)
         # Builds the real code asset and dependency layer with pip (no Docker)
         # and fails on any cdk-nag finding or asset-size-guard breach.
@@ -79,6 +94,36 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           if-no-files-found: ignore
+
+  frontend:
+    name: Dashboard SPA (lint, type-check, test, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard-ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard-ui/package-lock.json
+
+      - name: Install (lockfile, exact)
+        run: npm ci
+
+      - name: Lint (eslint, zero warnings)
+        run: npm run lint
+
+      - name: Type-check (tsc)
+        run: npm run typecheck
+
+      - name: Tests (vitest run, single pass)
+        run: npm test
+
+      - name: Build (tsc -b && vite build)
+        run: npm run build
 
   deps-scan:
     name: Build dependency layer + Trivy scan
