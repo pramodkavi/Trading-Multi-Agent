@@ -5,10 +5,15 @@ of the system depends on: the every-other-day cron after the 22:03 UTC wrap
 scan, the ``workflow_dispatch`` inputs the runbook documents, the permissions
 the ``gh pr create`` step needs, the two chunked loops, and the cost guard that
 stops a backfill after its first review chunk unless ``confirm_cost`` is set.
+
+It also pins the dashboard SPA contract (Slice 4 Step 4.5) in ``ci.yml`` and the
+two deploy workflows: a ``frontend`` CI job, and the SPA built before any synth
+or ``cdk deploy`` (``infrastructure/app.py`` refuses to synth without it).
 """
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -199,3 +204,120 @@ def test_critic_workflow_period_start_values_are_accepted_by_run_critic() -> Non
         assert parsed.utcoffset() == timedelta(0)
         if "T" not in example:  # a bare date means UTC midnight of that day
             assert (parsed.hour, parsed.minute, parsed.second) == (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard SPA (Slice 4 Step 4.5): CI frontend job + SPA built before synth/deploy
+# ---------------------------------------------------------------------------
+#
+# ``infrastructure/app.py`` refuses to synth unless ``dashboard-ui/dist/index.html``
+# exists (``resolve_spa_dist``), so every job that runs ``python app.py`` or
+# ``cdk deploy``/``cdk destroy`` must build the SPA first.
+
+WORKFLOWS = REPO / ".github" / "workflows"
+SPA_DIR = "dashboard-ui"
+SPA_LOCK = "dashboard-ui/package-lock.json"
+
+
+def _wf(name: str) -> dict[str, Any]:
+    doc: dict[str, Any] = yaml.safe_load((WORKFLOWS / name).read_text(encoding="utf-8"))
+    return doc
+
+
+def _job_steps(name: str, job: str) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = _wf(name)["jobs"][job]["steps"]
+    return steps
+
+
+def _index(steps: list[dict[str, Any]], pred: Any) -> int:
+    return next(i for i, s in enumerate(steps) if pred(s))
+
+
+def _is_spa_build(step: dict[str, Any]) -> bool:
+    run = step.get("run") or ""
+    return step.get("working-directory") == SPA_DIR and "npm ci" in run and "npm run build" in run
+
+
+def _setup_node(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [s for s in steps if str(s.get("uses", "")).startswith("actions/setup-node@")]
+
+
+def _assert_node_20_with_npm_cache(steps: list[dict[str, Any]]) -> None:
+    nodes = _setup_node(steps)
+    assert len(nodes) == 1, "exactly one setup-node step per job (reuse it, don't add a second)"
+    with_ = nodes[0]["with"]
+    assert with_["node-version"] == "20"
+    assert with_["cache"] == "npm"
+    assert with_["cache-dependency-path"] == SPA_LOCK
+
+
+def _assert_spa_built_before(steps: list[dict[str, Any]], target: int) -> None:
+    build = _index(steps, _is_spa_build)
+    node = steps.index(_setup_node(steps)[0])
+    assert node < build < target
+
+
+def test_ci_frontend_job_runs_lint_typecheck_test_build() -> None:
+    job = _wf("ci.yml")["jobs"]["frontend"]
+    assert job["runs-on"] == "ubuntu-latest"
+    assert job["defaults"]["run"]["working-directory"] == SPA_DIR
+    steps: list[dict[str, Any]] = job["steps"]
+    _assert_node_20_with_npm_cache(steps)
+    runs = [(s.get("run") or "").strip() for s in steps]
+    order = ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"]
+    positions = [runs.index(cmd) for cmd in order]
+    assert positions == sorted(positions), f"frontend steps out of order: {positions}"
+    assert steps.index(_setup_node(steps)[0]) < positions[0]
+
+
+def test_ci_frontend_tests_run_once_not_in_watch_mode() -> None:
+    package = json.loads((REPO / SPA_DIR / "package.json").read_text(encoding="utf-8"))
+    assert package["scripts"]["test"] == "vitest run"
+
+
+def test_ci_synth_builds_spa_first() -> None:
+    steps = _job_steps("ci.yml", "quality")
+    _assert_node_20_with_npm_cache(steps)
+    synth = _index(steps, lambda s: "python app.py" in (s.get("run") or ""))
+    _assert_spa_built_before(steps, synth)
+
+
+def test_ci_deps_scan_does_not_synth() -> None:
+    runs = " ".join(s.get("run") or "" for s in _job_steps("ci.yml", "deps-scan"))
+    assert "app.py" not in runs and "cdk " not in runs
+
+
+def _first_cdk_step(steps: list[dict[str, Any]]) -> int:
+    return _index(
+        steps,
+        lambda s: any(c in (s.get("run") or "") for c in ("cdk deploy", "cdk destroy")),
+    )
+
+
+def test_deploy_dev_builds_spa_before_cdk_deploy() -> None:
+    steps = _job_steps("deploy-dev.yml", "deploy")
+    _assert_node_20_with_npm_cache(steps)
+    _assert_spa_built_before(steps, _first_cdk_step(steps))
+
+
+def test_deploy_prod_builds_spa_before_cdk_deploy() -> None:
+    steps = _job_steps("deploy-prod.yml", "deploy")
+    _assert_node_20_with_npm_cache(steps)
+    _assert_spa_built_before(steps, _first_cdk_step(steps))
+
+
+def test_workflows_install_spa_deps_with_npm_ci_never_npm_install() -> None:
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        # The global CDK CLI install (`npm install -g aws-cdk@<pin>`) is the only allowed
+        # `npm install`; project deps always come from the lockfile via `npm ci`.
+        for line in text.splitlines():
+            if "npm install" in line and not line.lstrip().startswith("#"):
+                assert "npm install -g aws-cdk@" in line, f"{path.name}: {line.strip()}"
+        if SPA_DIR in text:
+            assert "npm ci" in text, path.name
+
+
+def test_critic_workflow_does_not_need_the_spa() -> None:
+    text = (WORKFLOWS / "critic.yml").read_text(encoding="utf-8")
+    assert "app.py" not in text and "cdk deploy" not in text and SPA_DIR not in text

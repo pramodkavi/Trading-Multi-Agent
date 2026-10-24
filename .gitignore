@@ -78,3 +78,8 @@ docker-compose.override.yml
 # --- Project-specific ---
 *.local.yaml
 *.local.yml
+
+# --- Dashboard SPA (Slice 4 Step 4.5) ---
+dashboard-ui/node_modules/
+dashboard-ui/dist/
+dashboard-ui/public/config.local.json

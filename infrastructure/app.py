@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import aws_cdk as cdk
 from cdk_nag import AwsSolutionsChecks
@@ -61,7 +62,8 @@ def resolve_app_version() -> str:
     return "local"
 
 
-app = cdk.App()
+# Repository root (this file lives in <root>/infrastructure/).
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # Region is PINNED to Mumbai (ap-south-1). The scan Lambda calls the Binance
 # REST API, which geofences North-American/EU AWS regions with HTTP 451
@@ -70,52 +72,76 @@ app = cdk.App()
 # account still comes from the ambient CDK env. See Step 1.22 deploy notes.
 AWS_REGION = "ap-south-1"
 
-env = cdk.Environment(
-    account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
-    region=AWS_REGION,
-)
 
-network = NetworkStack(app, "CryptoSignals-Network", env=env)
-data = DataStack(
-    app,
-    "CryptoSignals-Data",
-    env=env,
-    vpc=network.vpc,
-    db_security_group=network.db_security_group,
-)
-compute = ComputeStack(
-    app,
-    "CryptoSignals-Compute",
-    env=env,
-    cluster=data.cluster,
-    bucket=data.bucket,
-)
-SchedulingStack(
-    app,
-    "CryptoSignals-Scheduling",
-    env=env,
-    scan_function=compute.function,
-)
-MonitoringStack(
-    app,
-    "CryptoSignals-Monitoring",
-    env=env,
-    scan_function=compute.function,
-    scan_log_group=compute.log_group,
-    cluster=data.cluster,
-)
-# Slice 4 (design 2026-10-18 §3.5 / §4.4): LAST and coupled only to Data, so a
-# dashboard deploy failure can never block or delay a pipeline deploy.
-DashboardStack(
-    app,
-    "CryptoSignals-Dashboard",
-    env=env,
-    cluster=data.cluster,
-    app_version=resolve_app_version(),
-)
+def resolve_spa_dist(repo_root: Path) -> Path:
+    """The dashboard SPA build (``dashboard-ui/dist``) the DashboardStack uploads.
 
-# cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a
-# stack adds a resource, any insecure default is flagged immediately.
-cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
+    Step 4.5: ``cdk synth`` / ``deploy`` must fail loudly -- not ship an empty
+    site -- when the Vite build has not been run (``dist`` is gitignored).
+    """
+    dist = repo_root / "dashboard-ui" / "dist"
+    if not (dist / "index.html").is_file():
+        raise SystemExit(
+            "dashboard-ui/dist/index.html not found — run `npm ci && npm run build` "
+            "in dashboard-ui first"
+        )
+    return dist
 
-app.synth()
+
+def main() -> None:
+    """Build and synthesize the app (guarded so tests can import the helpers)."""
+    app = cdk.App()
+    env = cdk.Environment(
+        account=os.environ.get("CDK_DEFAULT_ACCOUNT"),
+        region=AWS_REGION,
+    )
+
+    network = NetworkStack(app, "CryptoSignals-Network", env=env)
+    data = DataStack(
+        app,
+        "CryptoSignals-Data",
+        env=env,
+        vpc=network.vpc,
+        db_security_group=network.db_security_group,
+    )
+    compute = ComputeStack(
+        app,
+        "CryptoSignals-Compute",
+        env=env,
+        cluster=data.cluster,
+        bucket=data.bucket,
+    )
+    SchedulingStack(
+        app,
+        "CryptoSignals-Scheduling",
+        env=env,
+        scan_function=compute.function,
+    )
+    MonitoringStack(
+        app,
+        "CryptoSignals-Monitoring",
+        env=env,
+        scan_function=compute.function,
+        scan_log_group=compute.log_group,
+        cluster=data.cluster,
+    )
+    # Slice 4 (design 2026-10-18 §3.5 / §4.4): LAST and coupled only to Data, so a
+    # dashboard deploy failure can never block or delay a pipeline deploy.
+    DashboardStack(
+        app,
+        "CryptoSignals-Dashboard",
+        env=env,
+        cluster=data.cluster,
+        app_version=resolve_app_version(),
+        spa_dist=resolve_spa_dist(REPO_ROOT),
+    )
+
+    # cdk-nag: fail synth on AWS Solutions security-rule violations. The moment a
+    # stack adds a resource, any insecure default is flagged immediately.
+    cdk.Aspects.of(app).add(AwsSolutionsChecks(verbose=True))
+
+    app.synth()
+
+
+if __name__ == "__main__":
+    main()
