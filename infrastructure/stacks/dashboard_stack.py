@@ -57,10 +57,19 @@ app only, deliberately unrouted here (no auth yet); the one change 4.2 made to
 this stack is the JSON access-log format (``ACCESS_LOG_FORMAT``). Step 4.3
 added the funnel / analytics / Critic / system-health / market routes, again
 FastAPI-only; its only change here is the read-only CloudWatch IAM above. What
-the next steps add here: 4.5 the SPA
-(private S3 bucket + CloudFront, which also fronts ``/api/*`` so SPA and API
-share one origin); 4.7 the SSM parameter publishing the base URL for the
+the next steps add here: 4.7 the SSM parameter publishing the base URL for the
 Telegram deep links (design §7).
+
+Step 4.5 (done) added the SPA hosting (design §8): a private, SSL-only S3 bucket
+behind CloudFront (OAC); a viewer-request CloudFront Function
+(``infrastructure/spa_rewrite.js``) on the DEFAULT behaviour only as the SPA
+fallback -- deliberately no distribution-level custom error responses, which
+would also rewrite the API's real 403/404 into ``index.html``; a ``/api/*``
+behaviour forwarding to this HTTP API (all viewer headers except Host, no
+caching), so SPA and API share one origin; security headers (HSTS, CSP, ...);
+two ``BucketDeployment``s uploading the Vite build (``dashboard-ui/dist``) and
+a runtime ``config.json``; and the CloudFront callback / logout URLs on the
+Cognito client. The API role is unchanged (still no S3).
 
 Step 4.4 (done) added the one-user Cognito pool (admin-created only, LITE plan,
 TOTP MFA required, RETAINED with deletion protection), its classic Hosted UI
@@ -76,6 +85,7 @@ non-health request without JWT claims is a 401. Runbook: docs/operations.md §8.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import jsii
@@ -83,6 +93,7 @@ from aws_cdk import (
     ArnFormat,
     CfnOutput,
     Duration,
+    Fn,
     RemovalPolicy,
     Stack,
     Tags,
@@ -91,11 +102,15 @@ from aws_cdk import aws_apigateway as apigw
 from aws_cdk import aws_apigatewayv2 as apigwv2
 from aws_cdk import aws_apigatewayv2_authorizers as authorizers
 from aws_cdk import aws_apigatewayv2_integrations as integrations
+from aws_cdk import aws_cloudfront as cloudfront
+from aws_cdk import aws_cloudfront_origins as origins
 from aws_cdk import aws_cognito as cognito
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_lambda as lambda_
 from aws_cdk import aws_logs as logs
 from aws_cdk import aws_rds as rds
+from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_s3_deployment as s3deploy
 from cdk_nag import NagSuppressions
 from constructs import Construct
 from lambda_assets import ARCHITECTURE, RUNTIME, code_asset, deps_layer
@@ -126,6 +141,27 @@ TOKEN_HELPER_LOGOUT = "http://localhost:8765/"
 # MonitoringStack's CDK-generated alarm names start with its stack name; the
 # dashboard may describe only those (mirrors `src.dashboard.api.cloudwatch.ALARM_PREFIX`).
 MONITORING_ALARM_PREFIX = "CryptoSignals-Monitoring-"
+
+# ---- Step 4.5: SPA hosting (design §8) --------------------------------------
+# PRICE_CLASS_200 includes the India edge locations PRICE_CLASS_100 lacks (the
+# operator is in Sri Lanka); the cost difference is pennies at one user.
+SPA_PRICE_CLASS = cloudfront.PriceClass.PRICE_CLASS_200
+# Vite emits content-hashed file names under assets/, so they never change in
+# place and may be cached forever; index.html / config.json / root files must be
+# revalidated on every load so a deploy is picked up immediately.
+SPA_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+SPA_HTML_CACHE_CONTROL = "no-cache"
+# The CloudFront Function source (viewer-request SPA fallback), read at synth.
+SPA_REWRITE_SOURCE = Path(__file__).resolve().parents[1] / "spa_rewrite.js"
+# Same-origin API prefix the SPA calls (config.json `apiBase`); also the
+# CloudFront behaviour path pattern that forwards to the HTTP API.
+SPA_API_BASE = "/api"
+# Construct id of the stack-level singleton Lambda that every BucketDeployment
+# shares (fixed UUID in aws-cdk-lib's aws-s3-deployment). Its nag findings are
+# suppressed by this exact path. The auto_delete_objects provider
+# (Custom::S3AutoDeleteObjectsCustomResourceProvider) is a raw CfnResource that
+# cdk-nag 2.38 does not flag, so it needs no suppression.
+BUCKET_DEPLOYMENT_SINGLETON = "Custom::CDKBucketDeployment8693BB64968944B69AAFB0CC9EB8756C"
 
 # HTTP-API access-log line, one JSON object per request. CDK's default (Common
 # Log) format uses the REST-era ``$context.resourcePath``, which an HTTP API
@@ -185,6 +221,7 @@ class DashboardStack(Stack):
         construct_id: str,
         *,
         cluster: rds.DatabaseCluster,
+        spa_dist: Path,
         db_name: str = "signals",
         app_version: str = "local",
         **kwargs: Any,
@@ -351,8 +388,24 @@ class DashboardStack(Stack):
             ),
             managed_login_version=cognito.ManagedLoginVersion.CLASSIC_HOSTED_UI,
         )
+        # Hosted UI host (<prefix>.auth.<region>.amazoncognito.com): the SPA's
+        # token / revoke calls and the login form post go here (CSP below).
+        # `domain_name` is the prefix (the UserPoolDomain's Ref).
+        hosted_ui_host = f"{self.user_pool_domain.domain_name}.auth.{self.region}.amazoncognito.com"
+
+        # ---- Step 4.5: the SPA -- private S3 + CloudFront (design §8) --------
+        # Declared before the app client: the client's callback / logout URLs
+        # need the distribution domain, and the distribution depends only on the
+        # bucket, the HTTP API endpoint and the Cognito *domain* (CSP) -- never
+        # on the client or the authorizer, so there is no cycle.
+        self._build_spa_hosting(hosted_ui_host)
+
+        spa_origin = f"https://{self.distribution.distribution_domain_name}"
         # Public client (a browser SPA / the local helper cannot keep a secret):
         # authorization code + PKCE only, SRP for the Hosted UI, no password flow.
+        # Callback / logout: the local token helper AND the CloudFront SPA. The
+        # logout URL keeps its trailing slash -- Cognito matches it exactly
+        # against the SPA's config.json `logoutUri`.
         self.user_pool_client = self.user_pool.add_client(
             "DashboardSpaClient",
             generate_secret=False,
@@ -364,8 +417,8 @@ class DashboardStack(Stack):
                     cognito.OAuthScope.EMAIL,
                     cognito.OAuthScope.PROFILE,
                 ],
-                callback_urls=[TOKEN_HELPER_CALLBACK],
-                logout_urls=[TOKEN_HELPER_LOGOUT],
+                callback_urls=[TOKEN_HELPER_CALLBACK, f"{spa_origin}/callback"],
+                logout_urls=[TOKEN_HELPER_LOGOUT, f"{spa_origin}/"],
             ),
             prevent_user_existence_errors=True,
             enable_token_revocation=True,
@@ -395,6 +448,13 @@ class DashboardStack(Stack):
         )
         self.proxy_route = proxy_routes[0]
 
+        # ---- Step 4.5: upload the SPA build + the runtime config.json --------
+        self._deploy_spa(
+            spa_dist,
+            spa_origin=spa_origin,
+            app_version=app_version,
+        )
+
         # ---- Outputs ---------------------------------------------------------
         # No default stage, so there is no `.url`; api_endpoint is the base URL
         # and $default serves at its root.
@@ -411,11 +471,189 @@ class DashboardStack(Stack):
             "DashboardJwtIssuer",
             value=f"https://cognito-idp.{self.region}.amazonaws.com/{self.user_pool.user_pool_id}",
         )
+        # Step 4.5: the web app.
+        CfnOutput(self, "DashboardUrl", value=spa_origin)
+        CfnOutput(self, "DashboardDistributionId", value=self.distribution.distribution_id)
+        CfnOutput(self, "DashboardSpaBucketName", value=self.spa_bucket.bucket_name)
 
         Tags.of(self).add("project", "crypto-signals")
         Tags.of(self).add("layer", "dashboard")
 
         self._apply_nag_suppressions()
+
+    def _build_spa_hosting(self, hosted_ui_host: str) -> None:
+        """Private bucket + CloudFront: S3 (OAC) by default, ``/api/*`` to the HTTP API."""
+        # Static build output, rebuilt and re-uploaded on every deploy: nothing
+        # to version or retain. auto_delete_objects empties it on stack delete
+        # (a CDK-managed custom-resource Lambda, suppressed below).
+        self.spa_bucket = s3.Bucket(
+            self,
+            "SpaBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            versioned=False,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
+        # SPA fallback as a viewer-request CloudFront Function on the DEFAULT
+        # behaviour only. Distribution-level custom error responses are NOT
+        # used: they would also turn the API's real 403/404 into index.html.
+        self.spa_rewrite_function = cloudfront.Function(
+            self,
+            "SpaRewriteFunction",
+            runtime=cloudfront.FunctionRuntime.JS_2_0,
+            code=cloudfront.FunctionCode.from_file(file_path=str(SPA_REWRITE_SOURCE)),
+            comment="SPA fallback: extension-less paths -> /index.html (default behaviour only)",
+        )
+
+        hsts = cloudfront.ResponseHeadersStrictTransportSecurity(
+            access_control_max_age=Duration.days(365),
+            include_subdomains=True,
+            override=True,
+        )
+        content_type_options = cloudfront.ResponseHeadersContentTypeOptions(override=True)
+        referrer_policy = cloudfront.ResponseHeadersReferrerPolicy(
+            referrer_policy=cloudfront.HeadersReferrerPolicy.NO_REFERRER, override=True
+        )
+        frame_options = cloudfront.ResponseHeadersFrameOptions(
+            frame_option=cloudfront.HeadersFrameOption.DENY, override=True
+        )
+        # The built app has no inline script/style (Vite + Tailwind emit files
+        # only), so 'self' suffices. The SPA talks only to its own origin (/api,
+        # /config.json) and Cognito: OIDC discovery + JWKS on cognito-idp, token /
+        # revoke on the Hosted UI host, which is also the login form's target.
+        self.spa_csp = "; ".join(
+            [
+                "default-src 'self'",
+                "script-src 'self'",
+                "style-src 'self'",
+                "img-src 'self' data:",
+                f"connect-src 'self' https://cognito-idp.{self.region}.amazonaws.com "
+                f"https://{hosted_ui_host}",
+                "frame-ancestors 'none'",
+                "base-uri 'self'",
+                f"form-action 'self' https://{hosted_ui_host}",
+            ]
+        )
+        self.spa_headers_policy = cloudfront.ResponseHeadersPolicy(
+            self,
+            "SpaSecurityHeaders",
+            comment="Dashboard SPA: HSTS, nosniff, no-referrer, DENY framing, CSP",
+            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                strict_transport_security=hsts,
+                content_type_options=content_type_options,
+                referrer_policy=referrer_policy,
+                frame_options=frame_options,
+                content_security_policy=cloudfront.ResponseHeadersContentSecurityPolicy(
+                    content_security_policy=self.spa_csp, override=True
+                ),
+            ),
+        )
+        # Same headers on /api/* minus the CSP (JSON responses, never rendered).
+        self.api_headers_policy = cloudfront.ResponseHeadersPolicy(
+            self,
+            "ApiSecurityHeaders",
+            comment="Dashboard /api/* via CloudFront: HSTS, nosniff, no-referrer, DENY framing",
+            security_headers_behavior=cloudfront.ResponseSecurityHeadersBehavior(
+                strict_transport_security=hsts,
+                content_type_options=content_type_options,
+                referrer_policy=referrer_policy,
+                frame_options=frame_options,
+            ),
+        )
+
+        # The HTTP API's host (<api-id>.execute-api.<region>.amazonaws.com) from
+        # its endpoint URL "https://<host>". The $default stage serves at the
+        # root, so /api/... paths pass through unchanged (no origin path).
+        api_origin = origins.HttpOrigin(
+            Fn.select(2, Fn.split("/", self.http_api.api_endpoint)),
+            protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+        )
+        self.distribution = cloudfront.Distribution(
+            self,
+            "SpaDistribution",
+            comment="Crypto-signals dashboard SPA + /api/* (Step 4.5)",
+            default_root_object="index.html",
+            price_class=SPA_PRICE_CLASS,
+            http_version=cloudfront.HttpVersion.HTTP2_AND_3,
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.S3BucketOrigin.with_origin_access_control(self.spa_bucket),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+                response_headers_policy=self.spa_headers_policy,
+                function_associations=[
+                    cloudfront.FunctionAssociation(
+                        function=self.spa_rewrite_function,
+                        event_type=cloudfront.FunctionEventType.VIEWER_REQUEST,
+                    )
+                ],
+            ),
+            additional_behaviors={
+                # No function association here: the API's 401/403/404 reach the
+                # SPA unchanged. ALL_VIEWER_EXCEPT_HOST_HEADER forwards
+                # Authorization + query strings; API Gateway needs its own Host.
+                f"{SPA_API_BASE}/*": cloudfront.BehaviorOptions(
+                    origin=api_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=(
+                        cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER
+                    ),
+                    response_headers_policy=self.api_headers_policy,
+                ),
+            },
+        )
+
+    def _deploy_spa(self, spa_dist: Path, *, spa_origin: str, app_version: str) -> None:
+        """Upload the Vite build + a generated ``config.json``; invalidate CloudFront.
+
+        Two deployments with disjoint sync filters, so neither can delete the
+        other's files: (1) ``assets/*`` only (content-hashed -> immutable, never
+        pruned, so a still-cached old ``index.html`` can load last deploy's
+        chunks); (2) everything except ``assets/*`` -- ``index.html``, root files
+        and ``config.json`` (no-cache, pruned; excluded paths are never deleted by
+        the sync). (2) runs after (1), so a new ``index.html`` never references
+        chunks not yet uploaded, and carries the ``/*`` invalidation.
+        """
+        build = s3deploy.Source.asset(str(spa_dist))
+        assets_deployment = s3deploy.BucketDeployment(
+            self,
+            "SpaAssetsDeployment",
+            sources=[build],
+            destination_bucket=self.spa_bucket,
+            exclude=["*"],
+            include=["assets/*"],
+            prune=False,
+            cache_control=[s3deploy.CacheControl.from_string(SPA_ASSET_CACHE_CONTROL)],
+        )
+        # Runtime config, never baked into the build (keys = the SPA loader's).
+        runtime_config = s3deploy.Source.json_data(
+            "config.json",
+            {
+                "region": self.region,
+                "userPoolId": self.user_pool.user_pool_id,
+                "clientId": self.user_pool_client.user_pool_client_id,
+                "cognitoDomain": self.user_pool_domain.base_url(),
+                "apiBase": SPA_API_BASE,
+                "redirectUri": f"{spa_origin}/callback",
+                "logoutUri": f"{spa_origin}/",
+                "version": app_version,
+            },
+        )
+        html_deployment = s3deploy.BucketDeployment(
+            self,
+            "SpaHtmlDeployment",
+            sources=[build, runtime_config],
+            destination_bucket=self.spa_bucket,
+            exclude=["assets/*"],
+            cache_control=[s3deploy.CacheControl.from_string(SPA_HTML_CACHE_CONTROL)],
+            distribution=self.distribution,
+            distribution_paths=["/*"],
+        )
+        html_deployment.node.add_dependency(assets_deployment)
 
     def _apply_nag_suppressions(self) -> None:
         """Justified cdk-nag suppressions for intentional Step 4.1 choices (design §8)."""
@@ -482,6 +720,86 @@ class DashboardStack(Stack):
                     ),
                 },
             ],
+        )
+        # ---- Step 4.5: SPA hosting (design §8 / NFR-3.5 amended) ------------
+        # Distribution only (not the stack): the deliberate single-operator /
+        # no-custom-domain / cost choices.
+        NagSuppressions.add_resource_suppressions(
+            self.distribution,
+            [
+                {
+                    "id": "AwsSolutions-CFR1",
+                    "reason": (
+                        "No geo restriction: a single operator who travels; Cognito + "
+                        "TOTP MFA gate every data route (design §4.3 non-goal)."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-CFR2",
+                    "reason": (
+                        "No WAF (design NFR-3.5 amended): ~$6+/month fixed cost for one "
+                        "user; the API is behind the Cognito JWT authorizer and throttled."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-CFR3",
+                    "reason": (
+                        "No CloudFront access logs (cost, static build output); /api/* "
+                        "requests are already access-logged by the HTTP API stage."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-CFR4",
+                    "reason": (
+                        "The default *.cloudfront.net certificate forces the TLSv1 security "
+                        "policy; a stricter minimum needs a custom domain + ACM certificate, "
+                        "which the design does not use. Browsers negotiate TLS 1.2/1.3."
+                    ),
+                },
+            ],
+        )
+        NagSuppressions.add_resource_suppressions(
+            self.spa_bucket,
+            [
+                {
+                    "id": "AwsSolutions-S1",
+                    "reason": (
+                        "No server access logs on the SPA bucket: private (OAC only), holds "
+                        "only the rebuilt-every-deploy static build output; cost."
+                    ),
+                },
+            ],
+        )
+        # BucketDeployment's CDK-managed singleton Lambda (stack-level construct,
+        # not ours to configure): suppressed by its exact path only.
+        NagSuppressions.add_resource_suppressions_by_path(
+            self,
+            f"/{self.node.path}/{BUCKET_DEPLOYMENT_SINGLETON}",
+            [
+                {
+                    "id": "AwsSolutions-IAM4",
+                    "reason": (
+                        "CDK-managed BucketDeployment custom resource: AWSLambdaBasicExecution"
+                        "Role for its CloudWatch Logs only."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-IAM5",
+                    "reason": (
+                        "CDK-managed BucketDeployment custom resource: CDK's grant of read on "
+                        "the bootstrap asset bucket and read/write on the SPA bucket's "
+                        "objects (+ CloudFront invalidation) -- generated, not editable."
+                    ),
+                },
+                {
+                    "id": "AwsSolutions-L1",
+                    "reason": (
+                        "CDK-managed BucketDeployment custom resource: its runtime is pinned "
+                        "by aws-cdk-lib and moves with CDK upgrades."
+                    ),
+                },
+            ],
+            apply_to_children=True,
         )
         # The proxy route needs no APIG4 suppression -- the authorizer satisfies it.
         # Cognito: only the deliberate cost choices (LITE plan / no advanced
