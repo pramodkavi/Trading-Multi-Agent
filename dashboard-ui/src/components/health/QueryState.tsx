@@ -1,0 +1,44 @@
+import type { UseQueryResult } from "@tanstack/react-query";
+import type { ReactNode } from "react";
+import { isDbResuming } from "../../api/client";
+import { mutedClass } from "../styles";
+
+/** One panel's data lifecycle: waking / loading / its own inline error, else the content. */
+export function QueryState<T>({
+  query,
+  label,
+  children,
+}: {
+  query: UseQueryResult<T, Error>;
+  label: string;
+  children: (data: T) => ReactNode;
+}) {
+  // A failed background refresh keeps the last good data (TanStack v5): show it, flag it stale.
+  if (query.data !== undefined) {
+    return (
+      <>
+        {query.isError ? (
+          <p role="status" className="mb-2 text-sm text-amber-900 dark:text-amber-200">
+            {`Could not refresh ${label} — showing the last data received.`}
+          </p>
+        ) : null}
+        {children(query.data)}
+      </>
+    );
+  }
+  if (query.isPending) {
+    return (
+      <p className={mutedClass}>
+        {isDbResuming(query.failureReason) ? "Waking the database…" : "Loading…"}
+      </p>
+    );
+  }
+  if (query.isError) {
+    return (
+      <p role="status" className="text-sm text-red-800 dark:text-red-200">
+        {`Could not load ${label}.`}
+      </p>
+    );
+  }
+  return null;
+}

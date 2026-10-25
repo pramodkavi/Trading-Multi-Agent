@@ -840,3 +840,25 @@ refresh) and wait out the hour. **Where 401s show up:** API Gateway's rejections
 own `{"reason":"unauthorized"}` (missing claims) is a normal invocation in the
 function log. `/api/docs` needs a token, so it is not browsable directly until the
 SPA (Step 4.5).
+
+
+### 8.8 Reading the dashboard banner (Step 4.6)
+
+Open `https://dop305tg1xjkt.cloudfront.net/` and sign in. The red (or amber) banner at the
+top of **Overview** appears only when something is wrong, and every banner links to
+**Health** for the detail. What each line means and the first action:
+
+| Banner | Meaning | First action |
+|---|---|---|
+| **Anthropic credit balance too low** (red) | The **latest finished** scan window FAILED and its stored `error_message` contains "credit balance" — the LLM call was rejected. | Top up Anthropic credits (Anthropic console → Billing). Once the next scan window succeeds the banner clears within one 60 s poll (earlier failed windows stay red on their own cards but no longer raise the banner). |
+| **Latest scan failed (WINDOW)** (red) | The latest finished scan window FAILED and the error is *not* a credit rejection. | Health → Scan history: read the error (full text on hover); then the scan Lambda log group. |
+| **N CloudWatch alarm(s) in ALARM** (red) | One of the five `CryptoSignals-Monitoring-*` alarms is firing; the names are listed. | Open the alarm in the CloudWatch console (§3). |
+| **Forecaster needs attention** (amber) | Open setups not evaluated since the last sweep, or `ERROR` evaluations in the last window. | Health → Forecaster sweeps; usually the same credit cause as above. |
+| **Alarm status unavailable** (amber) | The dashboard Lambda could not read CloudWatch (`cloudwatch unavailable` / `cloudwatch access denied`). Never treated as healthy. | Access denied = an IAM gap on the dashboard role — a bug; check the Lambda log. |
+
+If a 60 s refresh fails, the page keeps the last data and shows an amber "Could not refresh … — showing the last data received" line instead of blanking. A scheduled window that has not fired yet shows **not run yet**; once 15 minutes late with
+no scan it shows **missed** (amber). The credit wording depends on the failed scan's error
+text reaching `scan_runs.error_message` (`scripts/run_scan.py` stores
+`"<ExceptionType>: <message>"`); if a failure is swallowed before that, the banner falls
+back to the generic or Forecaster wording. Lambda metrics on Health load once per page view
+(not on the 60 s poll) because CloudWatch bills per request.
