@@ -7,6 +7,7 @@ import type {
   ScanRowOut,
   ScansResponse,
   SetupCardOut,
+  SignalRowOut,
   SweepsResponse,
   WindowOutcome,
   WindowSummary,
@@ -107,6 +108,36 @@ export function makeOverview(overrides: Partial<OverviewResponse> = {}): Overvie
       makeWindow("OVERLAP", "2026-10-25T15:03:00Z", null),
       makeWindow("DAILY_WRAP", "2026-10-25T22:03:00Z", null),
     ],
+    ...overrides,
+  };
+}
+
+/** A journal row; defaults to a published BTCUSDT long, override per test. */
+export function makeRow(overrides: Partial<SignalRowOut> = {}): SignalRowOut {
+  return {
+    id: "11111111-1111-4111-8111-111111111111",
+    scan_id: "scan-1",
+    symbol: "BTCUSDT",
+    strategy: "smc",
+    direction: "LONG",
+    status: "PUBLISHED",
+    created_at: "2026-10-25T08:03:00Z",
+    tags: ["htf-bias"],
+    outcome: null,
+    entry_price: 100,
+    stop_loss: 95,
+    take_profit_1: 115,
+    take_profit_2: null,
+    risk_reward_ratio: 3,
+    skip_reason: null,
+    skip_details: null,
+    decision_kind: "PUBLISHED",
+    judge_ruling: "PUBLISH",
+    session: "LONDON",
+    has_setup: true,
+    violated_rule: null,
+    resolution_outcome: null,
+    realized_r: null,
     ...overrides,
   };
 }

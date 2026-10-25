@@ -95,7 +95,9 @@ export interface OverviewResponse {
   windows_today: WindowSummary[];
 }
 
-// -- Journal (P3), only the slice the Overview lists ----------------------------
+// -- Journal (P3) and signal lifecycle (P2) -------------------------------------
+
+export type SignalOutcome = "WIN" | "LOSS" | "BREAKEVEN" | "INVALIDATED" | "EXPIRED";
 
 export interface SignalRowOut {
   id: string;
@@ -105,11 +107,112 @@ export interface SignalRowOut {
   direction: SignalDirection | null;
   status: string;
   created_at: string;
+  tags: string[];
+  outcome: SignalOutcome | null;
+  entry_price: number | null;
+  stop_loss: number | null;
+  take_profit_1: number | null;
+  take_profit_2: number | null;
+  risk_reward_ratio: number | null;
+  skip_reason: string | null;
+  skip_details: string | null;
   decision_kind: DecisionKind;
   judge_ruling: string | null;
   session: string | null;
+  has_setup: boolean;
+  violated_rule: string | null;
+  resolution_outcome: string | null;
+  realized_r: number | null;
 }
 
+export interface SignalFilters {
+  since?: string;
+  until?: string;
+  symbol?: string;
+  kind?: DecisionKind;
+  outcome?: SignalOutcome;
+  tag?: string;
+  session?: string;
+  violated_rule?: string;
+}
+
+export interface SignalDetailOut extends SignalRowOut {
+  payload: Record<string, unknown>;
+  features: Record<string, unknown>;
+  outcome_metadata: Record<string, unknown> | null;
+}
+
+export interface LifecycleStep {
+  role: string;
+  run_id: string;
+  created_at: string;
+  latency_ms: number;
+  cost_usd: number | null;
+  summary: Record<string, unknown>;
+}
+
+export interface EvaluationOut {
+  id: string;
+  setup_id: string;
+  signal_id: string;
+  evaluated_at: string;
+  status: "STILL_VALID" | "AT_RISK" | "INVALIDATED" | "ERROR";
+  outcome: SignalOutcome | null;
+  reasoning: string | null;
+  error: string | null;
+  latency_ms: number;
+  token_usage: Record<string, unknown>;
+  cost_usd: number | null;
+}
+
+export interface ResolutionOut {
+  signal_id: string;
+  decision_kind: DecisionKind;
+  outcome: "WIN" | "LOSS" | "EXPIRED" | "UNRESOLVABLE";
+  decided_at: string;
+  entered_at: string | null;
+  resolved_at: string;
+  realized_r: number;
+  max_adverse_excursion_r: number | null;
+  max_favorable_excursion_r: number | null;
+  tp2_reached: boolean;
+  candles_used: number;
+  engine_version: string;
+}
+
+export interface ReviewOut {
+  signal_id: string;
+  decision_kind: string;
+  review: Record<string, unknown>;
+  model: string;
+  token_usage: Record<string, unknown>;
+  cost_usd: number | null;
+  error: string | null;
+  attempts: number;
+  created_at: string;
+}
+
+export interface AgentRunOut {
+  id: string;
+  scan_id: string;
+  agent_role: string;
+  strategy: string | null;
+  input_hash: string;
+  output: Record<string, unknown>;
+  latency_ms: number;
+  token_usage: Record<string, unknown>;
+  cost_usd: number | null;
+  created_at: string;
+}
+
+export interface LifecycleResponse {
+  signal: SignalDetailOut;
+  steps: LifecycleStep[];
+  evaluations: EvaluationOut[];
+  resolution: ResolutionOut | null;
+  review: ReviewOut | null;
+  setup: SetupCardOut | null;
+}
 export interface SignalsPage {
   items: SignalRowOut[];
   next_cursor: string | null;

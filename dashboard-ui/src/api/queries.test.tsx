@@ -8,9 +8,12 @@ import {
   retryDelay,
   shouldRetry,
   useAgents,
+  useAgentRun,
   useMetrics,
   useOverview,
   useRecentSignals,
+  useSignal,
+  useSignalsJournal,
 } from "./queries";
 
 describe("endpoint hooks", () => {
@@ -120,5 +123,89 @@ describe("query retry policy", () => {
     expect(q?.refetchInterval).toBe(60_000);
     expect(q?.refetchIntervalInBackground).toBe(false);
     expect(q?.staleTime).toBe(30_000);
+  });
+});
+
+describe("journal and detail hooks", () => {
+  const urls: string[] = [];
+
+  beforeEach(() => {
+    urls.length = 0;
+    configureApi({
+      apiBase: "/api",
+      auth: {
+        getUser: async () => ({ access_token: "t", expired: false }),
+        signinSilent: async () => null,
+        signinRedirect: async () => undefined,
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urls.push(url);
+        const body = url.startsWith("/api/signals?")
+          ? { items: [], next_cursor: url.includes("cursor=") ? null : "abc" }
+          : { ok: true };
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    resetApiForTests();
+  });
+
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={createQueryClient()}>{children}</QueryClientProvider>
+  );
+
+  it("useSignalsJournal sends the filters in a fixed order with limit 50", async () => {
+    const { result } = renderHook(() => useSignalsJournal({ kind: "VETOED", symbol: "BTCUSDT" }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(urls).toEqual(["/api/signals?symbol=BTCUSDT&kind=VETOED&limit=50"]);
+  });
+
+  it("useSignalsJournal pages by the server cursor and stops when it is null", async () => {
+    const { result } = renderHook(() => useSignalsJournal({}), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.hasNextPage).toBe(true);
+    await result.current.fetchNextPage();
+    await waitFor(() => expect(result.current.hasNextPage).toBe(false));
+    expect(urls[1]).toBe("/api/signals?limit=50&cursor=abc");
+  });
+
+  it("a different filter set is a different query (fresh first page)", async () => {
+    const { result, rerender } = renderHook(({ f }) => useSignalsJournal(f), {
+      wrapper,
+      initialProps: { f: { symbol: "BTCUSDT" } as const },
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    rerender({ f: { symbol: "ETHUSDT" } as never });
+    await waitFor(() => expect(urls).toContain("/api/signals?symbol=ETHUSDT&limit=50"));
+  });
+
+  it("useSignal requests the lifecycle by id", async () => {
+    const id = "11111111-1111-4111-8111-111111111111";
+    const { result } = renderHook(() => useSignal(id), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(urls).toEqual([`/api/signals/${id}`]);
+  });
+
+  it("useAgentRun fetches only when enabled", async () => {
+    const { result, rerender } = renderHook(({ on }) => useAgentRun("sig-1", "run-1", on), {
+      wrapper,
+      initialProps: { on: false },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(urls).toEqual([]);
+    rerender({ on: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(urls).toEqual(["/api/signals/sig-1/runs/run-1"]);
   });
 });

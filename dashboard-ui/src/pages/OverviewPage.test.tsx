@@ -5,6 +5,7 @@ import {
   CREDIT_ERROR,
   makeOutcome,
   makeOverview,
+  makeRow,
   makeSetup,
   makeWindow,
 } from "../test/fixtures";
@@ -207,18 +208,13 @@ describe("OverviewPage", () => {
       "/overview": makeOverview(),
       "/signals": {
         items: [
-          {
+          makeRow({
             id: "s1",
-            scan_id: "scan-1",
             symbol: "SOLUSDT",
-            strategy: "smc",
             direction: "SHORT",
-            status: "PUBLISHED",
-            created_at: "2026-10-25T08:03:00Z",
             decision_kind: "GATE_REJECTED",
             judge_ruling: null,
-            session: "LONDON",
-          },
+          }),
         ],
         next_cursor: null,
       } satisfies SignalsPage,
