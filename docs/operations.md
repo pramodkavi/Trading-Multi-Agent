@@ -923,3 +923,41 @@ alarm notifier's messages have no signal, so no link.
    `could not read the dashboard URL parameter (<ExceptionType>)` — `ParameterNotFound` means the
    Dashboard stack has not deployed yet, `AccessDeniedException` means the Compute deploy has not
    applied the new grant.
+
+
+### 8.11 Reading the funnel and analytics (Step 4.8)
+
+**Funnel** (`/funnel`) shows where decisions die on the way to a published signal. Pick the period
+(7 / 30 / 90 days — default 30) and how to group (day, window or symbol); both live in the URL.
+
+| Stage | Meaning |
+|---|---|
+| Scans | Scan invocations in the period. |
+| Symbols scanned | Per-symbol decisions (≈ 4 per scan). Scans and symbols are different units, so neither has a percentage. |
+| Analyzer proposals | The Analyzer proposed a trade. Percentages from here are "of the stage before". |
+| Passed the risk gate | No SPEC §1.6 hard rule blocked the proposal. |
+| Published | The Judge ruled PUBLISH or PUBLISH_WITH_CAVEAT; the line under the bars splits the Judge's rulings (publish / with caveat / skip, plus "unruled" if any). |
+
+**Rejections by rule** stacks the gate's rejections per group (the five biggest rules plus "Other");
+every chart has a *Show data table* fallback with the exact numbers. **Top rejection rules** are
+always the **last 7 and 30 days**, whatever period is selected. A funnel with 160 symbols scanned
+and 3 published is the system working as designed — look at which rule dominates the rejections.
+
+**Analytics** (`/analytics`, default 90 days):
+
+- **Win rate** per tag / session / strategy / ISO week. Win rate = wins ÷ (wins + losses); `—` means
+  no decided outcomes yet, never 0 %. **Always read it with the sample size** — a bucket with fewer
+  than 5 decided outcomes is tagged *low sample*. The footnote says how many outcomes came from the
+  deterministic replay and how many from the Forecaster's judgement.
+- **Skeptic value**: how decisions ended when the Judge *respected* the objection (a veto — those
+  outcomes are **counterfactual replays**, the trade was never taken), *overruled with a caveat*, or
+  *overruled*. Runs with no macro data are excluded and counted.
+- **Equity curve**: hypothetical cumulative R at 1 R risk per published signal. The vetoed and
+  gate-rejected curves are counterfactual replays (dashed, opt-in) and are never added to the
+  published curve.
+- **Critic**: the latest reports (summary, the proposed-rules PR link — only for an `https://` URL —
+  and the report text as plain text on demand) and the latest review grades. **Both stay empty until
+  the first Critic backfill runs** (pending Anthropic credits, §7).
+
+Colours follow the dataviz palette (validated for colour-blindness in light and dark); dashed lines
+and the data tables carry identity without colour. Recharts is loaded only on these two pages.
