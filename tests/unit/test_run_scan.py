@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -438,6 +438,57 @@ class TestComposeMessage:
         assert "71\\.4%" in msg
 
 
+_DASH_BASE = "https://d111.cloudfront.net"
+_DASH_SIGNAL_ID = UUID("11111111-1111-4111-8111-111111111111")
+_DASH_URL = f"{_DASH_BASE}/signals/{_DASH_SIGNAL_ID}"
+_DASH_LINK = f"[Open in dashboard]({_DASH_URL})"
+
+
+class TestComposeMessageDashboardLink:
+    """Step 4.7 Part B: every message that references a signal carries its dashboard link."""
+
+    def _publish_state(self) -> dict[str, Any]:
+        return {
+            "proposal": _proposal(),
+            "decision": JudgeRuling.PUBLISH,
+            "historian_report": _report(),
+            "skeptic_objection": _objection(),
+            "judge_decision": _ruling(JudgeRuling.PUBLISH),
+        }
+
+    def test_publish_skip_and_judge_veto_carry_the_link(self) -> None:
+        states = {
+            "publish": self._publish_state(),
+            "analyzer skip": {
+                "proposal": _skip(),
+                "decision": JudgeRuling.SKIP,
+                "judge_decision": None,
+            },
+            "judge veto": {
+                "proposal": _proposal(),
+                "decision": JudgeRuling.SKIP,
+                "judge_decision": _ruling(JudgeRuling.SKIP),
+            },
+        }
+        for name, state in states.items():
+            msg = compose_message(state, signal_url=_DASH_URL)  # type: ignore[arg-type]
+            assert _DASH_LINK in msg, name
+
+    def test_no_url_leaves_every_message_unchanged(self) -> None:
+        for state in (
+            self._publish_state(),
+            {"proposal": _skip(), "decision": JudgeRuling.SKIP, "judge_decision": None},
+            {
+                "proposal": _proposal(),
+                "decision": JudgeRuling.SKIP,
+                "judge_decision": _ruling(JudgeRuling.SKIP),
+            },
+        ):
+            plain = compose_message(state)  # type: ignore[arg-type]
+            assert compose_message(state, signal_url=None) == plain  # type: ignore[arg-type]
+            assert "dashboard" not in plain
+
+
 # ---------------------------------------------------------------------------
 # run_one_symbol — full orchestration through the pipeline
 # ---------------------------------------------------------------------------
@@ -469,6 +520,70 @@ class TestRunOneSymbol:
         store.complete_scan.assert_awaited_once()
         store.fail_scan.assert_not_awaited()
         assert ctx.strategy == "smc"
+
+    async def test_publish_message_links_to_the_persisted_signal(self) -> None:
+        store = _store()
+        store.create_signal = AsyncMock(return_value=_DASH_SIGNAL_ID)
+        notifier = _notifier()
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_bullish_series())),
+            store=store,
+            graph=_publishing_graph(),
+            notifier=notifier,
+            clock=_london_clock,
+            dashboard_base_url=_DASH_BASE,
+        )
+
+        sent = notifier.send.await_args.args[0]
+        assert _DASH_LINK in sent
+        assert sent.index(_DASH_LINK) < sent.index("manual execution required")
+
+    async def test_skip_message_links_to_its_own_signal(self) -> None:
+        store = _store()
+        store.create_signal = AsyncMock(return_value=_DASH_SIGNAL_ID)
+        notifier = _notifier()
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_ranging_series())),
+            store=store,
+            graph=_pipeline_graph(_client([]), _client([])),
+            notifier=notifier,
+            dashboard_base_url=_DASH_BASE,
+        )
+
+        assert _DASH_LINK in notifier.send.await_args.args[0]
+
+    async def test_a_scan_without_a_dashboard_url_sends_no_link(self) -> None:
+        notifier = _notifier()
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_bullish_series())),
+            store=_store(),
+            graph=_publishing_graph(),
+            notifier=notifier,
+            clock=_london_clock,
+        )
+
+        assert "dashboard" not in notifier.send.await_args.args[0]
+
+    async def test_a_url_that_is_not_https_never_becomes_a_link(self) -> None:
+        notifier = _notifier()
+
+        await run_one_symbol(
+            symbol="BTCUSDT",
+            provider=_provider(_snapshot(_bullish_series())),
+            store=_store(),
+            graph=_publishing_graph(),
+            notifier=notifier,
+            clock=_london_clock,
+            dashboard_base_url="http://insecure.example",
+        )
+
+        assert "dashboard" not in notifier.send.await_args.args[0]
 
     async def test_skip_persists_only_analyzer_and_notifies(self) -> None:
         provider = _provider(_snapshot(_ranging_series()))
@@ -864,6 +979,59 @@ class TestLambdaHandler:
 
         await _alambda({"symbol": "BTCUSDT"}, _settings())
         assert run.await_args.kwargs["session"] is None
+
+    async def test_dashboard_url_is_read_once_and_shared_by_every_symbol(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = self._ok_run()
+        self._patch(monkeypatch, run=run)
+        reader = MagicMock(return_value=_DASH_BASE)
+        monkeypatch.setattr(run_scan_module, "get_dashboard_base_url", reader)
+
+        await _alambda({"symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]}, _settings())
+
+        reader.assert_called_once_with()
+        assert [c.kwargs["dashboard_base_url"] for c in run.await_args_list] == [_DASH_BASE] * 4
+
+    async def test_no_dashboard_url_is_read_when_notifications_are_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run = self._ok_run()
+        self._patch(monkeypatch, run=run)
+        reader = MagicMock(return_value=_DASH_BASE)
+        monkeypatch.setattr(run_scan_module, "get_dashboard_base_url", reader)
+
+        await _alambda({"symbol": "BTCUSDT", "notify": False}, _settings())
+
+        reader.assert_not_called()
+        assert run.await_args.kwargs["dashboard_base_url"] is None
+
+    async def test_forecaster_mode_hands_the_dashboard_url_to_the_forecaster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        store = MagicMock()
+        store.aclose = AsyncMock()
+        provider = MagicMock()
+        provider.aclose = AsyncMock()
+        notifier = MagicMock()
+        notifier.aclose = AsyncMock()
+        client = MagicMock()
+        client.close = AsyncMock()
+        forecaster = MagicMock()
+        forecaster.run = AsyncMock(return_value=[])
+        forecaster_cls = MagicMock(return_value=forecaster)
+        monkeypatch.setattr(run_scan_module, "create_store", AsyncMock(return_value=store))
+        monkeypatch.setattr(run_scan_module, "BinanceProvider", MagicMock(return_value=provider))
+        monkeypatch.setattr(run_scan_module, "TelegramNotifier", MagicMock(return_value=notifier))
+        monkeypatch.setattr(run_scan_module, "AsyncAnthropic", MagicMock(return_value=client))
+        monkeypatch.setattr(run_scan_module, "Forecaster", forecaster_cls)
+        monkeypatch.setattr(
+            run_scan_module, "get_dashboard_base_url", MagicMock(return_value=_DASH_BASE)
+        )
+
+        await _alambda({"mode": "forecaster"}, _settings())
+
+        assert forecaster_cls.call_args.kwargs["dashboard_base_url"] == _DASH_BASE
 
     async def test_forecaster_mode_runs_forecaster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         store = MagicMock()

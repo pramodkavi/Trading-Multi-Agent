@@ -53,7 +53,7 @@ from src.common.models import (
     SetupEvaluationStatus,
     SignalStatus,
 )
-from src.notifications import format_forecaster_update
+from src.notifications import format_forecaster_update, signal_url
 from src.providers import Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -168,12 +168,14 @@ class Forecaster:
         notifier: Notifier | None = None,
         client: AsyncAnthropic | None = None,
         model: str = DEFAULT_MODEL,
+        dashboard_base_url: str | None = None,
     ) -> None:
         self._store = store
         self._provider = provider
         self._notifier = notifier
         self._client = client
         self._model = model
+        self._dashboard_base_url = dashboard_base_url
 
     async def run(self) -> list[ForecasterUpdate]:
         """Evaluate and act on every OPEN setup; returns the verdicts produced.
@@ -272,7 +274,7 @@ class Forecaster:
             # Broad on purpose: journaling must never cost the operator an alert.
             journal_error = exc
             logger.exception("failed to journal forecaster verdict for setup %s", setup.id)
-        await self._notify_verdict(proposal, update)
+        await self._notify_verdict(setup, proposal, update)
         if journal_error is not None:
             raise journal_error
         return update
@@ -347,7 +349,9 @@ class Forecaster:
                 evaluation=evaluation,
             )
 
-    async def _notify_verdict(self, proposal: SignalProposal, update: ForecasterUpdate) -> None:
+    async def _notify_verdict(
+        self, setup: StoredActiveSetup, proposal: SignalProposal, update: ForecasterUpdate
+    ) -> None:
         """Send the Telegram message for AT_RISK / INVALIDATED; STILL_VALID is silent.
 
         Runs last in :meth:`_evaluate_one`, after the verdict-row write was
@@ -357,4 +361,5 @@ class Forecaster:
         """
         if self._notifier is None or update.status is ForecastStatus.STILL_VALID:
             return
-        await self._notifier.send(format_forecaster_update(proposal, update))
+        link = signal_url(self._dashboard_base_url, setup.signal_id)
+        await self._notifier.send(format_forecaster_update(proposal, update, signal_url=link))
