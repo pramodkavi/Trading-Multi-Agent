@@ -24,7 +24,9 @@ from src.notifications.formatter import (
     format_forecaster_update,
     format_new_signal,
     format_skip,
+    link_line,
 )
+from src.notifications.links import signal_url
 from src.notifications.telegram import TelegramNotifier
 
 __all__ = [
@@ -40,4 +42,6 @@ __all__ = [
     "format_forecaster_update",
     "format_new_signal",
     "format_skip",
+    "link_line",
+    "signal_url",
 ]

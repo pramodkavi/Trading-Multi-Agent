@@ -61,6 +61,8 @@ from lambda_assets import ARCHITECTURE, RUNTIME, code_asset, deps_layer
 from stacks.parameters import (
     ANTHROPIC_PARAM_ENV,
     ANTHROPIC_PARAM_NAME,
+    DASHBOARD_BASE_URL_PARAM_NAME,
+    DASHBOARD_URL_PARAM_ENV,
     TELEGRAM_PARAM_ENV,
     TELEGRAM_PARAM_NAME,
 )
@@ -125,6 +127,9 @@ class ComputeStack(Stack):
                 # runtime via ssm:GetParameter (src/config/secrets.py).
                 ANTHROPIC_PARAM_ENV: ANTHROPIC_PARAM_NAME,
                 TELEGRAM_PARAM_ENV: TELEGRAM_PARAM_NAME,
+                # Step 4.7 Part B: the NAME of the plain-String parameter holding the
+                # dashboard URL (Telegram deep links); absent/unreadable = no link.
+                DASHBOARD_URL_PARAM_ENV: DASHBOARD_BASE_URL_PARAM_NAME,
                 "LOG_LEVEL": "INFO",
             },
             description=(
@@ -138,7 +143,8 @@ class ComputeStack(Stack):
         # RDS Data API to the one cluster + read of the cluster credentials
         # secret (grant_data_api_access bundles both).
         cluster.grant_data_api_access(self.function)
-        # Read-only the two SSM SecureString parameters the scan uses. The
+        # Read-only the two SSM SecureString parameters the scan uses, plus the plain
+        # String dashboard-URL parameter (Step 4.7 Part B; no decryption needed). The
         # default AWS-managed `aws/ssm` KMS key permits decryption to any
         # principal with ssm:GetParameter on the parameter, so no explicit
         # kms:Decrypt statement is required. ARNs are exact (no wildcard).
@@ -148,6 +154,7 @@ class ComputeStack(Stack):
                 resources=[
                     self._param_arn(ANTHROPIC_PARAM_NAME),
                     self._param_arn(TELEGRAM_PARAM_NAME),
+                    self._param_arn(DASHBOARD_BASE_URL_PARAM_NAME),
                 ],
             )
         )

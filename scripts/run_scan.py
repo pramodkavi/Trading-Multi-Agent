@@ -80,17 +80,21 @@ from src.common.models import (
     SkipDecision,
 )
 from src.config import get_settings, hydrate_secrets_env
+from src.config.dashboard_url import get_dashboard_base_url
 from src.notifications import (
     TelegramNotifier,
     escape_markdown_v2,
     format_new_signal,
     format_skip,
+    link_line,
 )
+from src.notifications import signal_url as build_signal_url
 from src.persistence import create_store, run_data_api_migration
 from src.providers import BinanceProvider, NoMacroData, ProviderError, Timeframe
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable, Sequence
+    from uuid import UUID
 
     from pydantic import BaseModel
 
@@ -212,8 +216,8 @@ async def _persist(
     ctx: ScanContext,
     symbol: str,
     state: AgentState,
-) -> None:
-    """Write the signal row and the per-agent reasoning chain (FR-1.7).
+) -> UUID:
+    """Write the signal row and the per-agent reasoning chain (FR-1.7); returns the signal id.
 
     The parent scan_runs row is created by the caller before the work starts
     (FK ordering); this writes the signal plus one agent_run per agent that
@@ -251,6 +255,7 @@ async def _persist(
     # will follow (only on PUBLISH / PUBLISH_WITH_CAVEAT; skips and vetoes don't).
     if isinstance(proposal, SignalProposal) and state.get("decision") in _PUBLISH_RULINGS:
         await store.open_active_setup(signal_id=signal_id)
+    return signal_id
 
 
 # ---------------------------------------------------------------------------
@@ -267,24 +272,26 @@ def _skeptic_fields(objection: object) -> tuple[str | None, str | None]:
     return (None, None)
 
 
-def _format_judge_skip(state: AgentState) -> str:
+def _format_judge_skip(state: AgentState, signal_url: str | None = None) -> str:
     """Operator note when the Judge vetoed a real proposal (decision == SKIP)."""
     proposal = state.get("proposal")
     judge_decision = state.get("judge_decision")
     symbol = proposal.symbol if isinstance(proposal, SignalProposal) else "?"
     reasoning = judge_decision.reasoning if judge_decision is not None else "Judge ruled SKIP."
-    return "\n".join(
-        [
-            "*\U0001f50e JUDGED SKIP*",
-            "",
-            f"*Symbol:* `{escape_markdown_v2(symbol)}`",
-            "",
-            f"*Why:* {escape_markdown_v2(reasoning)}",
-        ]
-    )
+    lines = [
+        "*\U0001f50e JUDGED SKIP*",
+        "",
+        f"*Symbol:* `{escape_markdown_v2(symbol)}`",
+        "",
+        f"*Why:* {escape_markdown_v2(reasoning)}",
+    ]
+    link = link_line(signal_url)
+    if link is not None:
+        lines.extend(["", link])
+    return "\n".join(lines)
 
 
-def compose_message(state: AgentState) -> str:
+def compose_message(state: AgentState, signal_url: str | None = None) -> str:
     """Build the Telegram MarkdownV2 body for the scan outcome.
 
     Shape is chosen from the Judge's ruling:
@@ -293,6 +300,9 @@ def compose_message(state: AgentState) -> str:
             Judge's caveat line.
         analyzer SkipDecision         -> a skip note.
         Judge veto on a real proposal -> a "judged skip" note.
+
+    ``signal_url`` (Step 4.7 Part B) is the dashboard page of this decision; every
+    message kind appends it as a link, and nothing changes when it is ``None``.
     """
     proposal = state.get("proposal")
     decision = state.get("decision")
@@ -313,13 +323,14 @@ def compose_message(state: AgentState) -> str:
             skeptic_objection=skeptic_text,
             skeptic_severity=severity,
             caveat=caveat,
+            signal_url=signal_url,
         )
 
     if isinstance(proposal, SkipDecision):
-        return format_skip(proposal)
+        return format_skip(proposal, signal_url=signal_url)
 
     # A SignalProposal the Judge ruled SKIP (or any other non-publish outcome).
-    return _format_judge_skip(state)
+    return _format_judge_skip(state, signal_url)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +361,7 @@ async def run_one_symbol(
     session: ScanSession | None = None,
     triggered_by: str = "scheduler",
     clock: Callable[[], datetime] | None = None,
+    dashboard_base_url: str | None = None,
 ) -> ScanContext:
     """Run one full scan for one symbol through the pipeline; returns its ScanContext.
 
@@ -372,6 +384,9 @@ async def run_one_symbol(
     If this symbol does not end up publishing (a Judge veto) or the scan fails,
     we release that reservation so it does not wrongly block a sibling symbol. A
     publish keeps the reservation — its active_setups row now reflects it.
+
+    ``dashboard_base_url`` (Step 4.7 Part B): when set, the Telegram message ends with a
+    link to this decision's dashboard page (``<base>/signals/<signal id>``).
     """
     now = (clock or _utcnow)()
     ctx = ScanContext(
@@ -413,7 +428,7 @@ async def run_one_symbol(
         decision = state.get("decision")
         logger.info("judge decision: %s", decision.value if decision else "UNKNOWN")
 
-        await _persist(store=store, ctx=ctx, symbol=symbol, state=state)
+        signal_id = await _persist(store=store, ctx=ctx, symbol=symbol, state=state)
         logger.info("persisted signal + reasoning chain for scan %s", ctx.scan_id)
 
         # Step 2.13: a reservation that did not become a published setup (the gate
@@ -423,7 +438,8 @@ async def run_one_symbol(
             await reservations.release(ctx.scan_id)
 
         if notifier is not None:
-            await notifier.send(compose_message(state))
+            link = build_signal_url(dashboard_base_url, signal_id)
+            await notifier.send(compose_message(state, signal_url=link))
             logger.info("telegram message sent")
 
         await store.complete_scan(scan_id=ctx.scan_id, completed_at=_utcnow())
@@ -462,6 +478,7 @@ async def _scan_symbol_isolated(
     reservations: ScanReservationLedger,
     session: ScanSession | None,
     triggered_by: str,
+    dashboard_base_url: str | None = None,
 ) -> dict[str, Any]:
     """Run one symbol and convert its outcome into a result entry, never raising.
 
@@ -482,6 +499,7 @@ async def _scan_symbol_isolated(
             reservations=reservations,
             session=session,
             triggered_by=triggered_by,
+            dashboard_base_url=dashboard_base_url,
         )
         return {"symbol": symbol, "scan_id": str(ctx.scan_id), "status": "ok"}
     except Exception as exc:
@@ -536,6 +554,8 @@ async def _run_symbols(
             if notify
             else None
         )
+        # Read once per scan run (cached per container); never raises -- no URL, no links.
+        dashboard_base_url = get_dashboard_base_url() if notify else None
         try:
             results = list(
                 await asyncio.gather(
@@ -549,6 +569,7 @@ async def _run_symbols(
                             reservations=reservations,
                             session=session,
                             triggered_by="scheduler",
+                            dashboard_base_url=dashboard_base_url,
                         )
                         for symbol in symbols
                     )
@@ -588,7 +609,11 @@ async def _run_forecaster(*, settings: Settings, notify: bool) -> dict[str, Any]
         )
         try:
             forecaster = Forecaster(
-                store=store, provider=provider, notifier=notifier, client=client
+                store=store,
+                provider=provider,
+                notifier=notifier,
+                client=client,
+                dashboard_base_url=get_dashboard_base_url() if notify else None,
             )
             updates = await forecaster.run()
         finally:

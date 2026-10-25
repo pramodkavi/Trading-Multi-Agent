@@ -581,3 +581,69 @@ def test_format_escapes_markdown() -> None:
         ForecasterUpdate(status=ForecastStatus.AT_RISK, reasoning="Price at 1.5 support now."),
     )
     assert "1\\.5" in msg  # the '.' must be escaped for MarkdownV2
+
+
+# ---------------------------------------------------------------------------
+# Step 4.7 Part B: dashboard deep links in Forecaster alerts
+# ---------------------------------------------------------------------------
+
+_DASH_BASE = "https://d111.cloudfront.net"
+
+
+def _linked_forecaster(
+    store: FakeStore, notifier: MagicMock, responses: list[Any], base: str | None = _DASH_BASE
+) -> Forecaster:
+    return Forecaster(
+        store=store,  # type: ignore[arg-type]
+        provider=_provider(_snapshot()),
+        notifier=notifier,
+        client=_client([_response(r) for r in responses]),
+        dashboard_base_url=base,
+    )
+
+
+async def test_at_risk_alert_links_to_the_setups_own_signal() -> None:
+    signal = _stored_signal(_proposal())
+    store = FakeStore([_setup(signal.id)], {signal.id: signal})
+    notifier = _notifier()
+
+    await _linked_forecaster(store, notifier, [_AT_RISK]).run()
+
+    sent = notifier.send.await_args.args[0]
+    assert f"[Open in dashboard]({_DASH_BASE}/signals/{signal.id})" in sent
+
+
+async def test_each_alert_carries_the_link_of_its_own_signal() -> None:
+    first = _stored_signal(_proposal("BTCUSDT"))
+    second = _stored_signal(_proposal("ETHUSDT"))
+    store = FakeStore([_setup(first.id), _setup(second.id)], {first.id: first, second.id: second})
+    notifier = _notifier()
+
+    await _linked_forecaster(store, notifier, [_AT_RISK, _INVALIDATED_LOSS]).run()
+
+    sent = [call.args[0] for call in notifier.send.await_args_list]
+    assert f"/signals/{first.id})" in sent[0] and str(second.id) not in sent[0]
+    assert f"/signals/{second.id})" in sent[1] and str(first.id) not in sent[1]
+
+
+async def test_still_valid_stays_silent_even_with_a_dashboard_url() -> None:
+    signal = _stored_signal(_proposal())
+    store = FakeStore([_setup(signal.id)], {signal.id: signal})
+    notifier = _notifier()
+
+    await _linked_forecaster(store, notifier, [_STILL_VALID]).run()
+
+    notifier.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("base", [None, "http://insecure.example", ""])
+async def test_no_usable_dashboard_url_means_an_unchanged_alert(base: str | None) -> None:
+    signal = _stored_signal(_proposal())
+    store = FakeStore([_setup(signal.id)], {signal.id: signal})
+    notifier = _notifier()
+
+    updates = await _linked_forecaster(store, notifier, [_AT_RISK], base).run()
+
+    sent = notifier.send.await_args.args[0]
+    assert "dashboard" not in sent
+    assert sent == format_forecaster_update(signal.as_proposal(), updates[0])
