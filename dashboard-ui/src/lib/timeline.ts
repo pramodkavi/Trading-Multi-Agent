@@ -21,6 +21,9 @@ export interface TimelineStep {
   summary: string;
   /** Set for steps backed by an `agent_runs` row: the full output is fetched by this id. */
   runId: string | null;
+  /** LLM accounting for agent steps and Forecaster evaluations; null for derived steps. */
+  latencyMs: number | null;
+  costUsd: number | null;
   details: Record<string, unknown> | null;
 }
 
@@ -56,6 +59,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
           )} · R:R ${text(s.risk_reward_ratio)}`
         : `${text(s.reason)}${s.details ? ` — ${String(s.details)}` : ""}`,
       runId: analyzer.run_id,
+      latencyMs: analyzer.latency_ms,
+      costUsd: analyzer.cost_usd,
       details: s,
     });
   }
@@ -70,6 +75,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
       at: null,
       summary: [sig.violated_rule, sig.skip_details].filter(Boolean).join(": ") || "Rejected by a hard rule",
       runId: null,
+      latencyMs: null,
+      costUsd: null,
       details: null,
     });
   }
@@ -88,6 +95,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
         "0",
       )} W / ${text(s.losses, "0")} L)`,
       runId: historian.run_id,
+      latencyMs: historian.latency_ms,
+      costUsd: historian.cost_usd,
       details: s,
     });
   }
@@ -109,6 +118,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
       at: skeptic.created_at,
       summary: noMacro ? "Macro data unavailable" : `${text(s.severity)} — ${text(s.headline)}`,
       runId: skeptic.run_id,
+      latencyMs: skeptic.latency_ms,
+      costUsd: skeptic.cost_usd,
       details: s,
     });
   }
@@ -124,6 +135,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
       at: judge.created_at,
       summary: `${text(s.ruling)} (confidence ${text(s.confidence)})${s.caveat ? ` — ${String(s.caveat)}` : ""}`,
       runId: judge.run_id,
+      latencyMs: judge.latency_ms,
+      costUsd: judge.cost_usd,
       details: s,
     });
   }
@@ -141,6 +154,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
       at: e.evaluated_at,
       summary: e.status === "ERROR" ? text(e.error) : text(e.reasoning),
       runId: null,
+      latencyMs: e.latency_ms,
+      costUsd: e.cost_usd,
       details: { ...e },
     });
   }
@@ -154,6 +169,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
       at: l.resolution.resolved_at,
       summary: `${l.resolution.outcome} · ${formatR(l.resolution.realized_r)}`,
       runId: null,
+      latencyMs: null,
+      costUsd: null,
       details: { ...l.resolution },
     });
   } else if (sig.outcome) {
@@ -165,6 +182,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
       at: null,
       summary: sig.outcome,
       runId: null,
+      latencyMs: null,
+      costUsd: null,
       details: sig.outcome_metadata,
     });
   }
@@ -181,6 +200,8 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
         ? `Review failed: ${text(l.review.error)}`
         : text(l.review.review.lesson, "Reviewed"),
       runId: null,
+      latencyMs: null,
+      costUsd: l.review.cost_usd,
       details: l.review.review,
     });
   }

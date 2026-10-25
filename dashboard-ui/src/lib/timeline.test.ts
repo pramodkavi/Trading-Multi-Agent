@@ -111,6 +111,18 @@ describe("buildTimeline", () => {
     expect(review?.summary).toContain("timeout");
   });
 
+  it("carries latency and cost for agent steps and evaluations, null elsewhere", () => {
+    const steps = buildTimeline(makeLifecycle());
+    const skeptic = steps.find((s) => s.kind === "skeptic");
+    expect(skeptic?.latencyMs).toBe(1200);
+    expect(skeptic?.costUsd).toBe(0.0123);
+    expect(steps.find((s) => s.kind === "analyzer")?.costUsd).toBeNull();
+    const forecast = steps.find((s) => s.kind === "forecast");
+    expect(forecast?.latencyMs).toBe(900);
+    expect(forecast?.costUsd).toBe(0.004);
+    expect(steps.find((s) => s.kind === "outcome")?.latencyMs).toBeNull();
+  });
+
   it("ignores critic agent runs (the review step comes from the review row)", () => {
     const l = makeLifecycle();
     l.steps.push(makeStep("critic", { lesson: "x" }, 5));
