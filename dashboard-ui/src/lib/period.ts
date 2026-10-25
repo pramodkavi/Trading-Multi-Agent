@@ -13,3 +13,9 @@ export function periodSince(days: PeriodDays, now: Date = new Date()): string {
   const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   return new Date(midnight - days * DAY_MS).toISOString().replace(".000Z", "Z");
 }
+
+/** A period from a URL value: exactly `7`, `30` or `90`, else the page's default. */
+export function parsePeriod(raw: string | null, fallback: PeriodDays): PeriodDays {
+  const match = PERIODS.find((d) => String(d) === raw);
+  return match ?? fallback;
+}

@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import { Boot } from "./App";
 import { SESSION_STORAGE_KEY, SIGNED_OUT_KEY } from "./auth/SplitTokenStore";
 import { ConfigError, loadConfig, type DashboardConfig } from "./config";
-import { healthRoutes, makeLifecycle, makeOverview, SIGNAL_ID } from "./test/fixtures";
+import { healthRoutes, makeFunnel, makeLifecycle, makeOverview, SIGNAL_ID } from "./test/fixtures";
 
 const mocks = vi.hoisted(() => ({
   auth: {} as Record<string, unknown>,
@@ -62,6 +62,7 @@ function stubApi(health: unknown = { status: "ok", version: "deadbeefcafe" }): v
       let body: unknown = { db: "ok", latency_ms: 9 };
       if (url.endsWith("/health")) body = health;
       else if (url.endsWith("/overview")) body = makeOverview();
+      else if (url.includes("/funnel")) body = makeFunnel();
       else if (/\/signals\/[0-9a-f-]{36}$/.test(url)) body = makeLifecycle();
       else if (url.includes("/signals")) body = { items: [], next_cursor: null };
       else {
@@ -154,6 +155,14 @@ describe("App", () => {
     expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
   });
 
+  it("route /funnel renders the funnel, not the placeholder", async () => {
+    mocks.auth = signedIn();
+    renderAt("/funnel");
+    expect(await screen.findByRole("heading", { level: 1, name: "Funnel" })).toBeInTheDocument();
+    expect(await screen.findByRole("list", { name: "Funnel stages" })).toBeInTheDocument();
+    expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
+  });
+
   it("route /signals/:id renders the decision detail", async () => {
     mocks.auth = signedIn();
     renderAt(`/signals/${SIGNAL_ID}`);
@@ -178,7 +187,6 @@ describe("App", () => {
   });
 
   it.each([
-    ["/funnel", "Funnel", "4.8"],
     ["/analytics", "Analytics", "4.8"],
     ["/markets", "Markets", "4.9"],
   ])("route %s renders the %s placeholder", async (path, title, step) => {

@@ -1,4 +1,18 @@
-import { PERIODS, periodSince } from "./period";
+import { PERIODS, parsePeriod, periodSince } from "./period";
+
+describe("parsePeriod", () => {
+  it("accepts 7, 30 and 90 and nothing else", () => {
+    expect(parsePeriod("7", 30)).toBe(7);
+    expect(parsePeriod("90", 30)).toBe(90);
+    expect(parsePeriod("30", 90)).toBe(30);
+  });
+
+  it("falls back for missing, unknown or malformed values", () => {
+    for (const bad of [null, "", "bogus", "15", "7.5", "-7", " 7", "7 "]) {
+      expect(parsePeriod(bad, 30)).toBe(30);
+    }
+  });
+});
 
 describe("periodSince", () => {
   it("is UTC midnight N days before now", () => {
