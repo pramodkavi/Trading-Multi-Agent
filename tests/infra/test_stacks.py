@@ -1168,3 +1168,82 @@ def test_app_requires_spa_dist(tmp_path: Path) -> None:
         app_module.resolve_spa_dist(tmp_path)
     (tmp_path / "dashboard-ui" / "dist" / "index.html").write_text("<html></html>", "utf-8")
     assert app_module.resolve_spa_dist(tmp_path) == tmp_path / "dashboard-ui" / "dist"
+
+
+# ---------------------------------------------------------------------------
+# Step 4.7 Part B: the dashboard URL reaches the scan Lambda for Telegram deep links
+# (design §7: a static SSM parameter, no cross-stack reference in either direction)
+# ---------------------------------------------------------------------------
+
+DASHBOARD_URL_PARAM = "/crypto-signals/dashboard-base-url"
+
+
+def _compute_ssm_statements(templates: dict[str, Any]) -> list[dict[str, Any]]:
+    policies = templates["compute"].find_resources("AWS::IAM::Policy")
+    out: list[dict[str, Any]] = []
+    for policy in policies.values():
+        for statement in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = statement["Action"]
+            if "ssm:GetParameter" in (actions if isinstance(actions, list) else [actions]):
+                out.append(statement)
+    return out
+
+
+def test_dashboard_stack_publishes_its_url_as_a_plain_ssm_string(
+    templates: dict[str, Any],
+) -> None:
+    params = templates["dashboard"].find_resources("AWS::SSM::Parameter")
+    assert len(params) == 1
+    props = next(iter(params.values()))["Properties"]
+    assert props["Name"] == DASHBOARD_URL_PARAM
+    assert props["Type"] == "String"  # CloudFormation cannot create SecureString
+    assert props["Tier"] == "Standard"
+    # The value is the CloudFront origin: https:// + the distribution's domain name.
+    value = json.dumps(props["Value"])
+    assert "https://" in value and "DomainName" in value
+
+
+def test_scan_lambda_is_given_the_url_parameter_name(templates: dict[str, Any]) -> None:
+    templates["compute"].has_resource_properties(
+        "AWS::Lambda::Function",
+        {
+            "Environment": {
+                "Variables": assertions.Match.object_like(
+                    {"DASHBOARD_URL_PARAM_NAME": DASHBOARD_URL_PARAM}
+                )
+            }
+        },
+    )
+
+
+def test_scan_role_reads_exactly_the_three_named_parameters(templates: dict[str, Any]) -> None:
+    statements = _compute_ssm_statements(templates)
+    assert len(statements) == 1, "one shared read-only SSM statement"
+    resources = statements[0]["Resource"]
+    rendered = [json.dumps(r) for r in (resources if isinstance(resources, list) else [resources])]
+    assert len(rendered) == 3
+    for suffix in (
+        "parameter/crypto-signals/anthropic-api-key",
+        "parameter/crypto-signals/telegram-bot-token",
+        "parameter/crypto-signals/dashboard-base-url",
+    ):
+        assert sum(suffix in r for r in rendered) == 1, suffix
+    assert not any('"*"' in r or r.rstrip('"}]').endswith("*") for r in rendered)
+    assert statements[0]["Effect"] == "Allow"
+
+
+def test_no_cross_stack_reference_for_the_dashboard_url(templates: dict[str, Any]) -> None:
+    compute = json.dumps(templates["compute"].to_json())
+    assert "Dashboard:" not in compute, "Compute must not import anything from Dashboard"
+    dashboard = templates["dashboard"].to_json()
+    exported = [name for name, out in dashboard.get("Outputs", {}).items() if "Export" in out]
+    assert exported == [], "Dashboard must not export values for other stacks"
+
+
+def test_env_var_name_matches_the_app_constant() -> None:
+    from stacks.parameters import DASHBOARD_BASE_URL_PARAM_NAME, DASHBOARD_URL_PARAM_ENV
+
+    from src.config.dashboard_url import DASHBOARD_URL_PARAM_NAME_ENV
+
+    assert DASHBOARD_URL_PARAM_ENV == DASHBOARD_URL_PARAM_NAME_ENV
+    assert DASHBOARD_BASE_URL_PARAM_NAME == DASHBOARD_URL_PARAM

@@ -111,9 +111,12 @@ from aws_cdk import aws_logs as logs
 from aws_cdk import aws_rds as rds
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_s3_deployment as s3deploy
+from aws_cdk import aws_ssm as ssm
 from cdk_nag import NagSuppressions
 from constructs import Construct
 from lambda_assets import ARCHITECTURE, RUNTIME, code_asset, deps_layer
+
+from stacks.parameters import DASHBOARD_BASE_URL_PARAM_NAME
 
 # FastAPI + Mangum cold start comfortably fits 512 MB; the scan Lambda's 1024 MB
 # is sized for the agent pipeline, not a request handler.
@@ -473,6 +476,17 @@ class DashboardStack(Stack):
         )
         # Step 4.5: the web app.
         CfnOutput(self, "DashboardUrl", value=spa_origin)
+        # Step 4.7 Part B (design §7): publish the origin under a STATIC parameter name so the
+        # scan Lambda can put deep links in Telegram alerts without any cross-stack reference.
+        # A plain String (CloudFormation cannot create SecureString), standard tier (free).
+        ssm.StringParameter(
+            self,
+            "DashboardBaseUrlParameter",
+            parameter_name=DASHBOARD_BASE_URL_PARAM_NAME,
+            string_value=spa_origin,
+            tier=ssm.ParameterTier.STANDARD,
+            description="Dashboard CloudFront origin (Telegram deep links in the scan Lambda).",
+        )
         CfnOutput(self, "DashboardDistributionId", value=self.distribution.distribution_id)
         CfnOutput(self, "DashboardSpaBucketName", value=self.spa_bucket.bucket_name)
 

@@ -33,8 +33,16 @@ TELEGRAM_PARAM_NAME = f"{SSM_PARAM_PREFIX}/telegram-bot-token"
 FRED_PARAM_NAME = f"{SSM_PARAM_PREFIX}/fred-api-key"
 TWELVE_DATA_PARAM_NAME = f"{SSM_PARAM_PREFIX}/twelve-data-api-key"
 
+# Step 4.7 Part B (design §7): the one NON-secret parameter. ``DashboardStack`` writes its
+# CloudFront origin here as a plain ``String`` (CloudFormation can create those); ``ComputeStack``
+# grants the scan Lambda read on this static name and passes the name in an env var. Neither
+# stack references the other -- the contract is just this name.
+DASHBOARD_BASE_URL_PARAM_NAME = f"{SSM_PARAM_PREFIX}/dashboard-base-url"
+
 # Env-var names the application's secret-hydration layer (src/config/secrets.py)
 # reads to learn WHICH parameter to fetch. The Lambda is given the parameter
 # *names* here; the secret *values* are fetched at runtime, never baked in.
 ANTHROPIC_PARAM_ENV = "ANTHROPIC_PARAM_NAME"
 TELEGRAM_PARAM_ENV = "TELEGRAM_PARAM_NAME"
+# Must equal ``src.config.dashboard_url.DASHBOARD_URL_PARAM_NAME_ENV`` (a test pins it).
+DASHBOARD_URL_PARAM_ENV = "DASHBOARD_URL_PARAM_NAME"
