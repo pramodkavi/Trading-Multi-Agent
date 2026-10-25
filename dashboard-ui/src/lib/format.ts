@@ -1,5 +1,28 @@
 const pad2 = (n: number) => String(n).padStart(2, "0");
 
+function utcParts(iso: string): { month: string; day: string; hh: string; mm: string } | null {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return {
+    month: pad2(d.getUTCMonth() + 1),
+    day: pad2(d.getUTCDate()),
+    hh: pad2(d.getUTCHours()),
+    mm: pad2(d.getUTCMinutes()),
+  };
+}
+
+/** `08:03` — the UTC wall-clock time of an ISO instant; `—` when unparseable. */
+export function formatUtcTime(iso: string): string {
+  const p = utcParts(iso);
+  return p ? `${p.hh}:${p.mm}` : "—";
+}
+
+/** `10-25 08:03` — UTC month-day and time; `—` when unparseable. */
+export function formatUtcDateTime(iso: string): string {
+  const p = utcParts(iso);
+  return p ? `${p.month}-${p.day} ${p.hh}:${p.mm}` : "—";
+}
+
 /** `+1.25 R` / `−0.40 R` (true minus) / `—` when unknown. */
 export function formatR(r: number | null): string {
   if (r === null || !Number.isFinite(r)) return "—";

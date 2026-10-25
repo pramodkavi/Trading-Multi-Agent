@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { Boot } from "./App";
 import { SESSION_STORAGE_KEY, SIGNED_OUT_KEY } from "./auth/SplitTokenStore";
 import { ConfigError, loadConfig, type DashboardConfig } from "./config";
+import { makeOverview } from "./test/fixtures";
 
 const mocks = vi.hoisted(() => ({
   auth: {} as Record<string, unknown>,
@@ -58,7 +59,10 @@ function stubApi(health: unknown = { status: "ok", version: "deadbeefcafe" }): v
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string) => {
-      const body = url.endsWith("/health") ? health : { db: "ok", latency_ms: 9 };
+      let body: unknown = { db: "ok", latency_ms: 9 };
+      if (url.endsWith("/health")) body = health;
+      else if (url.endsWith("/overview")) body = makeOverview();
+      else if (url.includes("/signals")) body = { items: [], next_cursor: null };
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -136,8 +140,15 @@ describe("App", () => {
     expect(screen.getByRole("status")).toHaveTextContent("vdeadbee");
   });
 
+  it("route / renders the Overview page, not the placeholder", async () => {
+    mocks.auth = signedIn();
+    renderAt("/");
+    expect(await screen.findByRole("heading", { level: 1, name: "Overview" })).toBeInTheDocument();
+    expect(await screen.findByText("Open setups 1 / 3")).toBeInTheDocument();
+    expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
+  });
+
   it.each([
-    ["/", "Overview", "4.6"],
     ["/signals", "Signals", "4.7"],
     ["/funnel", "Funnel", "4.8"],
     ["/analytics", "Analytics", "4.8"],

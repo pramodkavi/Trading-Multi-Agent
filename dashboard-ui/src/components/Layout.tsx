@@ -6,18 +6,10 @@ import { dbProbeKey, healthKey, useDbProbe, useHealth } from "../api/queries";
 import { signOut } from "../auth/oidcSettings";
 import type { DashboardConfig } from "../config";
 import { formatAgo } from "../lib/apiStatus";
+import { useNow } from "../lib/useNow";
 import { buttonClass } from "./ErrorPage";
 import { Nav } from "./Nav";
 import { StatusChip } from "./StatusChip";
-
-function useNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(id);
-  }, [intervalMs]);
-  return now;
-}
 
 function MenuIcon({ open }: { open: boolean }) {
   return (

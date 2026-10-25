@@ -1,4 +1,24 @@
-import { formatAge, formatCountdown, formatDuration, formatR, truncate } from "./format";
+import {
+  formatAge,
+  formatCountdown,
+  formatDuration,
+  formatR,
+  formatUtcDateTime,
+  formatUtcTime,
+  truncate,
+} from "./format";
+
+describe("UTC time formatting", () => {
+  it("formats an ISO instant as UTC wall-clock text", () => {
+    expect(formatUtcTime("2026-10-25T08:03:00Z")).toBe("08:03");
+    expect(formatUtcDateTime("2026-10-25T08:03:00Z")).toBe("10-25 08:03");
+  });
+
+  it("shows a dash for an unparseable instant", () => {
+    expect(formatUtcTime("not a date")).toBe("—");
+    expect(formatUtcDateTime("")).toBe("—");
+  });
+});
 
 describe("formatR", () => {
   it("signs the multiple and uses a true minus", () => {
