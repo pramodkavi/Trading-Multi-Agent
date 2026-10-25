@@ -305,3 +305,139 @@ export interface ConfigResponse {
   langfuse_configured: Inferred<boolean>;
   schedule: ScheduleOut;
 }
+
+// -- Decision funnel (P4) --------------------------------------------------------
+
+export type FunnelGroupBy = "day" | "window" | "symbol";
+
+export interface FunnelGroup {
+  key: string;
+  scans: number;
+  symbols_scanned: number;
+  proposals: number;
+  gate_rejected: number;
+  gate_passed: number;
+  judge_publish: number;
+  judge_caveat: number;
+  judge_skip: number;
+  judge_none: number;
+  published: number;
+  rejections_by_rule: Record<string, number>;
+}
+
+export interface RejectionCount {
+  rule: string;
+  count: number;
+}
+
+export interface FunnelResponse {
+  since: string;
+  until: string;
+  group_by: FunnelGroupBy;
+  groups: FunnelGroup[];
+  totals: FunnelGroup;
+  top_rejections_7d: RejectionCount[];
+  top_rejections_30d: RejectionCount[];
+}
+
+// -- Performance analytics (P6) and the Critic -------------------------------------
+
+export type WinRateBy = "tag" | "session" | "strategy" | "time";
+
+export interface SourceCounts {
+  replayed: number;
+  forecaster: number;
+}
+
+export interface WinRateBucket {
+  key: string;
+  wins: number;
+  losses: number;
+  decisive: number;
+  win_rate: number | null;
+  n: number;
+}
+
+export interface WinRateResponse {
+  since: string;
+  until: string;
+  by: WinRateBy;
+  buckets: WinRateBucket[];
+  source_counts: SourceCounts;
+}
+
+export interface SkepticBucket {
+  n: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+}
+
+export interface SkepticValueResponse {
+  since: string;
+  until: string;
+  respected: SkepticBucket;
+  overruled_with_caveat: SkepticBucket;
+  overruled: SkepticBucket;
+  no_macro_data_excluded: number;
+  unruled: number;
+  source_counts: SourceCounts;
+}
+
+export interface EquityPoint {
+  signal_id: string;
+  at: string;
+  r: number;
+  cumulative_r: number;
+  source: "replayed" | "forecaster";
+}
+
+export interface EquityCurveResponse {
+  since: string;
+  until: string;
+  published: EquityPoint[];
+  vetoed: EquityPoint[];
+  gate_rejected: EquityPoint[];
+  source_counts: SourceCounts;
+}
+
+export interface CriticReportSummary {
+  id: string;
+  period_start: string;
+  period_end: string;
+  created_at: string;
+  pr_url: string | null;
+  summary: string | null;
+}
+
+export interface CriticReportsPage {
+  items: CriticReportSummary[];
+}
+
+export interface CriticReportOut {
+  id: string;
+  period_start: string;
+  period_end: string;
+  report: Record<string, unknown>;
+  markdown: string;
+  pr_url: string | null;
+  created_at: string;
+}
+
+export interface ReviewSummary {
+  signal_id: string;
+  decision_kind: string;
+  failure_category: string | null;
+  lesson: string | null;
+  judge_correct: boolean | null;
+  gate_correct: boolean | null;
+  skeptic_vindicated: string | null;
+  confidence: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+export interface ReviewsPage {
+  items: ReviewSummary[];
+  next_cursor: string | null;
+}

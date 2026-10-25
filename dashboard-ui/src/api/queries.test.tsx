@@ -9,11 +9,18 @@ import {
   shouldRetry,
   useAgents,
   useAgentRun,
+  useCriticReport,
+  useCriticReports,
+  useCriticReviews,
+  useEquityCurve,
+  useFunnel,
   useMetrics,
   useOverview,
   useRecentSignals,
   useSignal,
   useSignalsJournal,
+  useSkepticValue,
+  useWinRate,
 } from "./queries";
 
 describe("endpoint hooks", () => {
@@ -207,5 +214,84 @@ describe("journal and detail hooks", () => {
     rerender({ on: true });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(urls).toEqual(["/api/signals/sig-1/runs/run-1"]);
+  });
+});
+
+describe("funnel, analytics and critic hooks", () => {
+  const urls: string[] = [];
+
+  beforeEach(() => {
+    urls.length = 0;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-25T10:00:00Z"));
+    configureApi({
+      apiBase: "/api",
+      auth: {
+        getUser: async () => ({ access_token: "t", expired: false }),
+        signinSilent: async () => null,
+        signinRedirect: async () => undefined,
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        urls.push(url);
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    resetApiForTests();
+  });
+
+  const wrapper = ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={createQueryClient()}>{children}</QueryClientProvider>
+  );
+
+  it("useFunnel sends a midnight since and the grouping, never an until", async () => {
+    const { result } = renderHook(() => useFunnel(30, "window"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(urls).toEqual(["/api/funnel?since=2026-09-25T00%3A00%3A00Z&group_by=window"]);
+  });
+
+  it("useWinRate sends since and the bucket key", async () => {
+    const { result } = renderHook(() => useWinRate(90, "time"), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(urls).toEqual(["/api/analytics/win-rate?since=2026-07-27T00%3A00%3A00Z&by=time"]);
+  });
+
+  it("useSkepticValue and useEquityCurve send since only", async () => {
+    const a = renderHook(() => useSkepticValue(7), { wrapper });
+    const b = renderHook(() => useEquityCurve(7), { wrapper });
+    await waitFor(() => expect(a.result.current.isSuccess && b.result.current.isSuccess).toBe(true));
+    expect(urls.sort()).toEqual([
+      "/api/analytics/equity-curve?since=2026-10-18T00%3A00%3A00Z",
+      "/api/analytics/skeptic-value?since=2026-10-18T00%3A00%3A00Z",
+    ]);
+  });
+
+  it("critic hooks request their lists with limits", async () => {
+    const a = renderHook(() => useCriticReports(5), { wrapper });
+    const b = renderHook(() => useCriticReviews(10), { wrapper });
+    await waitFor(() => expect(a.result.current.isSuccess && b.result.current.isSuccess).toBe(true));
+    expect(urls.sort()).toEqual(["/api/critic/reports?limit=5", "/api/critic/reviews?limit=10"]);
+  });
+
+  it("useCriticReport fetches only when enabled", async () => {
+    const { result, rerender } = renderHook(({ on }) => useCriticReport("r1", on), {
+      wrapper,
+      initialProps: { on: false },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(urls).toEqual([]);
+    rerender({ on: true });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(urls).toEqual(["/api/critic/reports/r1"]);
   });
 });
