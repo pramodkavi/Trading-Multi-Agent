@@ -1,4 +1,33 @@
-import { toApiQuery } from "./journalFilters";
+import { filtersToParams, parseFilters, toApiQuery } from "./journalFilters";
+
+describe("parseFilters / filtersToParams", () => {
+  it("round-trips every key", () => {
+    const filters = {
+      since: "2026-10-01",
+      until: "2026-10-25",
+      symbol: "BTCUSDT",
+      kind: "VETOED",
+      outcome: "WIN",
+      tag: "htf-bias",
+      session: "LONDON",
+      violated_rule: "RULE_2_MIN_RR",
+    } as const;
+    expect(parseFilters(filtersToParams(filters))).toEqual(filters);
+  });
+
+  it("drops unknown keys, empty values and bad enum values", () => {
+    const params = new URLSearchParams("foo=1&kind=bogus&outcome=&symbol=&tag=x");
+    expect(parseFilters(params)).toEqual({ tag: "x" });
+  });
+
+  it("drops dates that do not parse", () => {
+    expect(parseFilters(new URLSearchParams("since=2026-13-45&until=nope"))).toEqual({});
+  });
+
+  it("trims and upper-cases the symbol", () => {
+    expect(parseFilters(new URLSearchParams("symbol=%20btcusdt%20"))).toEqual({ symbol: "BTCUSDT" });
+  });
+});
 
 describe("toApiQuery", () => {
   it("orders keys fixed, ends with limit, and omits empty filters", () => {
