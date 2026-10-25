@@ -1,6 +1,6 @@
 import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
 import { UserManager, type User } from "oidc-client-ts";
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { AuthProvider } from "react-oidc-context";
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import { configureApi } from "./api/client";
@@ -11,14 +11,20 @@ import { buildOidcSettings, safeReturnPath } from "./auth/oidcSettings";
 import { ErrorPage, FullPageMessage } from "./components/ErrorPage";
 import { Layout } from "./components/Layout";
 import { ConfigError, loadConfig, type DashboardConfig } from "./config";
-import AnalyticsPage from "./pages/AnalyticsPage";
-import FunnelPage from "./pages/FunnelPage";
 import HealthPage from "./pages/HealthPage";
 import MarketsPage from "./pages/MarketsPage";
 import NotFoundPage from "./pages/NotFoundPage";
 import OverviewPage from "./pages/OverviewPage";
 import SignalDetailPage from "./pages/SignalDetailPage";
 import SignalsPage from "./pages/SignalsPage";
+
+// The two chart pages pull in Recharts (~100 KB gzipped); load them only when opened.
+const FunnelPage = lazy(() => import("./pages/FunnelPage"));
+const AnalyticsPage = lazy(() => import("./pages/AnalyticsPage"));
+
+function PageLoading() {
+  return <p className="text-sm text-slate-700 dark:text-slate-300">Loading…</p>;
+}
 
 interface Runtime {
   config: DashboardConfig;
@@ -50,8 +56,22 @@ export function App({ runtime }: { runtime: Runtime }) {
                 <Route index element={<OverviewPage />} />
                 <Route path="signals" element={<SignalsPage />} />
                 <Route path="signals/:id" element={<SignalDetailPage />} />
-                <Route path="funnel" element={<FunnelPage />} />
-                <Route path="analytics" element={<AnalyticsPage />} />
+                <Route
+                  path="funnel"
+                  element={
+                    <Suspense fallback={<PageLoading />}>
+                      <FunnelPage />
+                    </Suspense>
+                  }
+                />
+                <Route
+                  path="analytics"
+                  element={
+                    <Suspense fallback={<PageLoading />}>
+                      <AnalyticsPage />
+                    </Suspense>
+                  }
+                />
                 <Route path="markets" element={<MarketsPage />} />
                 <Route path="health" element={<HealthPage />} />
                 <Route path="*" element={<NotFoundPage />} />

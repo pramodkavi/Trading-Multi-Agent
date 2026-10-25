@@ -4,7 +4,18 @@ import type { ReactNode } from "react";
 import { Boot } from "./App";
 import { SESSION_STORAGE_KEY, SIGNED_OUT_KEY } from "./auth/SplitTokenStore";
 import { ConfigError, loadConfig, type DashboardConfig } from "./config";
-import { healthRoutes, makeLifecycle, makeOverview, SIGNAL_ID } from "./test/fixtures";
+import {
+  healthRoutes,
+  makeCriticReports,
+  makeEquity,
+  makeFunnel,
+  makeLifecycle,
+  makeOverview,
+  makeReviews,
+  makeSkeptic,
+  makeWinRate,
+  SIGNAL_ID,
+} from "./test/fixtures";
 
 const mocks = vi.hoisted(() => ({
   auth: {} as Record<string, unknown>,
@@ -62,6 +73,12 @@ function stubApi(health: unknown = { status: "ok", version: "deadbeefcafe" }): v
       let body: unknown = { db: "ok", latency_ms: 9 };
       if (url.endsWith("/health")) body = health;
       else if (url.endsWith("/overview")) body = makeOverview();
+      else if (url.includes("/funnel")) body = makeFunnel();
+      else if (url.includes("/analytics/win-rate")) body = makeWinRate();
+      else if (url.includes("/analytics/skeptic-value")) body = makeSkeptic();
+      else if (url.includes("/analytics/equity-curve")) body = makeEquity();
+      else if (url.includes("/critic/reports")) body = makeCriticReports();
+      else if (url.includes("/critic/reviews")) body = makeReviews();
       else if (/\/signals\/[0-9a-f-]{36}$/.test(url)) body = makeLifecycle();
       else if (url.includes("/signals")) body = { items: [], next_cursor: null };
       else {
@@ -154,6 +171,27 @@ describe("App", () => {
     expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
   });
 
+  // The chart pages are lazy chunks; the first import of Recharts is slow under Vitest.
+  it("route /funnel renders the funnel, not the placeholder", async () => {
+    mocks.auth = signedIn();
+    renderAt("/funnel");
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Funnel" }, { timeout: 15_000 }),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole("list", { name: "Funnel stages" })).toBeInTheDocument();
+    expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
+  }, 30_000);
+
+  it("route /analytics renders the analytics page, not the placeholder", async () => {
+    mocks.auth = signedIn();
+    renderAt("/analytics");
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Analytics" }, { timeout: 15_000 }),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole("table", { name: /win rate by tag/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
+  }, 30_000);
+
   it("route /signals/:id renders the decision detail", async () => {
     mocks.auth = signedIn();
     renderAt(`/signals/${SIGNAL_ID}`);
@@ -178,8 +216,6 @@ describe("App", () => {
   });
 
   it.each([
-    ["/funnel", "Funnel", "4.8"],
-    ["/analytics", "Analytics", "4.8"],
     ["/markets", "Markets", "4.9"],
   ])("route %s renders the %s placeholder", async (path, title, step) => {
     mocks.auth = signedIn();

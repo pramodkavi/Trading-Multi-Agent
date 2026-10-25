@@ -7,3 +7,39 @@
     @apply bg-slate-50 text-slate-900 antialiased dark:bg-slate-950 dark:text-slate-100;
   }
 }
+
+/*
+ * Chart palette (Step 4.8): the dataviz skill's validated reference palette, categorical slots
+ * 1-5 (blue, orange, aqua, yellow, magenta) plus a muted "Other". `validate_palette.js`: light
+ * and dark pass every hard gate; the light mode contrast WARN (aqua, yellow, magenta < 3:1 on the
+ * surface) is relieved by always showing a legend and a data table. Dark mode follows the OS.
+ */
+:root {
+  --viz-series-1: #2a78d6;
+  --viz-series-2: #eb6834;
+  --viz-series-3: #1baf7a;
+  --viz-series-4: #eda100;
+  --viz-series-5: #e87ba4;
+  --viz-other: #898781;
+  --viz-surface: #fcfcfb;
+  --viz-grid: #e1e0d9;
+  --viz-axis: #c3c2b7;
+  --viz-text: #0b0b0b;
+  --viz-text-2: #52514e;
+  --viz-text-muted: #898781;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --viz-series-1: #3987e5;
+    --viz-series-2: #d95926;
+    --viz-series-3: #199e70;
+    --viz-series-4: #c98500;
+    --viz-series-5: #d55181;
+    --viz-surface: #1a1a19;
+    --viz-grid: #2c2c2a;
+    --viz-axis: #383835;
+    --viz-text: #f0efec;
+    --viz-text-2: #c3c2b7;
+  }
+}

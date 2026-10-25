@@ -1,18 +1,28 @@
 import { QueryClient, useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { ApiError, apiFetch, isDbResuming } from "./client";
 import { toApiQuery } from "../lib/journalFilters";
+import { periodSince, type PeriodDays } from "../lib/period";
 import type {
   AgentRunOut,
   AgentsResponse,
   AlarmsResponse,
   ConfigResponse,
+  CriticReportOut,
+  CriticReportsPage,
+  EquityCurveResponse,
+  FunnelGroupBy,
+  FunnelResponse,
   LifecycleResponse,
   MetricsResponse,
   OverviewResponse,
+  ReviewsPage,
   ScansResponse,
   SignalFilters,
   SignalsPage,
+  SkepticValueResponse,
   SweepsResponse,
+  WinRateBy,
+  WinRateResponse,
 } from "./types";
 
 export interface Health {
@@ -184,5 +194,81 @@ export function useAgentRun(signalId: string, runId: string, enabled: boolean) {
     queryFn: ({ signal }) =>
       apiFetch<AgentRunOut>(`/signals/${signalId}/runs/${runId}`, { signal }),
     enabled,
+  });
+}
+
+// -- P4 funnel, P6 analytics, Critic ---------------------------------------------------
+
+/** `?since=<utc-midnight>&k=v…` — only a midnight `since`, so keys are stable for a UTC day. */
+function periodQuery(days: PeriodDays, extra: Record<string, string> = {}): string {
+  return new URLSearchParams({ since: periodSince(days), ...extra }).toString();
+}
+
+export const funnelKey = (since: string, groupBy: FunnelGroupBy) => ["funnel", since, groupBy] as const;
+export const winRateKey = (since: string, by: WinRateBy) => ["analytics", "win-rate", since, by] as const;
+export const skepticKey = (since: string) => ["analytics", "skeptic-value", since] as const;
+export const equityKey = (since: string) => ["analytics", "equity-curve", since] as const;
+export const criticReportsKey = (limit: number) => ["critic", "reports", limit] as const;
+export const criticReportKey = (id: string) => ["critic", "report", id] as const;
+export const criticReviewsKey = (limit: number) => ["critic", "reviews", limit] as const;
+
+/** `GET /api/funnel` — stage counts and rejections per day / window / symbol. */
+export function useFunnel(days: PeriodDays, groupBy: FunnelGroupBy) {
+  return useQuery({
+    queryKey: funnelKey(periodSince(days), groupBy),
+    queryFn: ({ signal }) =>
+      apiFetch<FunnelResponse>(`/funnel?${periodQuery(days, { group_by: groupBy })}`, { signal }),
+  });
+}
+
+/** `GET /api/analytics/win-rate` — published win rate per tag / session / strategy / week. */
+export function useWinRate(days: PeriodDays, by: WinRateBy) {
+  return useQuery({
+    queryKey: winRateKey(periodSince(days), by),
+    queryFn: ({ signal }) =>
+      apiFetch<WinRateResponse>(`/analytics/win-rate?${periodQuery(days, { by })}`, { signal }),
+  });
+}
+
+/** `GET /api/analytics/skeptic-value` — outcomes by how the Judge treated the objection. */
+export function useSkepticValue(days: PeriodDays) {
+  return useQuery({
+    queryKey: skepticKey(periodSince(days)),
+    queryFn: ({ signal }) =>
+      apiFetch<SkepticValueResponse>(`/analytics/skeptic-value?${periodQuery(days)}`, { signal }),
+  });
+}
+
+/** `GET /api/analytics/equity-curve` — the hypothetical R curves. */
+export function useEquityCurve(days: PeriodDays) {
+  return useQuery({
+    queryKey: equityKey(periodSince(days)),
+    queryFn: ({ signal }) =>
+      apiFetch<EquityCurveResponse>(`/analytics/equity-curve?${periodQuery(days)}`, { signal }),
+  });
+}
+
+/** `GET /api/critic/reports?limit=n` — the latest Critic reports (no markdown). */
+export function useCriticReports(limit = 5) {
+  return useQuery({
+    queryKey: criticReportsKey(limit),
+    queryFn: ({ signal }) => apiFetch<CriticReportsPage>(`/critic/reports?limit=${limit}`, { signal }),
+  });
+}
+
+/** `GET /api/critic/reports/{id}` — one report with its markdown; only when `enabled`. */
+export function useCriticReport(id: string, enabled: boolean) {
+  return useQuery({
+    queryKey: criticReportKey(id),
+    queryFn: ({ signal }) => apiFetch<CriticReportOut>(`/critic/reports/${id}`, { signal }),
+    enabled,
+  });
+}
+
+/** `GET /api/critic/reviews?limit=n` — the latest decision-review grades. */
+export function useCriticReviews(limit = 10) {
+  return useQuery({
+    queryKey: criticReviewsKey(limit),
+    queryFn: ({ signal }) => apiFetch<ReviewsPage>(`/critic/reviews?limit=${limit}`, { signal }),
   });
 }
