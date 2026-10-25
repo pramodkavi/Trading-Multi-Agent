@@ -95,6 +95,31 @@ describe("buildTimeline", () => {
     expect(noReplay?.tone).toBe("bad");
   });
 
+  it("labels the replay of a decision that was never taken as counterfactual", () => {
+    const base = makeLifecycle();
+    const l = makeLifecycle({
+      resolution: { ...(base.resolution as NonNullable<typeof base.resolution>), decision_kind: "VETOED" },
+    });
+    const outcome = buildTimeline(l).find((s) => s.kind === "outcome");
+    expect(outcome?.title).toBe("Outcome (counterfactual replay)");
+    expect(outcome?.summary).toContain("not taken");
+  });
+
+  it("does not present an UNRESOLVABLE replay as a result", () => {
+    const base = makeLifecycle();
+    const l = makeLifecycle({
+      resolution: {
+        ...(base.resolution as NonNullable<typeof base.resolution>),
+        outcome: "UNRESOLVABLE",
+        realized_r: 0,
+      },
+    });
+    const outcome = buildTimeline(l).find((s) => s.kind === "outcome");
+    expect(outcome?.tone).toBe("neutral");
+    expect(outcome?.summary).toContain("UNRESOLVABLE");
+    expect(outcome?.summary).not.toContain("0.00 R");
+  });
+
   it("keeps the Historian matches in the step details for linking", () => {
     const historian = buildTimeline(makeLifecycle()).find((s) => s.kind === "historian");
     const matches = (historian?.details as { matches: { signal_id: string }[] }).matches;

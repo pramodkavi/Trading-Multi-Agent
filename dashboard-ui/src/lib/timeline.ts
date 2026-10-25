@@ -161,17 +161,25 @@ export function buildTimeline(l: LifecycleResponse): TimelineStep[] {
   }
 
   if (l.resolution) {
+    const r = l.resolution;
+    // A replay of a decision that was never published (veto, gate rejection) says what
+    // would have happened, not what the operator got — label it so it cannot be misread.
+    const counterfactual = r.decision_kind !== "PUBLISHED";
+    const unresolvable = r.outcome === "UNRESOLVABLE";
+    let summary = `${r.outcome} · ${formatR(r.realized_r)}`;
+    if (unresolvable) summary = "UNRESOLVABLE · no replay possible";
+    else if (counterfactual) summary = `${summary} · not taken`;
     out.push({
       id: "outcome",
       kind: "outcome",
-      title: "Outcome (replay)",
-      tone: OUTCOME_TONE[l.resolution.outcome] ?? "neutral",
-      at: l.resolution.resolved_at,
-      summary: `${l.resolution.outcome} · ${formatR(l.resolution.realized_r)}`,
+      title: counterfactual ? "Outcome (counterfactual replay)" : "Outcome (replay)",
+      tone: unresolvable || counterfactual ? "neutral" : (OUTCOME_TONE[r.outcome] ?? "neutral"),
+      at: r.resolved_at,
+      summary,
       runId: null,
       latencyMs: null,
       costUsd: null,
-      details: { ...l.resolution },
+      details: { ...r },
     });
   } else if (sig.outcome) {
     out.push({

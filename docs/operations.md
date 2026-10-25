@@ -884,7 +884,7 @@ Click a symbol to open the decision (`/signals/<id>`), the chain in order:
 | Skeptic | The strongest objection, or "Macro data unavailable" (amber) when macro providers had no data. |
 | Judge | PUBLISH / PUBLISH_WITH_CAVEAT / SKIP with confidence and caveat. |
 | Forecaster | Each look at the open setup (still valid / at risk / closed); an `ERROR` row (red) carries the failure text — usually the credit balance. |
-| Outcome (replay) | The deterministic 5m-candle replay result and realised R (Critic v0). |
+| Outcome (replay) | The deterministic 5m-candle replay result and realised R (Critic v0). For a decision that was **never published** (a veto or gate rejection) it reads **Outcome (counterfactual replay) … not taken** in neutral grey — what would have happened, not a trade result. `UNRESOLVABLE` means no replay was possible (no R is shown). When no replay exists yet, a plain **Outcome** step shows the Forecaster's recorded result. |
 | Critic review | The Critic's lesson, or "Review failed" (amber). |
 
 Each agent step has a **Raw output** button: the full stored output is fetched only when you open
