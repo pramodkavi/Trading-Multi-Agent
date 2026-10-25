@@ -2,16 +2,24 @@ import type {
   AgentsResponse,
   AlarmsResponse,
   ConfigResponse,
+  CriticReportsPage,
+  EquityCurveResponse,
+  EquityPoint,
+  FunnelGroup,
+  FunnelResponse,
   EvaluationOut,
   LifecycleResponse,
   LifecycleStep,
   MetricsResponse,
   OverviewResponse,
   ScanRowOut,
+  ReviewsPage,
   ScansResponse,
   SetupCardOut,
   SignalRowOut,
+  SkepticValueResponse,
   SweepsResponse,
+  WinRateResponse,
   WindowOutcome,
   WindowSummary,
 } from "../api/types";
@@ -351,6 +359,150 @@ export function healthRoutes(overrides: Record<string, unknown> = {}): Record<st
     "/system/sweeps": makeSweeps(),
     "/system/metrics": makeMetrics(),
     "/system/config": makeConfig(),
+    ...overrides,
+  };
+}
+
+// -- Funnel (P4) and analytics (P6) fixtures -------------------------------------
+
+export function makeFunnelGroup(key = "total", overrides: Partial<FunnelGroup> = {}): FunnelGroup {
+  return {
+    key,
+    scans: 40,
+    symbols_scanned: 160,
+    proposals: 30,
+    gate_rejected: 18,
+    gate_passed: 12,
+    judge_publish: 2,
+    judge_caveat: 1,
+    judge_skip: 9,
+    judge_none: 0,
+    published: 3,
+    rejections_by_rule: { RULE_2_MIN_RR: 10, RULE_3_PREMIUM_DISCOUNT: 8 },
+    ...overrides,
+  };
+}
+
+export function makeFunnel(overrides: Partial<FunnelResponse> = {}): FunnelResponse {
+  return {
+    since: "2026-09-25T00:00:00Z",
+    until: "2026-10-25T10:00:00Z",
+    group_by: "day",
+    groups: [
+      makeFunnelGroup("2026-10-24", {
+        scans: 20,
+        symbols_scanned: 80,
+        proposals: 14,
+        gate_rejected: 9,
+        gate_passed: 5,
+        published: 1,
+        rejections_by_rule: { RULE_2_MIN_RR: 6, RULE_3_PREMIUM_DISCOUNT: 3 },
+      }),
+      makeFunnelGroup("2026-10-25", {
+        scans: 20,
+        symbols_scanned: 80,
+        proposals: 16,
+        gate_rejected: 9,
+        gate_passed: 7,
+        published: 2,
+        rejections_by_rule: { RULE_2_MIN_RR: 4, RULE_3_PREMIUM_DISCOUNT: 5 },
+      }),
+    ],
+    totals: makeFunnelGroup("total"),
+    top_rejections_7d: [
+      { rule: "RULE_2_MIN_RR", count: 6 },
+      { rule: "RULE_3_PREMIUM_DISCOUNT", count: 4 },
+    ],
+    top_rejections_30d: [
+      { rule: "RULE_2_MIN_RR", count: 10 },
+      { rule: "RULE_3_PREMIUM_DISCOUNT", count: 8 },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeWinRate(overrides: Partial<WinRateResponse> = {}): WinRateResponse {
+  return {
+    since: "2026-07-27T00:00:00Z",
+    until: "2026-10-25T10:00:00Z",
+    by: "tag",
+    buckets: [
+      { key: "htf-bias", wins: 5, losses: 3, decisive: 8, win_rate: 0.625, n: 10 },
+      { key: "liquidity-sweep", wins: 1, losses: 2, decisive: 3, win_rate: 1 / 3, n: 4 },
+      { key: "unresolved-tag", wins: 0, losses: 0, decisive: 0, win_rate: null, n: 2 },
+    ],
+    source_counts: { replayed: 9, forecaster: 3 },
+    ...overrides,
+  };
+}
+
+export function makeSkeptic(overrides: Partial<SkepticValueResponse> = {}): SkepticValueResponse {
+  return {
+    since: "2026-07-27T00:00:00Z",
+    until: "2026-10-25T10:00:00Z",
+    respected: { n: 6, wins: 3, losses: 2, win_rate: 0.6 },
+    overruled_with_caveat: { n: 4, wins: 2, losses: 1, win_rate: 2 / 3 },
+    overruled: { n: 3, wins: 0, losses: 0, win_rate: null },
+    no_macro_data_excluded: 2,
+    unruled: 1,
+    source_counts: { replayed: 9, forecaster: 3 },
+    ...overrides,
+  };
+}
+
+export function makePoint(at: string, r: number, cumulative: number): EquityPoint {
+  return { signal_id: `sig-${at}`, at, r, cumulative_r: cumulative, source: "replayed" };
+}
+
+export function makeEquity(overrides: Partial<EquityCurveResponse> = {}): EquityCurveResponse {
+  return {
+    since: "2026-07-27T00:00:00Z",
+    until: "2026-10-25T10:00:00Z",
+    published: [
+      makePoint("2026-10-01T08:03:00Z", 3, 3),
+      makePoint("2026-10-05T13:03:00Z", -1, 2),
+      makePoint("2026-10-09T08:03:00Z", 3, 5),
+    ],
+    vetoed: [makePoint("2026-10-02T08:03:00Z", 3, 3), makePoint("2026-10-06T08:03:00Z", -1, 2)],
+    gate_rejected: [makePoint("2026-10-03T08:03:00Z", -1, -1)],
+    source_counts: { replayed: 6, forecaster: 0 },
+    ...overrides,
+  };
+}
+
+export function makeCriticReports(overrides: Partial<CriticReportsPage> = {}): CriticReportsPage {
+  return {
+    items: [
+      {
+        id: "99999999-9999-4999-8999-999999999999",
+        period_start: "2026-10-01T00:00:00Z",
+        period_end: "2026-10-15T00:00:00Z",
+        created_at: "2026-10-16T22:30:00Z",
+        pr_url: "https://github.com/pramodkavi/Trading-Multi-Agent/pull/30",
+        summary: "Most gate rejections were RULE_2_MIN_RR; the Judge vetoed 9 of 12.",
+      },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeReviews(overrides: Partial<ReviewsPage> = {}): ReviewsPage {
+  return {
+    items: [
+      {
+        signal_id: SIGNAL_ID,
+        decision_kind: "VETOED",
+        failure_category: "over_cautious_veto",
+        lesson: "The veto ignored a clean OB retest.",
+        judge_correct: false,
+        gate_correct: true,
+        skeptic_vindicated: null,
+        confidence: "high",
+        error: null,
+        created_at: "2026-10-16T22:31:00Z",
+      },
+    ],
+    next_cursor: null,
     ...overrides,
   };
 }
