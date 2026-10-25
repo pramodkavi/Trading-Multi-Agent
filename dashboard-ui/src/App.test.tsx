@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import { Boot } from "./App";
 import { SESSION_STORAGE_KEY, SIGNED_OUT_KEY } from "./auth/SplitTokenStore";
 import { ConfigError, loadConfig, type DashboardConfig } from "./config";
-import { makeOverview } from "./test/fixtures";
+import { healthRoutes, makeOverview } from "./test/fixtures";
 
 const mocks = vi.hoisted(() => ({
   auth: {} as Record<string, unknown>,
@@ -63,6 +63,11 @@ function stubApi(health: unknown = { status: "ok", version: "deadbeefcafe" }): v
       if (url.endsWith("/health")) body = health;
       else if (url.endsWith("/overview")) body = makeOverview();
       else if (url.includes("/signals")) body = { items: [], next_cursor: null };
+      else {
+        const routes = healthRoutes();
+        const path = url.replace(/^\/api/, "").split("?")[0] ?? "";
+        if (path !== "/system/db" && path in routes) body = routes[path];
+      }
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -148,12 +153,19 @@ describe("App", () => {
     expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
   });
 
+  it("route /health renders the Health page, not the placeholder", async () => {
+    mocks.auth = signedIn();
+    renderAt("/health");
+    expect(await screen.findByRole("heading", { level: 1, name: "Health" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: /scan history/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
+  });
+
   it.each([
     ["/signals", "Signals", "4.7"],
     ["/funnel", "Funnel", "4.8"],
     ["/analytics", "Analytics", "4.8"],
     ["/markets", "Markets", "4.9"],
-    ["/health", "Health", "4.6"],
   ])("route %s renders the %s placeholder", async (path, title, step) => {
     mocks.auth = signedIn();
     renderAt(path);

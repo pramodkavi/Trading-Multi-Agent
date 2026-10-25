@@ -1,6 +1,13 @@
 import type {
+  AgentsResponse,
+  AlarmsResponse,
+  ConfigResponse,
+  MetricsResponse,
   OverviewResponse,
+  ScanRowOut,
+  ScansResponse,
   SetupCardOut,
+  SweepsResponse,
   WindowOutcome,
   WindowSummary,
 } from "../api/types";
@@ -100,6 +107,108 @@ export function makeOverview(overrides: Partial<OverviewResponse> = {}): Overvie
       makeWindow("OVERLAP", "2026-10-25T15:03:00Z", null),
       makeWindow("DAILY_WRAP", "2026-10-25T22:03:00Z", null),
     ],
+    ...overrides,
+  };
+}
+
+// -- System health (P7) fixtures ------------------------------------------------
+
+export function makeScanRow(overrides: Partial<ScanRowOut> = {}): ScanRowOut {
+  return {
+    id: "scan-1",
+    window: "LONDON",
+    started_at: "2026-10-25T08:03:00Z",
+    completed_at: "2026-10-25T08:04:10Z",
+    duration_s: 70,
+    status: "SUCCESS",
+    symbols: ["BTCUSDT"],
+    error_message: null,
+    ...overrides,
+  };
+}
+
+export function makeScans(items: ScanRowOut[] = [makeScanRow()]): ScansResponse {
+  return { items };
+}
+
+export function makeAlarms(overrides: Partial<AlarmsResponse> = {}): AlarmsResponse {
+  return {
+    alarms: [
+      { name: "ProviderErrorAlarm", state: "OK", updated_at: "2026-10-24T00:00:00Z", reason: "ok" },
+      { name: "ForecasterErrorAlarm", state: "OK", updated_at: "2026-10-24T00:00:00Z", reason: null },
+    ],
+    note: null,
+    ...overrides,
+  };
+}
+
+export function makeAgents(overrides: Partial<AgentsResponse> = {}): AgentsResponse {
+  return {
+    since: "2026-10-19T00:00:00Z",
+    until: "2026-10-25T10:00:00Z",
+    usage: [
+      { date: "2026-10-25", role: "skeptic", runs: 4, errors: null, cost_usd: 0.1234 },
+      { date: "2026-10-25", role: "scan", runs: 4, errors: 3, cost_usd: 0 },
+    ],
+    cost_per_day: [
+      { date: "2026-10-24", total_usd: 0.5, by_role: { skeptic: 0.5 } },
+      { date: "2026-10-25", total_usd: 0.25, by_role: { skeptic: 0.25 } },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeSweeps(overrides: Partial<SweepsResponse> = {}): SweepsResponse {
+  return {
+    since: "2026-10-19T00:00:00Z",
+    until: "2026-10-25T10:00:00Z",
+    sweeps: [
+      { sweep_start: "2026-10-25T08:08:00Z", evaluations: 1, errors: 0 },
+      { sweep_start: "2026-10-25T13:08:00Z", evaluations: 1, errors: 1 },
+    ],
+    ...overrides,
+  };
+}
+
+export function makeMetrics(overrides: Partial<MetricsResponse> = {}): MetricsResponse {
+  return {
+    function_name: "CryptoSignals-Compute-ScanLambda-abc",
+    days: [
+      { date: "2026-10-25", invocations: 5, errors: 1, duration_p95_ms: 61234.5 },
+      { date: "2026-10-24", invocations: 5, errors: 0, duration_p95_ms: null },
+    ],
+    note: null,
+    ...overrides,
+  };
+}
+
+export function makeConfig(): ConfigResponse {
+  return {
+    watchlist: { value: ["BTCUSDT", "ETHUSDT"], inferred: true, source: "scan_runs, last 7 days" },
+    model: { value: "claude-sonnet-4-5", inferred: true, source: "latest agent run" },
+    macro_providers_configured: { value: true, inferred: true, source: "last 10 Skeptic outputs" },
+    langfuse_configured: { value: false, inferred: true, source: "dashboard settings" },
+    schedule: {
+      windows: [
+        { label: "LONDON", time_utc: "08:03" },
+        { label: "NY", time_utc: "13:03" },
+      ],
+      inferred: false,
+      source: "SPEC schedule",
+    },
+  };
+}
+
+/** Routes for every `/system/*` call the Health page makes, healthy by default. */
+export function healthRoutes(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    "/system/db": { db: "ok", latency_ms: 9 },
+    "/system/scans": makeScans(),
+    "/system/alarms": makeAlarms(),
+    "/system/agents": makeAgents(),
+    "/system/sweeps": makeSweeps(),
+    "/system/metrics": makeMetrics(),
+    "/system/config": makeConfig(),
     ...overrides,
   };
 }
