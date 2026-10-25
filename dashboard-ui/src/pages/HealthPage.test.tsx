@@ -147,6 +147,21 @@ describe("HealthPage", () => {
     );
   });
 
+  it("keeps a panel's last good data when a background refresh fails", async () => {
+    let calls = 0;
+    stubApi(
+      healthRoutes({
+        "/system/scans": () =>
+          calls++ === 0 ? jsonResponse(makeScans()) : jsonResponse({ reason: "db_error" }, 502),
+      }),
+    );
+    renderWithProviders(<HealthPage />, { client: createTestClient({ refetchIntervalMs: 40 }) });
+
+    expect(await screen.findAllByTestId("scan-row")).toHaveLength(1);
+    expect(await screen.findByText(/could not refresh scan history/i)).toBeInTheDocument();
+    expect(screen.getAllByTestId("scan-row")).toHaveLength(1);
+  });
+
   it("uses the default agent window when none is passed", async () => {
     const requested = stubApi(healthRoutes({ "/system/agents": makeAgents() }));
     renderWithProviders(<HealthPage />);

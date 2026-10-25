@@ -57,7 +57,7 @@ describe("OverviewPage", () => {
     const banner = await screen.findByRole("alert");
     expect(banner).toHaveAttribute("data-tone", "bad");
     expect(within(banner).getByText("Anthropic credit balance too low")).toBeInTheDocument();
-    expect(within(banner).queryByText(/scan window failed/i)).not.toBeInTheDocument();
+    expect(within(banner).queryByText(/latest scan failed/i)).not.toBeInTheDocument();
     const [londonCard] = screen.getAllByTestId("window-card");
     expect(within(londonCard as HTMLElement).getByText("failed")).toBeInTheDocument();
   });
@@ -67,7 +67,7 @@ describe("OverviewPage", () => {
     renderWithProviders(<OverviewPage />);
 
     const banner = await screen.findByRole("alert");
-    expect(within(banner).getByText("1 scan window failed today")).toBeInTheDocument();
+    expect(within(banner).getByText("Latest scan failed (LONDON)")).toBeInTheDocument();
     expect(within(banner).queryByText(/credit balance/i)).not.toBeInTheDocument();
   });
 
@@ -142,6 +142,21 @@ describe("OverviewPage", () => {
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(/could not load the overview/i)).toBeInTheDocument();
     await userEvent.click(within(alert).getByRole("button", { name: /retry/i }));
+  });
+
+  it("keeps showing the last good overview when a background refresh fails", async () => {
+    let calls = 0;
+    stubApi({
+      "/overview": () =>
+        calls++ === 0 ? jsonResponse(makeOverview()) : jsonResponse({ reason: "db_error" }, 502),
+      "/signals": NO_SIGNALS,
+    });
+    renderWithProviders(<OverviewPage />, { client: createTestClient({ refetchIntervalMs: 40 }) });
+
+    expect(await screen.findByText("Open setups 1 / 3")).toBeInTheDocument();
+    expect(await screen.findByText(/could not refresh the overview/i)).toBeInTheDocument();
+    expect(screen.getByText("Open setups 1 / 3")).toBeInTheDocument();
+    expect(screen.queryByText(/could not load the overview/i)).not.toBeInTheDocument();
   });
 
   it("handles no open setups and an unknown or negative unrealised R", async () => {

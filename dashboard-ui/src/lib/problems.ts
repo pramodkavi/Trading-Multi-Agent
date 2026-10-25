@@ -17,14 +17,21 @@ export function isCreditError(text: string | null | undefined): boolean {
   return typeof text === "string" && /credit balance/i.test(text);
 }
 
-function failedOutcomes(o: OverviewResponse): WindowOutcome[] {
-  const fromWindows = o.windows_today
+/**
+ * The scan the banner judges: the most recent window that has finished (RUNNING ones are
+ * skipped so an in-flight scan neither hides a failure nor counts as recovery). Falls back
+ * to the strip's last scan overnight, before today's first window has run. Judging the
+ * latest window — not every window today — is what lets the banner clear after recovery.
+ */
+function latestFinished(o: OverviewResponse): WindowOutcome | null {
+  const finished = o.windows_today
     .map((w) => w.scan)
-    .filter((s): s is WindowOutcome => s !== null && s.status === "FAILED");
-  // Overnight `windows_today` is empty of scans; the strip's last scan (yesterday's wrap) still counts.
+    .filter((s): s is WindowOutcome => s !== null && s.status !== "RUNNING")
+    .sort((a, b) => new Date(a.started_at).getTime() - new Date(b.started_at).getTime());
+  const latest = finished.at(-1) ?? null;
+  if (latest) return latest;
   const last = o.health.last_scan;
-  if (fromWindows.length === 0 && last?.status === "FAILED") return [last];
-  return fromWindows;
+  return last && last.status !== "RUNNING" ? last : null;
 }
 
 const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
@@ -33,28 +40,23 @@ const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
 export function collectProblems(o: OverviewResponse): Problem[] {
   const problems: Problem[] = [];
 
-  const failed = failedOutcomes(o);
-  const creditHits = failed.filter((s) => isCreditError(s.error));
-  if (creditHits.length > 0) {
-    problems.push({
-      id: "credits",
-      tone: "bad",
-      title: "Anthropic credit balance too low",
-      detail: `Scans are failing at the LLM call; top up Anthropic credits. ${creditHits.length} ${plural(
-        creditHits.length,
-        "window",
-        "windows",
-      )} affected.`,
-    });
-  }
-  const otherFailures = failed.length - creditHits.length;
-  if (otherFailures > 0) {
-    problems.push({
-      id: "scans_failed",
-      tone: "bad",
-      title: `${otherFailures} scan ${plural(otherFailures, "window", "windows")} failed today`,
-      detail: "See the scan history on the Health page for the error.",
-    });
+  const latest = latestFinished(o);
+  if (latest?.status === "FAILED") {
+    if (isCreditError(latest.error)) {
+      problems.push({
+        id: "credits",
+        tone: "bad",
+        title: "Anthropic credit balance too low",
+        detail: `The latest scan (${latest.label}) failed at the LLM call; top up Anthropic credits.`,
+      });
+    } else {
+      problems.push({
+        id: "scans_failed",
+        tone: "bad",
+        title: `Latest scan failed (${latest.label})`,
+        detail: "See the scan history on the Health page for the error.",
+      });
+    }
   }
 
   const alarming = (o.health.alarms ?? []).filter((a) => a.state === "ALARM");

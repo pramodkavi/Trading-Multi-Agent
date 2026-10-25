@@ -850,13 +850,13 @@ top of **Overview** appears only when something is wrong, and every banner links
 
 | Banner | Meaning | First action |
 |---|---|---|
-| **Anthropic credit balance too low** (red) | A FAILED scan's stored `error_message` contains "credit balance" — the LLM call was rejected. | Top up Anthropic credits (Anthropic console → Billing). The next scan window turns green; the banner clears within one 60 s poll. |
-| **N scan window(s) failed today** (red) | FAILED scans whose error is *not* a credit rejection. | Health → Scan history: read the error (full text on hover); then the scan Lambda log group. |
+| **Anthropic credit balance too low** (red) | The **latest finished** scan window FAILED and its stored `error_message` contains "credit balance" — the LLM call was rejected. | Top up Anthropic credits (Anthropic console → Billing). Once the next scan window succeeds the banner clears within one 60 s poll (earlier failed windows stay red on their own cards but no longer raise the banner). |
+| **Latest scan failed (WINDOW)** (red) | The latest finished scan window FAILED and the error is *not* a credit rejection. | Health → Scan history: read the error (full text on hover); then the scan Lambda log group. |
 | **N CloudWatch alarm(s) in ALARM** (red) | One of the five `CryptoSignals-Monitoring-*` alarms is firing; the names are listed. | Open the alarm in the CloudWatch console (§3). |
 | **Forecaster needs attention** (amber) | Open setups not evaluated since the last sweep, or `ERROR` evaluations in the last window. | Health → Forecaster sweeps; usually the same credit cause as above. |
 | **Alarm status unavailable** (amber) | The dashboard Lambda could not read CloudWatch (`cloudwatch unavailable` / `cloudwatch access denied`). Never treated as healthy. | Access denied = an IAM gap on the dashboard role — a bug; check the Lambda log. |
 
-A scheduled window that has not fired yet shows **not run yet**; once 15 minutes late with
+If a 60 s refresh fails, the page keeps the last data and shows an amber "Could not refresh … — showing the last data received" line instead of blanking. A scheduled window that has not fired yet shows **not run yet**; once 15 minutes late with
 no scan it shows **missed** (amber). The credit wording depends on the failed scan's error
 text reaching `scan_runs.error_message` (`scripts/run_scan.py` stores
 `"<ExceptionType>: <message>"`); if a failure is swallowed before that, the banner falls

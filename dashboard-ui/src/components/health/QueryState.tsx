@@ -13,6 +13,19 @@ export function QueryState<T>({
   label: string;
   children: (data: T) => ReactNode;
 }) {
+  // A failed background refresh keeps the last good data (TanStack v5): show it, flag it stale.
+  if (query.data !== undefined) {
+    return (
+      <>
+        {query.isError ? (
+          <p role="status" className="mb-2 text-sm text-amber-900 dark:text-amber-200">
+            {`Could not refresh ${label} — showing the last data received.`}
+          </p>
+        ) : null}
+        {children(query.data)}
+      </>
+    );
+  }
   if (query.isPending) {
     return (
       <p className={mutedClass}>
@@ -27,5 +40,5 @@ export function QueryState<T>({
       </p>
     );
   }
-  return <>{children(query.data)}</>;
+  return null;
 }

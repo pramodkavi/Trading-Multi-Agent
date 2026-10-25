@@ -38,7 +38,63 @@ describe("collectProblems", () => {
   it("reports generic failed scans for a non-credit failure", () => {
     const problems = collectProblems(failedOverview("ReadTimeout"));
     expect(problems.map((p) => p.id)).toEqual(["scans_failed"]);
-    expect(problems[0]?.title).toBe("1 scan window failed today");
+    expect(problems[0]?.title).toBe("Latest scan failed (LONDON)");
+  });
+
+  it("clears once a later window succeeds (recovery), even though an earlier one failed", () => {
+    const o = makeOverview({
+      windows_today: [
+        makeWindow("LONDON", "2026-10-25T08:03:00Z", makeOutcome({ status: "FAILED", error: CREDIT_ERROR })),
+        makeWindow(
+          "NY",
+          "2026-10-25T13:03:00Z",
+          makeOutcome({ label: "NY", started_at: "2026-10-25T13:03:00Z", status: "SUCCESS" }),
+        ),
+      ],
+    });
+    expect(collectProblems(o)).toEqual([]);
+  });
+
+  it("keeps the failure while a newer window is still running", () => {
+    const o = makeOverview({
+      windows_today: [
+        makeWindow("LONDON", "2026-10-25T08:03:00Z", makeOutcome({ status: "FAILED", error: CREDIT_ERROR })),
+        makeWindow(
+          "NY",
+          "2026-10-25T13:03:00Z",
+          makeOutcome({ label: "NY", started_at: "2026-10-25T13:03:00Z", status: "RUNNING" }),
+        ),
+      ],
+    });
+    expect(collectProblems(o).map((p) => p.id)).toEqual(["credits"]);
+  });
+
+  it("judges by start time, not array order", () => {
+    const failedLate = makeOutcome({
+      label: "NY",
+      started_at: "2026-10-25T13:03:00Z",
+      status: "FAILED",
+      error: "ReadTimeout",
+    });
+    const okEarly = makeOutcome({ status: "SUCCESS" });
+    const o = makeOverview({
+      windows_today: [
+        makeWindow("NY", "2026-10-25T13:03:00Z", failedLate),
+        makeWindow("LONDON", "2026-10-25T08:03:00Z", okEarly),
+      ],
+    });
+    expect(collectProblems(o).map((p) => p.id)).toEqual(["scans_failed"]);
+  });
+
+  it("falls back to the strip's last scan overnight and does not say 'today'", () => {
+    const failed = makeOutcome({ label: "DAILY_WRAP", status: "FAILED", error: "ReadTimeout" });
+    const o = makeOverview({
+      health: { ...makeOverview().health, last_scan: failed },
+      windows_today: [makeWindow("LONDON", "2026-10-25T08:03:00Z", null)],
+    });
+    const problems = collectProblems(o);
+    expect(problems[0]?.title).toBe("Latest scan failed (DAILY_WRAP)");
+    expect(problems[0]?.title).not.toMatch(/today/i);
   });
 
   it("counts a failed scan with no stored error as a generic failure", () => {
