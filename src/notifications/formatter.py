@@ -88,6 +88,21 @@ def _format_price(value: float, *, precision: int = 2) -> str:
 # Public formatters
 # ---------------------------------------------------------------------------
 
+LINK_LABEL: str = "Open in dashboard"
+
+
+def link_line(url: str | None) -> str | None:
+    r"""A MarkdownV2 inline link to the dashboard, or ``None`` when there is no URL.
+
+    Inside the ``(...)`` target Telegram requires ``\`` and ``)`` to be escaped with a
+    backslash; the label goes through :func:`escape_markdown_v2` like all dynamic text.
+    """
+    if url is None:
+        return None
+    target = url.replace("\\", "\\\\").replace(")", "\\)")
+    return f"[{escape_markdown_v2(LINK_LABEL)}]({target})"
+
+
 FOOTER: str = escape_markdown_v2("Signal only - manual execution required")
 """SPEC FR-5.2 mandates this footer verbatim on every alert."""
 
@@ -100,6 +115,7 @@ def format_new_signal(
     skeptic_objection: str | None = None,
     skeptic_severity: str | None = None,
     caveat: str | None = None,
+    signal_url: str | None = None,
 ) -> str:
     """Render a SignalProposal as a Telegram MarkdownV2 message.
 
@@ -115,6 +131,8 @@ def format_new_signal(
         skeptic_objection: the skeptic's strongest objection text.
         skeptic_severity: 'low' / 'medium' / 'high'.
         caveat: the Judge's caveat shown on a PUBLISH_WITH_CAVEAT ruling.
+        signal_url: dashboard page of this decision (Step 4.7 Part B); adds a link line
+            above the footer, and nothing when ``None``.
 
     Returns:
         A Telegram-ready MarkdownV2 string. Always ends with the mandated
@@ -188,12 +206,19 @@ def format_new_signal(
         tag_chunk = " ".join(f"`{escape_markdown_v2(t)}`" for t in proposal.tags)
         lines.extend(["", f"*Tags:* {tag_chunk}"])
 
+    # Dashboard deep link (Step 4.7 Part B), just above the footer.
+    link = link_line(signal_url)
+    if link is not None:
+        lines.extend(["", link])
+
     # Mandated footer.
     lines.extend(["", f"_{FOOTER}_"])
     return "\n".join(lines)
 
 
-def format_forecaster_update(proposal: SignalProposal, update: ForecasterUpdate) -> str:
+def format_forecaster_update(
+    proposal: SignalProposal, update: ForecasterUpdate, *, signal_url: str | None = None
+) -> str:
     """Render a Forecaster verdict on an open setup (FR-2.1 / FR-5.3).
 
     Distinguished from a NEW SIGNAL by its header so the operator can tell a
@@ -219,10 +244,13 @@ def format_forecaster_update(proposal: SignalProposal, update: ForecasterUpdate)
     if update.outcome is not None:
         lines.append(f"*Outcome:* `{escape_markdown_v2(update.outcome.value)}`")
     lines.extend(["", f"*Why:* {escape_markdown_v2(update.reasoning)}"])
+    link = link_line(signal_url)
+    if link is not None:
+        lines.extend(["", link])
     return "\n".join(lines)
 
 
-def format_skip(skip: SkipDecision) -> str:
+def format_skip(skip: SkipDecision, *, signal_url: str | None = None) -> str:
     """Render a SkipDecision for operator transparency.
 
     Skip messages are not part of FR-5.2 (that mandates alert format for
@@ -245,4 +273,7 @@ def format_skip(skip: SkipDecision) -> str:
             f"*Details:* {escape_markdown_v2(skip.details)}",
         ]
     )
+    link = link_line(signal_url)
+    if link is not None:
+        lines.extend(["", link])
     return "\n".join(lines)
