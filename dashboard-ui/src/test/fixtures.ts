@@ -2,11 +2,15 @@ import type {
   AgentsResponse,
   AlarmsResponse,
   ConfigResponse,
+  EvaluationOut,
+  LifecycleResponse,
+  LifecycleStep,
   MetricsResponse,
   OverviewResponse,
   ScanRowOut,
   ScansResponse,
   SetupCardOut,
+  SignalRowOut,
   SweepsResponse,
   WindowOutcome,
   WindowSummary,
@@ -107,6 +111,144 @@ export function makeOverview(overrides: Partial<OverviewResponse> = {}): Overvie
       makeWindow("OVERLAP", "2026-10-25T15:03:00Z", null),
       makeWindow("DAILY_WRAP", "2026-10-25T22:03:00Z", null),
     ],
+    ...overrides,
+  };
+}
+
+/** A journal row; defaults to a published BTCUSDT long, override per test. */
+export function makeRow(overrides: Partial<SignalRowOut> = {}): SignalRowOut {
+  return {
+    id: "11111111-1111-4111-8111-111111111111",
+    scan_id: "scan-1",
+    symbol: "BTCUSDT",
+    strategy: "smc",
+    direction: "LONG",
+    status: "PUBLISHED",
+    created_at: "2026-10-25T08:03:00Z",
+    tags: ["htf-bias"],
+    outcome: null,
+    entry_price: 100,
+    stop_loss: 95,
+    take_profit_1: 115,
+    take_profit_2: null,
+    risk_reward_ratio: 3,
+    skip_reason: null,
+    skip_details: null,
+    decision_kind: "PUBLISHED",
+    judge_ruling: "PUBLISH",
+    session: "LONDON",
+    has_setup: true,
+    violated_rule: null,
+    resolution_outcome: null,
+    realized_r: null,
+    ...overrides,
+  };
+}
+
+export const SIGNAL_ID = "11111111-1111-4111-8111-111111111111";
+export const PAST_SIGNAL_ID = "22222222-2222-4222-8222-222222222222";
+
+export function makeStep(role: string, summary: Record<string, unknown>, n: number): LifecycleStep {
+  return {
+    role,
+    run_id: `run-${role}-${n}`,
+    created_at: `2026-10-25T08:03:0${n}Z`,
+    latency_ms: 1200,
+    cost_usd: role === "skeptic" || role === "judge" ? 0.0123 : null,
+    summary,
+  };
+}
+
+export function makeEvaluation(overrides: Partial<EvaluationOut> = {}): EvaluationOut {
+  return {
+    id: "eval-1",
+    setup_id: "setup-1",
+    signal_id: SIGNAL_ID,
+    evaluated_at: "2026-10-25T09:05:00Z",
+    status: "STILL_VALID",
+    outcome: null,
+    reasoning: "Structure intact.",
+    error: null,
+    latency_ms: 900,
+    token_usage: {},
+    cost_usd: 0.004,
+    ...overrides,
+  };
+}
+
+/** A full PUBLISHED chain: analyzer → historian → skeptic → judge → 2 evaluations → replay → review. */
+export function makeLifecycle(overrides: Partial<LifecycleResponse> = {}): LifecycleResponse {
+  return {
+    signal: {
+      ...makeRow({ id: SIGNAL_ID, outcome: "WIN", realized_r: 3 }),
+      payload: { symbol: "BTCUSDT", entry_price: 100 },
+      features: { ob_zone_low: 98 },
+      outcome_metadata: null,
+    },
+    steps: [
+      makeStep(
+        "analyzer",
+        {
+          direction: "LONG",
+          entry_price: 100,
+          stop_loss: 95,
+          take_profit_1: 115,
+          take_profit_2: null,
+          risk_reward_ratio: 3,
+          tags: ["htf-bias"],
+        },
+        1,
+      ),
+      makeStep(
+        "historian",
+        {
+          win_rate: 0.6,
+          sample_size: 5,
+          wins: 3,
+          losses: 2,
+          matches: [{ signal_id: PAST_SIGNAL_ID, symbol: "ETHUSDT", outcome: "WIN" }],
+        },
+        2,
+      ),
+      makeStep("skeptic", { severity: "MEDIUM", recommends_against: false, headline: "DXY rising" }, 3),
+      makeStep("judge", { ruling: "PUBLISH", confidence: 0.8, caveat: null }, 4),
+    ],
+    evaluations: [
+      makeEvaluation({ id: "e1" }),
+      makeEvaluation({
+        id: "e2",
+        evaluated_at: "2026-10-25T13:05:00Z",
+        status: "INVALIDATED",
+        outcome: "WIN",
+        reasoning: "TP1 reached.",
+      }),
+    ],
+    resolution: {
+      signal_id: SIGNAL_ID,
+      decision_kind: "PUBLISHED",
+      outcome: "WIN",
+      decided_at: "2026-10-25T08:03:00Z",
+      entered_at: "2026-10-25T08:30:00Z",
+      resolved_at: "2026-10-25T13:00:00Z",
+      realized_r: 3,
+      max_adverse_excursion_r: 0.4,
+      max_favorable_excursion_r: 3.2,
+      tp2_reached: false,
+      candles_used: 120,
+      engine_version: "v1",
+    },
+    review: {
+      signal_id: SIGNAL_ID,
+      decision_kind: "PUBLISHED",
+      review: { lesson: "Good entry at the OB." },
+      model: "claude-sonnet-4-5",
+      token_usage: {},
+      cost_usd: 0.02,
+      error: null,
+      attempts: 1,
+      created_at: "2026-10-26T00:00:00Z",
+    },
+    setup: makeSetup({ signal_id: SIGNAL_ID }),
     ...overrides,
   };
 }

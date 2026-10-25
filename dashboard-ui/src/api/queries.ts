@@ -1,12 +1,16 @@
-import { QueryClient, useQuery } from "@tanstack/react-query";
+import { QueryClient, useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { ApiError, apiFetch, isDbResuming } from "./client";
+import { toApiQuery } from "../lib/journalFilters";
 import type {
+  AgentRunOut,
   AgentsResponse,
   AlarmsResponse,
   ConfigResponse,
+  LifecycleResponse,
   MetricsResponse,
   OverviewResponse,
   ScansResponse,
+  SignalFilters,
   SignalsPage,
   SweepsResponse,
 } from "./types";
@@ -146,5 +150,39 @@ export function useSystemConfig() {
   return useQuery({
     queryKey: configKey,
     queryFn: ({ signal }) => apiFetch<ConfigResponse>("/system/config", { signal }),
+  });
+}
+
+export const JOURNAL_PAGE_SIZE = 50;
+export const signalsJournalKey = (filters: SignalFilters) => ["signals", "journal", filters] as const;
+export const signalKey = (id: string) => ["signal", id] as const;
+export const agentRunKey = (signalId: string, runId: string) => ["signal", signalId, "run", runId] as const;
+
+/** `GET /api/signals` — the journal, paged by the server's opaque keyset cursor. */
+export function useSignalsJournal(filters: SignalFilters) {
+  return useInfiniteQuery({
+    queryKey: signalsJournalKey(filters),
+    initialPageParam: undefined as string | undefined,
+    queryFn: ({ pageParam, signal }) =>
+      apiFetch<SignalsPage>(`/signals?${toApiQuery(filters, JOURNAL_PAGE_SIZE, pageParam)}`, { signal }),
+    getNextPageParam: (page) => page.next_cursor ?? undefined,
+  });
+}
+
+/** `GET /api/signals/{id}` — one decision's whole lifecycle. */
+export function useSignal(id: string) {
+  return useQuery({
+    queryKey: signalKey(id),
+    queryFn: ({ signal }) => apiFetch<LifecycleResponse>(`/signals/${id}`, { signal }),
+  });
+}
+
+/** `GET /api/signals/{id}/runs/{run_id}` — the full output of one agent step; only when `enabled`. */
+export function useAgentRun(signalId: string, runId: string, enabled: boolean) {
+  return useQuery({
+    queryKey: agentRunKey(signalId, runId),
+    queryFn: ({ signal }) =>
+      apiFetch<AgentRunOut>(`/signals/${signalId}/runs/${runId}`, { signal }),
+    enabled,
   });
 }

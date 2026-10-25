@@ -17,6 +17,7 @@ import HealthPage from "./pages/HealthPage";
 import MarketsPage from "./pages/MarketsPage";
 import NotFoundPage from "./pages/NotFoundPage";
 import OverviewPage from "./pages/OverviewPage";
+import SignalDetailPage from "./pages/SignalDetailPage";
 import SignalsPage from "./pages/SignalsPage";
 
 interface Runtime {
@@ -48,6 +49,7 @@ export function App({ runtime }: { runtime: Runtime }) {
               <Route element={<Layout config={config} />}>
                 <Route index element={<OverviewPage />} />
                 <Route path="signals" element={<SignalsPage />} />
+                <Route path="signals/:id" element={<SignalDetailPage />} />
                 <Route path="funnel" element={<FunnelPage />} />
                 <Route path="analytics" element={<AnalyticsPage />} />
                 <Route path="markets" element={<MarketsPage />} />

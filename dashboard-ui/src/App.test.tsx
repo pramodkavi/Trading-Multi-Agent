@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import { Boot } from "./App";
 import { SESSION_STORAGE_KEY, SIGNED_OUT_KEY } from "./auth/SplitTokenStore";
 import { ConfigError, loadConfig, type DashboardConfig } from "./config";
-import { healthRoutes, makeOverview } from "./test/fixtures";
+import { healthRoutes, makeLifecycle, makeOverview, SIGNAL_ID } from "./test/fixtures";
 
 const mocks = vi.hoisted(() => ({
   auth: {} as Record<string, unknown>,
@@ -62,6 +62,7 @@ function stubApi(health: unknown = { status: "ok", version: "deadbeefcafe" }): v
       let body: unknown = { db: "ok", latency_ms: 9 };
       if (url.endsWith("/health")) body = health;
       else if (url.endsWith("/overview")) body = makeOverview();
+      else if (/\/signals\/[0-9a-f-]{36}$/.test(url)) body = makeLifecycle();
       else if (url.includes("/signals")) body = { items: [], next_cursor: null };
       else {
         const routes = healthRoutes();
@@ -153,6 +154,13 @@ describe("App", () => {
     expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
   });
 
+  it("route /signals/:id renders the decision detail", async () => {
+    mocks.auth = signedIn();
+    renderAt(`/signals/${SIGNAL_ID}`);
+    expect(await screen.findByRole("heading", { level: 3, name: "Analyzer proposal" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /back to signals/i })).toBeInTheDocument();
+  });
+
   it("route /health renders the Health page, not the placeholder", async () => {
     mocks.auth = signedIn();
     renderAt("/health");
@@ -161,8 +169,15 @@ describe("App", () => {
     expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
   });
 
+  it("route /signals renders the journal, not the placeholder", async () => {
+    mocks.auth = signedIn();
+    renderAt("/signals");
+    expect(await screen.findByRole("heading", { level: 1, name: "Signals" })).toBeInTheDocument();
+    expect(await screen.findByRole("form", { name: "Filters" })).toBeInTheDocument();
+    expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
+  });
+
   it.each([
-    ["/signals", "Signals", "4.7"],
     ["/funnel", "Funnel", "4.8"],
     ["/analytics", "Analytics", "4.8"],
     ["/markets", "Markets", "4.9"],

@@ -36,12 +36,12 @@ export function renderWithProviders(
   );
 }
 
-type Route = unknown | (() => Response);
+type Route = unknown | ((url: string) => Response);
 
 /**
  * Stub `fetch` for `/api/*`. Keys are paths after `/api` without the query
  * (e.g. `"/system/scans"`); a function value returns a custom `Response`, any
- * other value is served as a 200 JSON body. Unknown paths answer 404 `not_found`.
+ * other value is served as a 200 JSON body; a function receives the full request URL. Unknown paths answer 404 `not_found`.
  * Returns the list of requested URLs (including query strings).
  */
 export function stubApi(routes: Record<string, Route>): string[] {
@@ -61,7 +61,9 @@ export function stubApi(routes: Record<string, Route>): string[] {
       const path = url.replace(/^\/api/, "").split("?")[0] ?? "";
       if (!(path in routes)) return jsonResponse({ reason: "not_found" }, 404);
       const value = routes[path];
-      return typeof value === "function" ? (value as () => Response)() : jsonResponse(value);
+      return typeof value === "function"
+        ? (value as (url: string) => Response)(url)
+        : jsonResponse(value);
     }),
   );
   return requested;
