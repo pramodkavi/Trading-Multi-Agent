@@ -862,3 +862,31 @@ text reaching `scan_runs.error_message` (`scripts/run_scan.py` stores
 `"<ExceptionType>: <message>"`); if a failure is swallowed before that, the banner falls
 back to the generic or Forecaster wording. Lambda metrics on Health load once per page view
 (not on the 60 s poll) because CloudWatch bills per request.
+
+
+### 8.9 Reading the journal and a decision (Step 4.7)
+
+**Signals** (`/signals`) is every decision the pipeline journaled, newest first — published
+signals, Judge vetoes, risk-gate rejections and "no setup" skips. Filters (from / to date,
+symbol, decision, outcome, session, tag, violated rule) live in the URL, so a filtered view can be
+bookmarked or shared; text filters apply on Enter or when you leave the field. "Load more" pages
+50 rows at a time. **Export CSV** writes the rows loaded so far (so load more first for older
+rows); text cells that start with `=`, `+`, `-` or `@` are prefixed with `'` so a spreadsheet
+does not run them as formulas.
+
+Click a symbol to open the decision (`/signals/<id>`), the chain in order:
+
+| Step | What it shows |
+|---|---|
+| Analyzer proposal / skip | The levels it proposed (or why it skipped). |
+| Risk gate rejected | The SPEC §1.6 hard rule that blocked it, and the details. Only the first violated rule is stored. |
+| Historian | Similar past setups and their win rate; each match links to that past decision. |
+| Skeptic | The strongest objection, or "Macro data unavailable" (amber) when macro providers had no data. |
+| Judge | PUBLISH / PUBLISH_WITH_CAVEAT / SKIP with confidence and caveat. |
+| Forecaster | Each look at the open setup (still valid / at risk / closed); an `ERROR` row (red) carries the failure text — usually the credit balance. |
+| Outcome (replay) | The deterministic 5m-candle replay result and realised R (Critic v0). |
+| Critic review | The Critic's lesson, or "Review failed" (amber). |
+
+Each agent step has a **Raw output** button: the full stored output is fetched only when you open
+it. **Signal JSON** shows the stored payload and features. The H4 candlestick chart arrives with
+the Markets page (Step 4.9).

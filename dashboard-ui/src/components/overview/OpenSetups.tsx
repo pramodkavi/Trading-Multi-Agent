@@ -1,3 +1,4 @@
+import { Link } from "react-router-dom";
 import type { SetupCardOut } from "../../api/types";
 import { formatAge, formatR } from "../../lib/format";
 import type { Tone } from "../../lib/problems";
@@ -19,7 +20,10 @@ function SetupCard({ setup }: { setup: SetupCardOut }) {
     <li className={cardClass}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="font-semibold text-slate-900 dark:text-slate-100">
-          <span>{setup.symbol}</span> <span className="font-normal">{setup.direction}</span>
+          <Link to={`/signals/${setup.signal_id}`} className="underline decoration-slate-400 underline-offset-2">
+            {setup.symbol}
+          </Link>{" "}
+          <span className="font-normal">{setup.direction}</span>
         </p>
         {setup.unrealised_r !== null ? (
           <span className={`font-mono text-sm font-semibold ${rClass(setup.unrealised_r)}`}>

@@ -145,6 +145,16 @@ describe("OverviewPage", () => {
     await userEvent.click(within(alert).getByRole("button", { name: /retry/i }));
   });
 
+  it("links window chips and open-setup cards to their decision", async () => {
+    stubApi({ "/overview": makeOverview(), "/signals": NO_SIGNALS });
+    renderWithProviders(<OverviewPage />);
+
+    const chip = await screen.findByRole("link", { name: /BTCUSDT NO_SETUP/ });
+    expect(chip).toHaveAttribute("href", "/signals/sig-LONDON");
+    const setup = screen.getByRole("link", { name: "BTCUSDT" });
+    expect(setup).toHaveAttribute("href", "/signals/sig-1");
+  });
+
   it("keeps showing the last good overview when a background refresh fails", async () => {
     let calls = 0;
     stubApi({
@@ -203,7 +213,7 @@ describe("OverviewPage", () => {
     expect(await screen.findByText("Next scan in 2 m 00 s", {}, { timeout: 3000 })).toBeInTheDocument();
   });
 
-  it("lists the latest signals as plain text", async () => {
+  it("lists the latest signals, each row linking to its decision", async () => {
     stubApi({
       "/overview": makeOverview(),
       "/signals": {
@@ -224,6 +234,6 @@ describe("OverviewPage", () => {
     const list = await screen.findByTestId("latest-signals");
     expect(within(list).getByText("SOLUSDT")).toBeInTheDocument();
     expect(within(list).getByText("GATE_REJECTED")).toBeInTheDocument();
-    expect(within(list).queryByRole("link")).not.toBeInTheDocument();
+    expect(within(list).getByRole("link", { name: "SOLUSDT" })).toHaveAttribute("href", "/signals/s1");
   });
 });

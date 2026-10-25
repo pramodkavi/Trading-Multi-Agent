@@ -1,6 +1,8 @@
-import type { DecisionKind, WindowSummary } from "../../api/types";
+import { Link } from "react-router-dom";
+import type { WindowSummary } from "../../api/types";
 import { formatUtcTime, truncate } from "../../lib/format";
 import { windowState, type Tone, type WindowState } from "../../lib/problems";
+import { KIND_TONE } from "../../lib/tones";
 import { Badge } from "../Badge";
 import { cardClass } from "../styles";
 
@@ -18,13 +20,6 @@ const STATE_LABEL: Record<WindowState, string> = {
   running: "running",
   pending: "not run yet",
   missed: "missed",
-};
-
-const KIND_TONE: Record<DecisionKind, Tone> = {
-  PUBLISHED: "ok",
-  VETOED: "warn",
-  GATE_REJECTED: "neutral",
-  NO_SETUP: "neutral",
 };
 
 const ERROR_MAX = 140;
@@ -53,11 +48,13 @@ function WindowCard({ window: w, now }: { window: WindowSummary; now: Date }) {
         <ul className="mt-2 flex flex-wrap gap-1.5">
           {w.symbols.map((chip) => (
             <li key={`${chip.symbol}-${chip.signal_id}`}>
-              <Badge tone={KIND_TONE[chip.kind]}>
-                {chip.violated_rule
-                  ? `${chip.symbol} ${chip.kind} · ${chip.violated_rule}`
-                  : `${chip.symbol} ${chip.kind}`}
-              </Badge>
+              <Link to={`/signals/${chip.signal_id}`} className="inline-flex max-w-full">
+                <Badge tone={KIND_TONE[chip.kind]}>
+                  {chip.violated_rule
+                    ? `${chip.symbol} ${chip.kind} · ${chip.violated_rule}`
+                    : `${chip.symbol} ${chip.kind}`}
+                </Badge>
+              </Link>
             </li>
           ))}
         </ul>

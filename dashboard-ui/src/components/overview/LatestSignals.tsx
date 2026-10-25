@@ -1,18 +1,11 @@
+import { Link } from "react-router-dom";
 import { useRecentSignals } from "../../api/queries";
-import type { DecisionKind } from "../../api/types";
 import { formatUtcDateTime } from "../../lib/format";
-import type { Tone } from "../../lib/problems";
+import { KIND_TONE } from "../../lib/tones";
 import { Badge } from "../Badge";
 import { cardClass, mutedClass } from "../styles";
 
-const KIND_TONE: Record<DecisionKind, Tone> = {
-  PUBLISHED: "ok",
-  VETOED: "warn",
-  GATE_REJECTED: "neutral",
-  NO_SETUP: "neutral",
-};
-
-/** The five newest decisions. Plain text until the signal detail route lands (Step 4.7). */
+/** The five newest decisions; the symbol opens the decision's detail page. */
 export function LatestSignals() {
   const query = useRecentSignals(5);
   if (query.isPending) return <p className={mutedClass}>Loading signals…</p>;
@@ -25,7 +18,12 @@ export function LatestSignals() {
           <span className="font-mono text-xs text-slate-700 dark:text-slate-300">
             {formatUtcDateTime(s.created_at)}
           </span>
-          <span className="font-semibold text-slate-900 dark:text-slate-100">{s.symbol}</span>
+          <Link
+            to={`/signals/${s.id}`}
+            className="font-semibold text-slate-900 underline decoration-slate-400 underline-offset-2 dark:text-slate-100"
+          >
+            {s.symbol}
+          </Link>
           <span className={mutedClass}>{s.direction ?? "—"}</span>
           <Badge tone={KIND_TONE[s.decision_kind]}>{s.decision_kind}</Badge>
           {s.judge_ruling ? <span className={mutedClass}>{s.judge_ruling}</span> : null}
