@@ -890,3 +890,36 @@ Click a symbol to open the decision (`/signals/<id>`), the chain in order:
 Each agent step has a **Raw output** button: the full stored output is fetched only when you open
 it. **Signal JSON** shows the stored payload and features. The H4 candlestick chart arrives with
 the Markets page (Step 4.9).
+
+
+### 8.10 Telegram deep links (Step 4.7 Part B)
+
+Every Telegram message that references a decision — a new signal, a skip, a Judge veto, and a
+Forecaster AT_RISK / SETUP CLOSED update — ends with an **Open in dashboard** link to
+`https://<cloudfront>/signals/<signal id>`. Tapping it opens that decision's detail page (Cognito
+login if you are signed out). `STILL_VALID` Forecaster looks send no message, hence no link. The
+alarm notifier's messages have no signal, so no link.
+
+**How it is wired** (no cross-stack reference in either direction):
+
+- `DashboardStack` writes its CloudFront origin to the plain SSM **String** parameter
+  `/crypto-signals/dashboard-base-url` (standard tier, free).
+- `ComputeStack` gives the scan Lambda the env var `DASHBOARD_URL_PARAM_NAME` (the parameter
+  *name*) and adds `ssm:GetParameter` on exactly that one ARN to its existing read-only statement.
+- The scan Lambda reads the parameter once per container (`src/config/dashboard_url.py`) and
+  never fails because of it: a missing, unreadable or malformed value (anything that is not an
+  `https://` URL with a host) logs one warning — the exception type only, never the value — and
+  the messages simply go out **without** a link. A warm container keeps the result it first
+  got, so after the parameter first appears the link shows up on the next cold start (the next
+  deploy, or an idle container being recycled).
+
+**Check it** (read-only, via aws-mcp — no local AWS CLI):
+
+1. `ssm GetParameter` `/crypto-signals/dashboard-base-url` → the CloudFront origin, no trailing path.
+2. Lambda configuration of the scan function: `DASHBOARD_URL_PARAM_NAME` is set; the role policy
+   lists the parameter's ARN beside the two secret ARNs.
+3. Console Test event `{"symbol":"BTCUSDT","session":"AD_HOC"}` (§4.1) → the Telegram message ends
+   with the link; tap it on the phone. **No link?** Check the scan's log group for
+   `could not read the dashboard URL parameter (<ExceptionType>)` — `ParameterNotFound` means the
+   Dashboard stack has not deployed yet, `AccessDeniedException` means the Compute deploy has not
+   applied the new grant.
