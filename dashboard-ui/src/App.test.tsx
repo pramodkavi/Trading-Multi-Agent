@@ -161,8 +161,15 @@ describe("App", () => {
     expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
   });
 
+  it("route /signals renders the journal, not the placeholder", async () => {
+    mocks.auth = signedIn();
+    renderAt("/signals");
+    expect(await screen.findByRole("heading", { level: 1, name: "Signals" })).toBeInTheDocument();
+    expect(await screen.findByRole("form", { name: "Filters" })).toBeInTheDocument();
+    expect(screen.queryByText(/Coming in Step/)).not.toBeInTheDocument();
+  });
+
   it.each([
-    ["/signals", "Signals", "4.7"],
     ["/funnel", "Funnel", "4.8"],
     ["/analytics", "Analytics", "4.8"],
     ["/markets", "Markets", "4.9"],
