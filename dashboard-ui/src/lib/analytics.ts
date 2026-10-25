@@ -117,3 +117,25 @@ export function equityLines(c: EquityCurveResponse): EquityLine[] {
 export function hasAnyPoints(c: EquityCurveResponse): boolean {
   return c.published.length + c.vetoed.length + c.gate_rejected.length > 0;
 }
+
+const DAY_MS = 86_400_000;
+
+/**
+ * One row per timestamp, one column per line, for a single LineChart. Every curve starts at 0
+ * one day before the first point: an equity curve begins at zero, and a curve with a single
+ * point would otherwise draw nothing. Empty when no line has a point.
+ */
+export function equityRows(lines: EquityLine[]): Record<string, number>[] {
+  const byTime = new Map<number, Record<string, number>>();
+  for (const line of lines) {
+    for (const p of line.points) {
+      const row = byTime.get(p.t) ?? { t: p.t };
+      row[line.id] = p.cumulativeR;
+      byTime.set(p.t, row);
+    }
+  }
+  if (byTime.size === 0) return [];
+  const origin: Record<string, number> = { t: Math.min(...byTime.keys()) - DAY_MS };
+  for (const line of lines) origin[line.id] = 0;
+  return [origin, ...[...byTime.values()].sort((a, b) => (a.t ?? 0) - (b.t ?? 0))];
+}

@@ -9,7 +9,7 @@ import {
   YAxis,
 } from "recharts";
 import { formatR } from "../../lib/format";
-import { type EquityLine } from "../../lib/analytics";
+import { equityRows, type EquityLine } from "../../lib/analytics";
 import { mutedClass } from "../styles";
 import { DataTable } from "./DataTable";
 
@@ -21,27 +21,24 @@ const STYLE: Record<EquityLine["id"], { color: string; dash: string | undefined 
 
 const day = (t: number) => new Date(t).toISOString().slice(5, 10);
 
-/** One row per timestamp, one column per line, so a single LineChart can draw them all. */
-function mergeLines(lines: EquityLine[]): Record<string, number>[] {
-  const byTime = new Map<number, Record<string, number>>();
-  for (const line of lines) {
-    for (const p of line.points) {
-      const row = byTime.get(p.t) ?? { t: p.t };
-      row[line.id] = p.cumulativeR;
-      byTime.set(p.t, row);
-    }
-  }
-  return [...byTime.values()].sort((a, b) => (a.t ?? 0) - (b.t ?? 0));
-}
-
 /**
  * The hypothetical cumulative-R curves. Counterfactual lines are dashed (not just another
  * colour); every visible line is named in the legend with its final R, and a table repeats it.
  */
 export function EquityChart({ lines, visible }: { lines: EquityLine[]; visible: Record<string, boolean> }) {
   const shown = lines.filter((l) => visible[l.id] !== false);
-  if (lines.every((l) => l.points.length === 0)) {
-    return <p className={mutedClass}>No resolved outcomes in this period.</p>;
+  // Judge by what is *shown*: with credits exhausted nothing is published, yet vetoed replays
+  // may exist behind the (default-off) counterfactual toggles.
+  if (shown.every((l) => l.points.length === 0)) {
+    const hiddenHasData = lines.some((l) => !shown.includes(l) && l.points.length > 0);
+    return (
+      <>
+        <p className={mutedClass}>No resolved outcomes in this period.</p>
+        {hiddenHasData ? (
+          <p className={`${mutedClass} mt-1`}>Tick a counterfactual curve above to see the replays that exist.</p>
+        ) : null}
+      </>
+    );
   }
   const finalText = (l: EquityLine) => (l.finalR === null ? "—" : formatR(l.finalR));
   return (
@@ -67,7 +64,7 @@ export function EquityChart({ lines, visible }: { lines: EquityLine[]; visible: 
       </ul>
       <div role="img" aria-label="Equity curve: cumulative R of each published decision over time. A data table follows.">
         <ResponsiveContainer width="100%" height={280} initialDimension={{ width: 640, height: 280 }}>
-          <LineChart data={mergeLines(shown)} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
+          <LineChart data={equityRows(shown)} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
             <CartesianGrid stroke="var(--viz-grid)" vertical={false} />
             <XAxis
               dataKey="t"

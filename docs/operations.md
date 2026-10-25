@@ -954,7 +954,8 @@ and 3 published is the system working as designed — look at which rule dominat
   *overruled*. Runs with no macro data are excluded and counted.
 - **Equity curve**: hypothetical cumulative R at 1 R risk per published signal. The vetoed and
   gate-rejected curves are counterfactual replays (dashed, opt-in) and are never added to the
-  published curve.
+  published curve. Every curve starts at 0. When nothing has been published yet (credits exhausted)
+  the chart says so and, if vetoed or gate-rejected replays exist, tells you to tick them.
 - **Critic**: the latest reports (summary, the proposed-rules PR link — only for an `https://` URL —
   and the report text as plain text on demand) and the latest review grades. **Both stay empty until
   the first Critic backfill runs** (pending Anthropic credits, §7).

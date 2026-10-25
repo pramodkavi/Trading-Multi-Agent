@@ -1,6 +1,7 @@
 import { makeEquity, makePoint, makeSkeptic, makeWinRate } from "../test/fixtures";
 import {
   equityLines,
+  equityRows,
   formatWinRate,
   hasAnyPoints,
   isLowSample,
@@ -98,5 +99,35 @@ describe("hasAnyPoints", () => {
     expect(hasAnyPoints(makeEquity())).toBe(true);
     expect(hasAnyPoints(makeEquity({ published: [], vetoed: [], gate_rejected: [] }))).toBe(false);
     expect(hasAnyPoints(makeEquity({ published: [], vetoed: [], gate_rejected: [makePoint("2026-10-03T08:03:00Z", -1, -1)] }))).toBe(true);
+  });
+});
+
+describe("equityRows", () => {
+  const DAY = 86_400_000;
+
+  it("starts every curve at 0 one day before the first point, so a single point is a visible step", () => {
+    const [published] = equityLines(makeEquity({ published: [makePoint("2026-10-05T08:00:00Z", 2, 2)], vetoed: [], gate_rejected: [] }));
+    const t = Date.parse("2026-10-05T08:00:00Z");
+    expect(equityRows(published ? [published] : [])).toEqual([
+      { t: t - DAY, published: 0 },
+      { t, published: 2 },
+    ]);
+  });
+
+  it("merges lines by timestamp in order, with a zero origin for every line", () => {
+    const [published, vetoed] = equityLines(makeEquity());
+    const rows = equityRows([published, vetoed].filter((l) => l !== undefined));
+    const first = Date.parse("2026-10-01T08:03:00Z");
+    expect(rows[0]).toEqual({ t: first - DAY, published: 0, vetoed: 0 });
+    const times = rows.map((r) => r.t);
+    expect(times).toEqual([...times].sort((a, b) => (a ?? 0) - (b ?? 0)));
+    expect(rows.find((r) => r.t === Date.parse("2026-10-02T08:03:00Z"))).toEqual({
+      t: Date.parse("2026-10-02T08:03:00Z"),
+      vetoed: 3,
+    });
+  });
+
+  it("is empty when no line has a point", () => {
+    expect(equityRows(equityLines(makeEquity({ published: [], vetoed: [], gate_rejected: [] })))).toEqual([]);
   });
 });
