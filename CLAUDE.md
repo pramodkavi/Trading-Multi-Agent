@@ -103,6 +103,7 @@ Minutes are `:03` deliberately — avoids clock-jitter on `:00`. The Actions cro
 
 ## 7. Current Build Status
 
+- **🛑 DECOMMISSIONED 2026-11-24.** Work moved to the separate Trading-AI-Harness repo. The AWS deployment is torn down via `.github/workflows/destroy.yml`; the automatic deploy after CI and the Critic cron are disabled. Runbook + manual leftovers: `docs/operations.md §9`. The status below is historical.
 - **Slice 1 (Weeks 1-3): ✅ COMPLETE & DEPLOYED LIVE** (Steps 1.1–1.22). End-to-end substrate — multi-symbol watchlist, SMC-stub Analyzer, Telegram delivery from a scheduled **Lambda** (zip + layer, **ap-south-1**) + Aurora Serverless v2 via the RDS Data API. Verified end-to-end (Telegram confirmed 2026-06-12). **See [`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md) for live resource IDs, gotchas, and open items.**
 - **Slice 2 (Weeks 4-7): ✅ COMPLETE** — Steps 2.1–2.14 on `main` (2.1–2.13 LIVE since 2026-06-27; Critic v0 / Step 2.14 merged via PR #12 on 2026-10-20). Full 4-agent pipeline + Forecaster + risk gates + multi-symbol + real SMC Analyzer are deployed. Step 2.14's manual review is automated: OutcomeResolver (Lambda) + DecisionReviewer/CriticReport (GitHub Actions `critic.yml`); the **Slice 2 exit gate is the first section of the backfill report** (`docs/critic-reports/<date>.md`). The first Critic backfill is pending on Anthropic credits (operator paused it).
 - **Slice 3 (Weeks 8-11):** Strategy registry + embeddings + Critic with PR opening.

@@ -962,3 +962,43 @@ and 3 published is the system working as designed — look at which rule dominat
 
 Colours follow the dataviz palette (validated for colour-blindness in light and dark); dashed lines
 and the data tables carry identity without colour. Recharts is loaded only on these two pages.
+
+---
+
+## 9. Decommissioning (2026-11-24)
+
+The project moved to the separate **Trading-AI-Harness** repo (local, no AWS). The
+signal journal was imported into the harness on 2026-11-24 (11,885 rows, snapshot
+12:55 UTC; harness `desk/journal/import/2026-11-24`). The AWS deployment is torn
+down with `.github/workflows/destroy.yml`. The automatic deploy after CI
+(`deploy-dev.yml`) and the Critic cron (`critic.yml`) are switched off in the same
+change, so a merge to `main` can no longer re-create anything.
+
+### 9.1 Before the destroy
+
+1. Pick a quiet window, **not** within 10 minutes of a scan (`:03` past 08, 13, 15, 22 UTC).
+2. **Manual Aurora snapshot** (the cluster has `RemovalPolicy.DESTROY`, no final snapshot):
+   RDS console → ap-south-1 → Databases → `cryptosignals-data-aurora2cbab212-s1pyvq9ztgdm`
+   → Actions → *Take snapshot* → name `crypto-signals-final-2026-11-24`. Wait for *Available*.
+   Manual snapshots survive the cluster's deletion (cost ≈ $0.021/GB-month for the storage).
+3. Final delta export of the rows written after the harness import (aws-mcp, read-only),
+   saved to the harness repo next to the import.
+
+### 9.2 Destroy
+
+GitHub → Actions → **Destroy (decommission)** → *Run workflow* on `main`:
+`confirm = DESTROY`, tick `snapshot_taken`. It runs `cdk destroy --all --force`
+(Dashboard, Monitoring, Scheduling → Compute → Data → Network; Aurora deletion
+takes ~10 min).
+
+### 9.3 Manual cleanup (left behind on purpose)
+
+| Leftover | Why it survives | How to remove |
+|---|---|---|
+| Cognito user pool `crypto-signals-dashboard` (`ap-south-1_DQCy7rINH`) | `RETAIN` + deletion protection | Cognito console → pool → *Settings* → deactivate deletion protection → *Delete* |
+| SSM `/crypto-signals/anthropic-api-key`, `/telegram-bot-token`, `/dashboard-base-url` | created out-of-band (§1) | Systems Manager → Parameter Store → delete (rotate/revoke the Anthropic key + Telegram bot token at the providers too) |
+| `CDKToolkit` stack in **ap-south-1** and **us-east-1** | bootstrap, not part of the app | empty the `cdk-hnb659fds-assets-*` bucket (all versions) and ECR repo if any, then delete the stack |
+| IAM role `github-actions-cdk-deploy` + GitHub OIDC provider | used by the destroy run itself | delete after the destroy succeeds |
+| IAM user `claude-mcp-operator` | aws-mcp access | delete **last**, after the leftovers are verified gone |
+| Manual snapshot `crypto-signals-final-2026-11-24` | the backup | keep as long as wanted; delete to reach $0 |
+| GitHub secret `AWS_DEPLOY_ROLE_ARN`, variable `AWS_REGION`, environment `dev` | repo settings | delete in GitHub → Settings |

@@ -23,11 +23,11 @@
 
 name: Deploy (dev)
 
+# DECOMMISSIONED 2026-11-24: the automatic workflow_run trigger (deploy after CI
+# on main) is removed so that a merge to main can no longer re-create the stacks
+# that destroy.yml tore down. Manual dispatch is kept only as a deliberate
+# "bring it back" path. See docs/operations.md §9.
 on:
-  workflow_run:
-    workflows: ["CI"]
-    types: [completed]
-    branches: [main]
   # Manual run from the Actions UI. The operator's machine has NO AWS CLI / CDK /
   # credentials by rule, so every AWS operation -- including the one-off
   # destroy+recreate below -- is a workflow step triggered from GitHub.

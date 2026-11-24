@@ -1,0 +1,100 @@
+# Decommission: destroy every CryptoSignals-* stack (2026-11-24).
+#
+# The project is moving to the separate Trading-AI-Harness repo, which runs
+# locally and needs no AWS. This workflow is the ONLY sanctioned way to tear the
+# AWS deployment down: the operator's machine has no AWS CLI / CDK / credentials
+# by rule, and the aws-mcp operator identity is read-mostly (no DeleteStack).
+#
+# Manual only. It refuses to run unless the operator types DESTROY and confirms
+# that a MANUAL Aurora cluster snapshot exists. The cluster has
+# RemovalPolicy.DESTROY (no final snapshot), so without that manual snapshot the
+# signal journal is gone for good. Runbook: docs/operations.md §9.
+#
+# `cdk destroy --all` deletes dependents first:
+#   Dashboard, Monitoring, Scheduling -> Compute -> Data -> Network.
+# Left behind on purpose (cleaned up by hand, docs/operations.md §9.3): the
+# Cognito user pool (RETAIN + deletion protection), the /crypto-signals/* SSM
+# parameters (created out-of-band), the CDKToolkit stacks, the OIDC deploy role
+# this workflow itself uses, and the manual Aurora snapshot.
+
+name: Destroy (decommission)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type DESTROY to delete every CryptoSignals-* stack"
+        required: true
+        default: ""
+      snapshot_taken:
+        description: "I took a MANUAL Aurora cluster snapshot in the RDS console and it is Available"
+        type: boolean
+        required: true
+        default: false
+
+concurrency:
+  group: deploy-dev # never overlap a deploy
+  cancel-in-progress: false
+
+permissions:
+  id-token: write # OIDC
+  contents: read
+
+jobs:
+  destroy:
+    name: cdk destroy --all
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - name: Guard
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          SNAPSHOT: ${{ inputs.snapshot_taken }}
+        run: |
+          if [ "$CONFIRM" != "DESTROY" ]; then
+            echo "::error::confirm must be exactly DESTROY (got '$CONFIRM')."; exit 1
+          fi
+          if [ "$SNAPSHOT" != "true" ]; then
+            echo "::error::Take a manual Aurora snapshot first and tick snapshot_taken."; exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install CDK app dependencies
+        run: pip install -r infrastructure/requirements.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard-ui/package-lock.json
+
+      - name: Install the CDK CLI
+        run: npm install -g aws-cdk@2.1126.0
+
+      - name: Build the dashboard SPA
+        # infrastructure/app.py refuses to synth without dashboard-ui/dist/index.html,
+        # and cdk destroy synthesizes the app first.
+        working-directory: dashboard-ui
+        run: npm ci && npm run build
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Destroy all stacks
+        working-directory: infrastructure
+        env:
+          JSII_SILENCE_WARNING_UNTESTED_NODE_VERSION: "1"
+        run: |
+          set -euo pipefail
+          echo "::warning::Destroying every CryptoSignals-* stack (Aurora + VPC included)."
+          cdk destroy --all --force
+          echo "::notice::All stacks destroyed. Finish the manual cleanup in docs/operations.md §9.3."

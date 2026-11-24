@@ -35,8 +35,9 @@
 name: Critic
 
 on:
-  schedule:
-    - cron: "30 22 */2 * *" # every other day, after the 22:03 UTC wrap scan
+  # DECOMMISSIONED 2026-11-24: the every-2-days schedule ("30 22 */2 * *") is
+  # removed with the AWS teardown (docs/operations.md §9); the Critic now lives in
+  # the Trading-AI-Harness repo. Manual dispatch kept for the record only.
   workflow_dispatch:
     inputs:
       mode:
